@@ -1,0 +1,26 @@
+# Author: jperch1987
+# Example profiles - replace values with your own AWS profile metadata.
+# Credentials stay in your existing AWS credentials file or credential provider.
+
+[default]
+region = us-east-1
+
+[profile development]
+role_arn = arn:aws:iam::111111111111:role/Developer
+source_profile = default
+region = us-east-1
+
+[profile staging]
+role_arn = arn:aws:iam::222222222222:role/Staging
+source_profile = default
+region = us-west-2
+
+[profile production]
+role_arn = arn:aws:iam::333333333333:role/Production
+source_profile = default
+region = ap-southeast-1
+
+[profile read-only]
+role_arn = arn:aws:iam::444444444444:role/ReadOnly
+source_profile = default
+region = eu-west-1

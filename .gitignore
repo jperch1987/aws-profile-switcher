@@ -1,0 +1,14 @@
+# Author: jperch1987
+.state/
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
+# Personal AWS configuration belongs outside source control.
+profiles.txt
+.env
+.env.*
+.aws/
+credentials
+# Local QA image includes the developer's filesystem path.
+preview.jpg
