@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { readFile, mkdir, writeFile, rename, unlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -31,31 +32,79 @@ function resolveLocalPath(value) {
 const quotePosix = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
 const quotePowerShell = (value) => "'" + value.replaceAll("'", "''") + "'";
 
-export function buildCommands(profile, configFile) {
-  const values = {
-    AWS_CONFIG_FILE: configFile,
-    AWS_PROFILE: profile.profile,
-    AWS_DEFAULT_PROFILE: profile.profile,
-  };
-  if (profile.region) {
-    values.AWS_REGION = profile.region;
-    values.AWS_DEFAULT_REGION = profile.region;
-  }
-  const credentials = [
+export function pythonExecutable() {
+  if (process.env.PYTHON) return process.env.PYTHON;
+  const local = path.join(APP_DIR, '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
+  return existsSync(local) ? local : (process.platform === 'win32' ? 'python' : 'python3');
+}
+
+export function buildCommands(profile, configFile, python = pythonExecutable(), helper = path.join(APP_DIR, 'aws_session.py')) {
+  const overrides = [
     'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
     'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_ROLE_SESSION_NAME',
+    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_CONFIG_FILE',
+    'AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI',
+    'AWS_CONTAINER_AUTHORIZATION_TOKEN', 'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE',
   ];
-  const posix = [`unset ${credentials.join(' ')}`];
-  const powershell = [`Remove-Item ${credentials.map((key) => `Env:${key}`).join(', ')} -ErrorAction SilentlyContinue`];
-  if (!profile.region) {
-    posix.push('unset AWS_REGION AWS_DEFAULT_REGION');
-    powershell.push('Remove-Item Env:AWS_REGION, Env:AWS_DEFAULT_REGION -ErrorAction SilentlyContinue');
-  }
-  for (const [key, value] of Object.entries(values)) {
-    posix.push(`export ${key}=${quotePosix(value)}`);
-    powershell.push(`$Env:${key} = ${quotePowerShell(value)}`);
-  }
+  const args = [python, helper, `--file=${configFile}`, `--profile=${profile.profile}`, '--shell'];
+  const posix = [
+    'case $- in *x*) __aws_profile_switcher_trace=1; set +x ;; *) __aws_profile_switcher_trace=0 ;; esac',
+    `unset ${overrides.join(' ')}`,
+    `if __aws_profile_switcher_env=$(${args.concat('posix').map(quotePosix).join(' ')}); then`,
+    '  eval "$__aws_profile_switcher_env"',
+    '  __aws_profile_switcher_status=$?',
+    'else',
+    '  __aws_profile_switcher_status=1',
+    "  printf '%s\\n' 'AWS switch failed. Previous exported AWS context was cleared; verify your identity before running AWS commands.' >&2",
+    'fi',
+    'unset __aws_profile_switcher_env',
+    'if [ "$__aws_profile_switcher_trace" = 1 ]; then unset __aws_profile_switcher_trace; set -x; else unset __aws_profile_switcher_trace; fi',
+    'if [ "$__aws_profile_switcher_status" = 0 ]; then unset __aws_profile_switcher_status; true; else unset __aws_profile_switcher_status; false; fi',
+  ];
+  const powershell = [
+    `Remove-Item ${overrides.map((key) => `Env:${key}`).join(', ')} -ErrorAction SilentlyContinue`,
+    `$__aws_profile_switcher_env = & ${args.concat('powershell').map(quotePowerShell).join(' ')}`,
+    'if ($? -and $LASTEXITCODE -eq 0) {',
+    '  try { Invoke-Expression ($__aws_profile_switcher_env -join "`n") }',
+    '  finally { Remove-Variable __aws_profile_switcher_env -ErrorAction SilentlyContinue }',
+    '} else {',
+    '  Remove-Variable __aws_profile_switcher_env -ErrorAction SilentlyContinue',
+    "  throw 'AWS switch failed. Previous exported AWS context was cleared; verify your identity before running AWS commands.'",
+    '}',
+  ];
   return { posix: posix.join('\n'), powershell: powershell.join('\n') };
+}
+
+export function authenticationTarget(profile, profiles) {
+  const source = profiles.find((item) => item.profile === profile.source_profile);
+  const mfaSerial = profile.mfa_serial || source?.mfa_serial || '';
+  const region = profile.region || source?.region || 'us-east-1';
+  let reason = null;
+  if (!/^arn:aws:iam::[0-9]{12}:role\/[A-Za-z0-9+=,.@_/-]{1,512}$/.test(profile.role_arn || '')) reason = 'Choose a role profile with a commercial AWS role ARN.';
+  else if (!profile.source_profile) reason = 'Add source_profile for the IAM user that assumes this role.';
+  else if (source?.role_arn || profile.source_profile === profile.profile) reason = 'Use a direct IAM user source profile; chained roles are not supported by this MFA flow.';
+  else if (!/^[\w+=/:,.@-]{9,256}$/.test(mfaSerial)) reason = 'Add mfa_serial with your MFA device ARN or hardware serial to this role or its source profile.';
+  else if (mfaSerial.startsWith('arn:') && !/^arn:aws:iam::[0-9]{12}:mfa\/[A-Za-z0-9_+=/:,.@-]+$/.test(mfaSerial)) reason = 'The MFA device ARN must be a commercial AWS IAM MFA ARN.';
+  else if (!/^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/.test(region)) reason = 'Set a supported commercial AWS region, such as us-east-1, on the profile.';
+  else if (profile.external_id && !/^[A-Za-z0-9_+=,.@:/-]{2,1224}$/.test(profile.external_id)) reason = 'The profile external_id has an invalid length or format.';
+  return { enabled: !reason, reason, mfaSerial };
+}
+
+export function validateFederationResult(result) {
+  try {
+    const url = new URL(result.url);
+    const destination = new URL(url.searchParams.get('Destination'));
+    const params = [...url.searchParams.keys()].sort();
+    if (url.protocol !== 'https:' || url.host !== 'signin.aws.amazon.com' || url.username || url.password || url.hash || url.pathname !== '/federation'
+      || JSON.stringify(params) !== JSON.stringify(['Action', 'Destination', 'SigninToken']) || url.searchParams.get('Action') !== 'login'
+      || !url.searchParams.get('SigninToken') || destination.protocol !== 'https:' || destination.host !== 'console.aws.amazon.com'
+      || destination.username || destination.password || destination.hash || destination.pathname !== '/console/home'
+      || JSON.stringify([...destination.searchParams.keys()]) !== JSON.stringify(['region'])
+      || !/^[a-z]{2}-[a-z]+-[1-9][0-9]*$/.test(destination.searchParams.get('region') || '')
+      || typeof result.expiration !== 'string' || !Number.isFinite(Date.parse(result.expiration)) || Date.parse(result.expiration) <= Date.now()
+      || typeof result.roleArn !== 'string') throw new Error();
+    return { url: url.href, expiration: result.expiration, roleArn: result.roleArn };
+  } catch { throw new AppError('AWS returned an invalid console session. Please try again.', 502); }
 }
 
 function sendJson(res, status, payload) {
@@ -81,9 +130,36 @@ async function readJson(req) {
 export function createProfileServer(options = {}) {
   const configFile = resolveLocalPath(options.configFile || process.env.PROFILES_FILE || path.join(APP_DIR, 'profiles.txt'));
   const stateDirectory = resolveLocalPath(options.stateDirectory || process.env.PROFILE_SWITCHER_STATE_DIR || path.join(APP_DIR, '.state'));
-  const python = options.python || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const python = options.python || pythonExecutable();
   const token = randomBytes(32).toString('hex');
   const stateFile = path.join(stateDirectory, 'active-profile.json');
+  let consolePending = false;
+
+  async function createConsoleSession(profile, mfaCode) {
+    if (options.consoleSession) return options.consoleSession(profile, mfaCode);
+    return new Promise((resolve, reject) => {
+      const child = execFile(python, [path.join(APP_DIR, 'aws_session.py'), '--console-worker', '--file', configFile], {
+        timeout: 45_000, maxBuffer: 64 * 1024, windowsHide: true,
+      }, (error, stdout, stderr) => {
+        if (error) {
+          let message = 'Could not create the AWS console session. Check your Python dependencies and AWS configuration.';
+          if (error.killed) message = 'The AWS request timed out. Enter a fresh MFA code and try again.';
+          else {
+            try {
+              const safe = JSON.parse(stderr).error;
+              if (typeof safe === 'string' && safe.length < 500 && !/[\r\n]/.test(safe)) message = safe;
+            } catch { /* Never expose worker traces or credential-bearing output. */ }
+          }
+          reject(new AppError(message, 502));
+        } else {
+          try { resolve(JSON.parse(stdout)); }
+          catch { reject(new AppError('The AWS session helper returned an invalid response.', 502)); }
+        }
+      });
+      child.stdin.on('error', () => {});
+      child.stdin.end(JSON.stringify({ profile: profile.profile, mfaCode }));
+    });
+  }
 
   async function readProfiles() {
     try {
@@ -91,7 +167,7 @@ export function createProfileServer(options = {}) {
         timeout: 10_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
       });
       const data = JSON.parse(stdout);
-      return { ...data, profiles: data.profiles.map((profile) => ({ ...profile, console: buildConsoleTarget(profile) })) };
+      return { ...data, profiles: data.profiles.map((profile) => ({ ...profile, console: buildConsoleTarget(profile), auth: authenticationTarget(profile, data.profiles) })) };
     } catch (error) {
       if (error.code === 'ENOENT') throw new AppError('Python was not found. Install Python 3 or set PYTHON to its executable path.', 500);
       if (error.killed) throw new AppError('Reading the profile file timed out.', 500);
@@ -122,7 +198,7 @@ export function createProfileServer(options = {}) {
     }
   }
 
-  const activePayload = (profile) => ({ profile, commands: profile ? buildCommands(profile, configFile) : null });
+  const activePayload = (profile) => ({ profile, commands: profile?.auth.enabled ? buildCommands(profile, configFile, python) : null });
   const server = http.createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -159,9 +235,30 @@ export function createProfileServer(options = {}) {
         const { profiles } = await readProfiles();
         const profile = profiles.find((entry) => entry.profile === body.profile);
         if (!profile) throw new AppError('This profile no longer exists. Refresh the profile list.', 404);
+        if (!profile.auth.enabled) throw new AppError(profile.auth.reason, 422);
         try { await saveActive(profile); }
         catch { throw new AppError('Could not save the selection. Check the state directory permissions.', 500); }
         sendJson(res, 200, activePayload(profile));
+      } else if (req.method === 'POST' && url.pathname === '/api/console') {
+        if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before opening AWS Console.', 403);
+        const body = await readJson(req);
+        if (!body || typeof body.profile !== 'string' || typeof body.mfaCode !== 'string' || !/^[0-9]{6}$/.test(body.mfaCode)) {
+          throw new AppError('Choose a profile and enter the six-digit MFA code.');
+        }
+        if (consolePending) throw new AppError('An AWS sign-in is already in progress. Wait before trying again.', 409);
+        consolePending = true;
+        try {
+          const { profiles } = await readProfiles();
+          const profile = profiles.find((entry) => entry.profile === body.profile);
+          if (!profile) throw new AppError('This profile no longer exists. Refresh the profile list.', 404);
+          if (!profile.auth.enabled) throw new AppError(profile.auth.reason, 422);
+          const result = validateFederationResult(await createConsoleSession(profile, body.mfaCode));
+          if (result.roleArn !== profile.role_arn) throw new AppError('The AWS session did not match the selected role.', 502);
+          sendJson(res, 200, result);
+        } finally {
+          body.mfaCode = '';
+          consolePending = false;
+        }
       } else {
         throw new AppError('Not found.', 404);
       }

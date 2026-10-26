@@ -15,7 +15,7 @@ import unicodedata
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_PROFILES = 1000
-PROFILE_FIELDS = ("role_arn", "source_profile", "region")
+PROFILE_FIELDS = ("role_arn", "source_profile", "region", "mfa_serial", "external_id")
 
 
 class ProfileConfigError(ValueError):

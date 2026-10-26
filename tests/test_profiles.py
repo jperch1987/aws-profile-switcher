@@ -31,9 +31,9 @@ region = ap-southeast-1
 credential_process = NEVER_RUN_THIS
 """)
         self.assertEqual(result, [
-            {"profile": "default", "role_arn": "", "source_profile": "", "region": "us-east-1"},
+            {"profile": "default", "role_arn": "", "source_profile": "", "region": "us-east-1", "mfa_serial": "", "external_id": ""},
             {"profile": "dev", "role_arn": "arn:aws:iam::111111111111:role/Developer",
-             "source_profile": "default", "region": "ap-southeast-1"},
+             "source_profile": "default", "region": "ap-southeast-1", "mfa_serial": "", "external_id": ""},
         ])
         self.assertNotIn("SECRET", json.dumps(result))
         self.assertNotIn("NEVER_RUN", json.dumps(result))
@@ -50,8 +50,14 @@ source_profile = default
 """)
         self.assertEqual(result[0]["role_arn"], "")
         self.assertEqual(result[1], {
-            "profile": "child", "role_arn": "", "source_profile": "default", "region": ""
+            "profile": "child", "role_arn": "", "source_profile": "default", "region": "", "mfa_serial": "", "external_id": ""
         })
+
+    def test_mfa_and_external_id_metadata_are_allowed_but_tokens_are_not(self):
+        result = profiles.parse_profiles("[profile dev]\nmfa_serial = arn:aws:iam::111111111111:mfa/device\nexternal_id = client-id\naws_session_token = DO_NOT_EXPOSE\n")
+        self.assertEqual(result[0]["mfa_serial"], "arn:aws:iam::111111111111:mfa/device")
+        self.assertEqual(result[0]["external_id"], "client-id")
+        self.assertNotIn("DO_NOT_EXPOSE", json.dumps(result))
 
     def test_other_sections_are_ignored(self):
         result = profiles.parse_profiles("""

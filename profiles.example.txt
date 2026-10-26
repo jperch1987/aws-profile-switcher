@@ -1,24 +1,33 @@
 # Author: jperch1987
-# Example profiles - replace values with your own AWS profile metadata.
-# Credentials stay in your existing AWS credentials file or credential provider.
+# Example profiles - replace account IDs, role names, and MFA device identifiers.
+# Keep the source IAM user's long-term keys in ~/.aws/credentials, never in Git.
+# Fresh MFA is required for each CLI authentication or direct Console launch.
+# SSO, credential_process, web identity, and role chaining are not supported.
 
 [default]
 region = us-east-1
+# This device belongs to the source IAM user, not the target role account.
+mfa_serial = arn:aws:iam::123456789012:mfa/example-user
 
 [profile development]
 role_arn = arn:aws:iam::111111111111:role/Developer
 source_profile = default
 region = us-east-1
+# A role-specific MFA device overrides the source profile's setting.
+mfa_serial = arn:aws:iam::123456789012:mfa/example-user
 
 [profile staging]
 role_arn = arn:aws:iam::222222222222:role/Staging
 source_profile = default
 region = us-west-2
+# If omitted here, mfa_serial is read from source_profile = default.
 
 [profile production]
 role_arn = arn:aws:iam::333333333333:role/Production
 source_profile = default
 region = ap-southeast-1
+# Optional: uncomment only when the role's trust policy requires an external ID.
+# external_id = external-id-provided-by-your-client
 
 [profile read-only]
 role_arn = arn:aws:iam::444444444444:role/ReadOnly

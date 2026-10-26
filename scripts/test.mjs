@@ -1,11 +1,14 @@
 // Author: jperch1987
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { readdirSync } from 'node:fs';
+import { pythonExecutable } from '../server.mjs';
 
 const rootDirectory = fileURLToPath(new URL('../', import.meta.url));
-const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+const python = pythonExecutable();
+const nodeTests = readdirSync(new URL('../tests/', import.meta.url)).filter((name) => name.endsWith('.test.mjs')).sort().map((name) => `tests/${name}`);
 const suites = [
-  [process.execPath, ['--test', 'tests/server.test.mjs']],
+  [process.execPath, ['--test', ...nodeTests]],
   [python, ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_*.py']],
 ];
 

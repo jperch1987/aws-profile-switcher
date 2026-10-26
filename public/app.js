@@ -2,9 +2,13 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { profiles: [], selected: null, active: null, commands: null, token: "", shell: "posix", loading: false, switching: false, loaded: false, copyTimer: null };
+const state = { profiles: [], selected: null, active: null, commands: null, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
+
+function busy() { return state.loading || state.switching || state.authenticating; }
+function clearMfa() { $("mfa-code").value = ""; }
 
 function announce(message, error = false) {
+  if (error) clearMfa();
   const notice = $("notice");
   notice.textContent = message;
   notice.classList.toggle("is-error", error);
@@ -44,10 +48,28 @@ function approvedConsoleUrl(value) {
   } catch { return null; }
 }
 
+function approvedFederationUrl(value) {
+  if (typeof value !== "string" || !value) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "signin.aws.amazon.com" || url.pathname !== "/federation" || url.username || url.password || url.port || url.hash) return null;
+    const allowed = new Set(["Action", "Destination", "SigninToken"]);
+    for (const key of url.searchParams.keys()) {
+      if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) return null;
+    }
+    if (url.searchParams.get("Action") !== "login" || !url.searchParams.get("SigninToken")) return null;
+    const destination = new URL(url.searchParams.get("Destination"));
+    if (destination.protocol !== "https:" || destination.hostname !== "console.aws.amazon.com" || destination.pathname !== "/console/home" || destination.username || destination.password || destination.port || destination.hash) return null;
+    if (destination.searchParams.getAll("region").length !== 1 || !destination.searchParams.get("region") || [...destination.searchParams.keys()].some((key) => key !== "region")) return null;
+    return url.href;
+  } catch { return null; }
+}
+
 function clearConsoleAction() {
   $("console-link").hidden = true;
   $("console-link").removeAttribute("href");
-  $("console-unavailable").hidden = false;
+  $("console-button").disabled = true;
+  $("mfa-code").disabled = true;
   $("console-reason").hidden = true;
   $("console-reason").textContent = "";
 }
@@ -75,6 +97,7 @@ function renderProfiles() {
   for (const profile of profiles) {
     const button = makeElement("button", "profile-item");
     button.type = "button";
+    button.disabled = busy();
     button.classList.toggle("is-selected", profile.profile === state.selected);
     button.setAttribute("aria-pressed", String(profile.profile === state.selected));
     button.setAttribute("aria-label", `${profile.profile}, ${profile.region || "region not set"}${profile.profile === state.active?.profile ? ", saved CLI profile" : ""}`);
@@ -91,6 +114,9 @@ function renderProfiles() {
     arrow.setAttribute("aria-hidden", "true");
     button.append(avatar, text, arrow);
     button.addEventListener("click", () => {
+      if (busy()) return;
+      clearMfa();
+      clearNotice();
       state.selected = profile.profile;
       for (const item of $("profile-list").children) {
         const selected = item === button;
@@ -120,25 +146,31 @@ function renderDetails() {
     $(id).textContent = value || "Not set";
     $(id).classList.toggle("not-set", !value);
   }
-  $("switch-label").textContent = state.switching ? "Saving…" : isActive ? "Selected for CLI" : "Use for CLI";
-  $("switch-button").disabled = state.loading || state.switching || isActive;
-  $("switch-help").textContent = isActive ? "CLI selection saved. Run the command below to apply it in your terminal." : "Open AWS to confirm a role switch, or generate a CLI command below.";
-  if (state.loading) return;
+  const enabled = selected.auth?.enabled === true;
+  $("switch-label").textContent = state.switching ? "Saving…" : isActive ? "Refresh CLI command" : "Use for CLI";
+  $("switch-button").disabled = busy() || !enabled;
+  $("switch-help").textContent = "CLI: copy and run the command below. Enter a fresh MFA code in your terminal each time.";
+  $("console-label").textContent = state.authenticating ? "Signing in…" : "Open AWS Console";
+  $("console-button").disabled = busy() || !enabled;
+  $("mfa-code").disabled = busy() || !enabled;
+  $("detail-mfa").textContent = selected.auth?.mfaSerial || "Not set";
+  $("detail-mfa").classList.toggle("not-set", !selected.auth?.mfaSerial);
+  if (!enabled) {
+    $("console-reason").textContent = typeof selected.auth?.reason === "string" && selected.auth.reason ? selected.auth.reason : "Direct Console sign-in and MFA CLI commands require a supported role, source profile, MFA device, and region.";
+    $("console-reason").hidden = false;
+  }
+  if (busy()) return;
   const url = approvedConsoleUrl(selected.console?.url);
   if (url) {
     $("console-link").href = url;
     $("console-link").hidden = false;
-    $("console-unavailable").hidden = true;
-  } else {
-    $("console-reason").textContent = typeof selected.console?.reason === "string" && selected.console.reason ? selected.console.reason : "This profile does not have a supported AWS Console switch-role link. You can still select it for CLI use.";
-    $("console-reason").hidden = false;
   }
 }
 
 function renderActive() {
   $("active-name").textContent = state.active?.profile || "No CLI profile selected";
   $("active-meta").textContent = state.active ? `${state.active.region || "Region not set"}${state.active.source_profile ? ` · from ${state.active.source_profile}` : ""}` : "Choose a profile and select “Use for CLI”.";
-  $("active-status").textContent = state.active ? "Saved locally" : "CLI selection";
+  $("active-status").textContent = state.active ? "Selection only" : "CLI selection";
   renderCommand();
 }
 
@@ -146,9 +178,9 @@ function renderCommand() {
   const command = state.commands?.[state.shell];
   $("terminal-command").textContent = command || "# Your CLI profile command will appear here";
   $("terminal-command").classList.toggle("is-placeholder", !command);
-  $("terminal-description").textContent = state.active ? `Apply saved CLI profile “${state.active.profile}” to your current shell.` : "Choose “Use for CLI” to generate your shell command.";
+  $("terminal-description").textContent = command ? `Run for “${state.active.profile}”, then enter MFA in your terminal.` : state.active ? "The saved profile cannot authenticate. Check its configuration and select it again." : "Choose “Use for CLI” to generate your shell command.";
   document.querySelector(".terminal-prompt").textContent = state.shell === "powershell" ? ">" : "$";
-  $("copy-button").disabled = !command || state.loading || state.switching;
+  $("copy-button").disabled = !command || busy();
   $("copy-label").textContent = "Copy command";
   clearTimeout(state.copyTimer);
   document.querySelectorAll("[data-shell]").forEach((tab) => {
@@ -158,20 +190,27 @@ function renderCommand() {
   });
 }
 
-function setLoading(loading) {
-  state.loading = loading;
-  $("refresh-button").disabled = loading || state.switching;
-  $("refresh-button").classList.toggle("is-loading", loading);
-  $("refresh-button").querySelector("span").textContent = loading ? "Reading…" : "Refresh";
-  $("profile-list").setAttribute("aria-busy", String(loading));
-  $("profile-details").setAttribute("aria-busy", String(loading));
+function renderBusy() {
+  $("refresh-button").disabled = busy();
+  $("profile-search").disabled = busy();
+  $("refresh-button").classList.toggle("is-loading", state.loading);
+  $("refresh-button").querySelector("span").textContent = state.loading ? "Reading…" : "Refresh";
+  $("profile-list").setAttribute("aria-busy", String(busy()));
+  $("profile-details").setAttribute("aria-busy", String(busy()));
+  for (const item of $("profile-list").children) if (item.tagName === "BUTTON") item.disabled = busy();
   renderDetails();
   renderCommand();
 }
 
+function setLoading(loading) {
+  state.loading = loading;
+  renderBusy();
+}
+
 async function loadProfiles(isRefresh = false) {
-  if (state.loading || state.switching) return;
+  if (busy()) return;
   const previousSelection = state.selected;
+  clearMfa();
   clearNotice();
   state.profiles = [];
   state.selected = null;
@@ -191,7 +230,7 @@ async function loadProfiles(isRefresh = false) {
     state.commands = null;
     $("source-file").textContent = data.file || "Local AWS configuration";
     $("source-file").title = data.file || "";
-    state.selected = state.profiles.some((profile) => profile.profile === previousSelection) ? previousSelection : state.profiles.find((profile) => approvedConsoleUrl(profile.console?.url))?.profile || state.profiles[0]?.profile || null;
+    state.selected = state.profiles.some((profile) => profile.profile === previousSelection) ? previousSelection : state.profiles.find((profile) => profile.auth?.enabled === true)?.profile || state.profiles.find((profile) => approvedConsoleUrl(profile.console?.url))?.profile || state.profiles[0]?.profile || null;
     state.loaded = true;
     if (data.activeProfile) {
       try {
@@ -225,28 +264,74 @@ async function loadProfiles(isRefresh = false) {
 }
 
 async function switchProfile() {
-  if (state.loading || state.switching || !state.selected) return;
+  if (busy() || state.profiles.find((profile) => profile.profile === state.selected)?.auth?.enabled !== true) return;
   const profileName = state.selected;
+  clearMfa();
   state.switching = true;
   clearNotice();
-  $("refresh-button").disabled = true;
-  renderDetails();
-  renderCommand();
+  renderBusy();
   try {
     const result = await request("/api/active", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: profileName }) });
     state.active = result.profile;
     state.profiles = state.profiles.map((profile) => profile.profile === result.profile.profile ? result.profile : profile);
     state.commands = result.commands;
-    announce(`“${result.profile.profile}” is saved for CLI use. Copy and run the command below to apply it in your terminal.`);
+    announce(`“${result.profile.profile}” is selected for CLI use. Run the command below and enter a fresh MFA code in your terminal to authenticate.`);
     renderProfiles();
     renderActive();
   } catch (error) {
     announce(error.message, true);
   } finally {
     state.switching = false;
-    $("refresh-button").disabled = false;
-    renderDetails();
-    renderCommand();
+    renderBusy();
+  }
+}
+
+async function openConsole(event) {
+  event.preventDefault();
+  if (busy()) return;
+  const selected = state.profiles.find((profile) => profile.profile === state.selected);
+  let mfaCode = $("mfa-code").value;
+  clearMfa();
+  if (selected?.auth?.enabled !== true) return;
+  if (!/^[0-9]{6}$/.test(mfaCode)) {
+    mfaCode = "";
+    announce("Enter a fresh six-digit code from your authenticator to open AWS Console.", true);
+    $("mfa-code").focus();
+    return;
+  }
+  // Open during the user gesture; a later async open would be blocked by browsers.
+  let consoleTab;
+  try {
+    consoleTab = window.open("about:blank", "_blank");
+    if (!consoleTab) throw new Error("Popup blocked");
+    consoleTab.opener = null;
+  } catch {
+    mfaCode = "";
+    consoleTab?.close();
+    announce("Allow pop-ups for this local app, then enter a fresh MFA code and try again.", true);
+    return;
+  }
+  state.authenticating = true;
+  clearNotice();
+  renderBusy();
+  try {
+    const pending = request("/api/console", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode }) });
+    mfaCode = "";
+    const result = await pending;
+    const url = approvedFederationUrl(result.url);
+    if (!url) throw new Error("AWS Console returned an invalid sign-in link. Enter a fresh MFA code and try again.");
+    if (consoleTab.closed) throw new Error("The new tab was closed. Enter a fresh MFA code and try again.");
+    // The short-lived sign-in URL is never saved in state, storage, or a page link.
+    consoleTab.location.replace(url);
+    announce(`Opened AWS Console for “${selected.profile}” in a new tab. The temporary session expires; sign in again with MFA when needed.`);
+  } catch (error) {
+    consoleTab.close();
+    announce(error.message, true);
+  } finally {
+    mfaCode = "";
+    clearMfa();
+    state.authenticating = false;
+    renderBusy();
   }
 }
 
@@ -266,6 +351,7 @@ function fallbackCopy(text) {
 }
 
 async function copyCommand() {
+  if (busy()) return;
   const command = state.commands?.[state.shell];
   if (!command) return;
   try {
@@ -276,7 +362,7 @@ async function copyCommand() {
       if (!fallbackCopy(command)) throw new Error("Clipboard unavailable");
     }
     $("copy-label").textContent = "Copied!";
-    announce("Command copied. Paste and run it in your terminal to apply the profile.");
+    announce("Command copied. Run it in your terminal and enter a fresh MFA code to authenticate.");
     clearTimeout(state.copyTimer);
     state.copyTimer = setTimeout(() => { $("copy-label").textContent = "Copy command"; }, 2200);
   } catch {
@@ -292,6 +378,9 @@ async function copyCommand() {
 $("refresh-button").addEventListener("click", () => loadProfiles(true));
 $("profile-search").addEventListener("input", renderProfiles);
 $("switch-button").addEventListener("click", switchProfile);
+$("console-form").addEventListener("submit", openConsole);
+$("console-link").addEventListener("click", clearMfa);
+$("console-link").addEventListener("auxclick", clearMfa);
 $("copy-button").addEventListener("click", copyCommand);
 document.querySelectorAll("[data-shell]").forEach((button) => button.addEventListener("click", () => { state.shell = button.dataset.shell; renderCommand(); }));
 document.addEventListener("keydown", (event) => {
@@ -301,3 +390,4 @@ document.addEventListener("keydown", (event) => {
   }
 });
 loadProfiles();
+window.addEventListener("pagehide", clearMfa);

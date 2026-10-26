@@ -1,10 +1,10 @@
 {
   "name": "local-aws-profile-switcher",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "jperch1987",
   "private": true,
   "type": "module",
-  "description": "Local AWS Console role links and CLI profile switching, with Node.js and Python.",
+  "description": "Local AWS CLI and direct Console role sessions with fresh MFA, Node.js, and Python.",
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node server.mjs",
