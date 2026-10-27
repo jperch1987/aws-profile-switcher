@@ -3,10 +3,10 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda']);
+export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53']);
 const CHECK_STATES = new Set(['found', 'not_found', 'access_denied', 'auth_failed', 'error', 'skipped']);
 const REGION = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
-const MAX_OUTPUT = 4 * 1024 * 1024;
+const MAX_OUTPUT = 32 * 1024 * 1024;
 const MAX_LINE = 2 * 1024 * 1024;
 const cleanString = (value, maximum = 1024) => typeof value === 'string' && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value);
 
@@ -17,10 +17,10 @@ export class LookupError extends Error {
 export function validateLookupRequest(body, profiles) {
   if (!body || typeof body !== 'object' || Array.isArray(body)
     || Object.keys(body).sort().join(',') !== 'mfaCode,profiles,query,resourceType'
-    || !Array.isArray(body.profiles) || body.profiles.length < 1 || body.profiles.length > 25
+    || !Array.isArray(body.profiles) || body.profiles.length < 1 || body.profiles.length > 250
     || body.profiles.some((name) => !cleanString(name, 2048) || !name)
     || new Set(body.profiles).size !== body.profiles.length) {
-    throw new LookupError('Choose between 1 and 25 distinct role profiles for the lookup.');
+    throw new LookupError('Choose between 1 and 250 distinct role profiles for the lookup.');
   }
   if (!RESOURCE_TYPES.includes(body.resourceType)) throw new LookupError('Choose a supported resource type.');
   if (!cleanString(body.query, 256) || !body.query.trim()) throw new LookupError('Enter a resource ID, exact name, or ARN using at most 256 characters on one line.');
@@ -43,7 +43,7 @@ export function validateLookupRequest(body, profiles) {
 
 // Only the short-lived Python worker sees source and session keys. Node forwards
 // MFA transiently over stdin; stored jobs contain only allowlisted metadata.
-export function createLookupManager({ python, configFile, spawnProcess = spawn, timeoutMs = 180_000, retentionMs = 600_000 } = {}) {
+export function createLookupManager({ python, configFile, spawnProcess = spawn, timeoutMs = 600_000, retentionMs = 600_000 } = {}) {
   let current = null;
   let closed = false;
   const snapshot = (job) => structuredClone(job.data);
@@ -97,7 +97,8 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
     for (const item of event.results) {
       if (!item || item.profile !== target.profile || item.accountId !== target.accountId || item.resourceType !== job.data.resourceType
         || !['region', 'resourceId', 'name', 'arn'].every((key) => cleanString(item[key])) || !item.resourceId
-        || (job.data.resourceType !== 's3' && item.region !== target.region)
+        || (!['s3', 'route53'].includes(job.data.resourceType) && item.region !== target.region)
+        || (job.data.resourceType === 'route53' && item.region !== 'global')
         || (job.data.resourceType === 's3' && !REGION.test(item.region) && !['unknown', 'global'].includes(item.region))) return badWorker(job);
       rows.push({ profile: target.profile, accountId: target.accountId, region: item.region, resourceType: job.data.resourceType,
         resourceId: item.resourceId, name: item.name, arn: item.arn });

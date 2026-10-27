@@ -39,7 +39,7 @@ const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
 test('lookup validation limits scope and requires one source/MFA group before starting a worker', (t) => {
   const { manager, children } = fixture(t);
   for (const body of [null, [], request({ extra: true }), request({ profiles: [] }), request({ profiles: ['dev', 'dev'] }),
-    request({ profiles: Array.from({ length: 26 }, (_, i) => `p${i}`) }), request({ query: '' }), request({ query: 'x'.repeat(257) }),
+    request({ profiles: Array.from({ length: 251 }, (_, i) => `p${i}`) }), request({ query: '' }), request({ query: 'x'.repeat(257) }),
     request({ query: 'hello\nworld' }), request({ resourceType: 'arbitrary-service' }), request({ mfaCode: '12345' }), request({ profiles: ['missing'] })]) {
     assert.throws(() => manager.start(body, profiles));
   }
@@ -70,6 +70,34 @@ test('worker receives MFA only over stdin, metadata is allowlisted, and partial 
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE|"012345"|credentials|mfaCode/);
   result.results.length = 0;
   assert.equal(manager.get(started.id).results.length, 1, 'callers cannot mutate stored metadata');
+});
+
+test('all 250 profiles can be selected and every account receives a completion status', (t) => {
+  const { manager, children } = fixture(t);
+  const scope = Array.from({ length: 250 }, (_, index) => ({ ...profiles[0], profile: `account-${index}` }));
+  const started = manager.start(request({ profiles: scope.map((item) => item.profile) }), scope);
+  assert.equal(started.total, 250);
+  assert.equal(JSON.parse(children[0].input).profiles.length, 250);
+  for (const target of scope) children[0].event({ event: 'profile', check: {
+    profile: target.profile, accountId: '111111111111', region: 'us-east-1', status: 'not_found', message: 'No exact match.' }, results: [] });
+  children[0].event({ event: 'complete' }); children[0].end();
+  assert.equal(manager.get(started.id).state, 'complete');
+  assert.equal(manager.get(started.id).completed, 250);
+});
+
+test('new resource types accept regional results and Route 53 requires global results', (t) => {
+  const { manager, children } = fixture(t);
+  for (const resourceType of ['eks', 'elasticache', 'route53']) {
+    const start = manager.start(request({ profiles: ['dev'], resourceType, query: 'example' }), profiles);
+    const row = event();
+    Object.assign(row.results[0], { resourceType, region: resourceType === 'route53' ? 'global' : 'us-east-1' });
+    children.at(-1).event(row); children.at(-1).event({ event: 'complete' }); children.at(-1).end();
+    assert.equal(manager.get(start.id).state, 'complete');
+  }
+  const start = manager.start(request({ profiles: ['dev'], resourceType: 'route53', query: 'example.com' }), profiles);
+  const invalid = event(); invalid.results[0].resourceType = 'route53';
+  children.at(-1).event(invalid);
+  assert.equal(manager.get(start.id).state, 'error');
 });
 
 test('malformed, mismatched, duplicate and false no-match events stop the worker', (t) => {

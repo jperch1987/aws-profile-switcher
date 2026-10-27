@@ -8,9 +8,11 @@ Clients need Node.js, Python, the packages in `requirements.txt` (including **bo
 
 **Get CLI credentials** requires a fresh six-digit MFA code in the app and produces five ready-to-copy environment assignments. It uses an IAM user's long-term keys through `source_profile`; SSO, `credential_process`, web identity, temporary source credentials, and role chaining are not supported by this CLI flow. **Open AWS Switch Role** opens a new tab in your current browser, using its AWS sign-in session. Review the prefilled account and role, then click **Switch Role** on AWS. AWS handles any sign-in and MFA prompts there.
 
-**Resource Lookup** searches for an exact resource ID, name, or ARN using the configured roles and regions. Each search requires fresh MFA for one source identity and can include up to 25 profiles sharing that source and MFA device. It returns resource metadata, not credentials. It uses the existing boto3 dependency and requires no AWS Resource Explorer setup.
+**Resource Lookup** searches for an exact resource ID, name, or ARN using the configured roles and regions. Each search requires fresh MFA for one source identity and can include up to 250 profiles sharing that source and MFA device. It returns resource metadata, not credentials. It uses the existing boto3 dependency and requires no AWS Resource Explorer setup.
 
 ## Install Python and Node.js
+
+For automated setup, jump to [Install and run the app](#install-and-run-the-app). Use `install.sh` on macOS/WSL or `install.ps1` on native Windows; their optional runtime flag can also install missing prerequisites. The instructions below are for manual runtime installation.
 
 Use a patched **Node.js 24 LTS** (recommended; the repository's `.nvmrc` selects 24) or **22 LTS**, and a supported **Python 3.11+** release. Node.js installers include npm. If these are already installed, check their versions below and skip reinstalling. See the [Node.js release list](https://nodejs.org/en/about/previous-releases) for supported releases.
 
@@ -99,7 +101,7 @@ This installs Node.js 24 and npm for your user. Run `nvm use 24` in a new termin
   py -3 -m venv .venv
   ```
 
-- **Multiple Python versions:** create `.venv` using the desired Python version. The server selects the project's virtual environment automatically unless `PYTHON` is set. A `PYTHON` override must be one executable path, without arguments; `py -3` is not a valid value. Install `requirements.txt` with that same interpreter.
+- **Multiple Python versions:** create `.venv` using the desired Python version. The server selects an installer-saved environment first, then the project's virtual environment, unless `PYTHON` is set. A `PYTHON` override must be one executable path, without arguments; `py -3` is not a valid value. Install `requirements.txt` with that same interpreter.
 - **Missing boto3:** install `requirements.txt` into the Python environment used by the server, then restart it. A previously set `PYTHON` override takes precedence over `.venv`.
 - **PowerShell blocks `npm.ps1`:** use `npm.cmd` in place of `npm`. You can also start with `node server.mjs`.
 
@@ -119,7 +121,7 @@ npm ci
 npm start
 ```
 
-Use Python 3.11 or newer and install Node.js using the Linux instructions above. Do not reuse a Windows `.venv` inside WSL. Set `PYTHON` to this same Linux interpreter each time you start the app; it takes precedence over any `.venv` in the checkout.
+Use Python 3.11 or newer and install Node.js using the Linux instructions above. Do not reuse a Windows `.venv` inside WSL. For this manual setup, set `PYTHON` to this same Linux interpreter each time you start the app; it takes precedence over any saved environment or `.venv` in the checkout. The automated `install.sh` workflow below remembers it for you.
 
 Open the app in your usual Windows browser at [http://127.0.0.1:3000](http://127.0.0.1:3000). The Console link opens in that browser; the server does not launch a Linux browser.
 
@@ -129,33 +131,46 @@ For CLI credentials and Resource Lookup, the source keys must exist in **WSL's**
 
 Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Run the setup commands below and configure your roles. Configure source credentials as well if you need CLI credentials or Resource Lookup.
 
-macOS/Linux:
+macOS, Linux, or Debian/Ubuntu on WSL:
 
 ```sh
 git clone https://github.com/jperch1987/aws-profile-switcher.git profile-switcher
 cd profile-switcher
-npm ci
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-cp profiles.example.txt profiles.txt
+bash install.sh
 # Edit profiles.txt and configure source credentials as described below.
-npm start
+bash start.sh
 ```
 
-Windows PowerShell:
+If Node.js or Python is missing, use `bash install.sh --install-runtimes` instead. On macOS this requires an existing Homebrew installation and installs missing runtimes through Homebrew. On Debian/Ubuntu/WSL it uses apt for Python prerequisites (which may request your sudo password) and, when needed, downloads Node.js 24 from nodejs.org into your Linux home, checking the published SHA-256 checksum. Other Linux distributions can use the default installer after their supported runtimes are installed. No shell startup files are changed.
+
+Native Windows PowerShell:
 
 ```powershell
 git clone https://github.com/jperch1987/aws-profile-switcher.git profile-switcher
 cd profile-switcher
-npm.cmd ci
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item profiles.example.txt profiles.txt
+.\install.ps1
 # Edit profiles.txt and configure source credentials as described below.
-npm.cmd start
+.\start.ps1
 ```
 
-You can also start with `node server.mjs`. Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and stop the server with Ctrl+C. Example account IDs, MFA devices, and roles are placeholders and will not grant AWS access. When upgrading an existing checkout, run `git pull`, `npm ci`, and the Python dependency installation command, then restart the server and refresh the app. Use `npm.cmd` on PowerShell. Do not overwrite your personal `profiles.txt`. The Node.js server uses its standard library and has no runtime npm dependencies.
+Use `.\install.ps1 -InstallRuntimes` to install missing Node.js/Python through WinGet. Windows uses PowerShell scripts because `.sh` files require a Unix shell; inside WSL, use `install.sh` and `start.sh`. If your Windows execution policy blocks scripts, follow your organization's approved PowerShell policy or use the manual installation commands below.
+
+The installers validate **Node.js 22+** and **Python 3.11+**, create a Python virtual environment, install `requirements.txt`, run `npm ci --ignore-scripts`, and create `profiles.txt` only if it does not already exist. They do not configure AWS credentials or install a browser. On WSL the environment is always in `$HOME/.venvs/aws-profile-switcher-wsl`, even if the checkout is on `/mnt/c`; other platforms use `.venv` beside the app. The selected executable paths are saved in ignored, platform-specific files under `.state`, so subsequent launches use the installed environment. An explicit `PYTHON` setting still takes precedence; unset a stale override if switching to the installer-managed environment.
+
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and stop the server with Ctrl+C. Example account IDs, MFA devices, and roles are placeholders. `npm start` (Windows: `npm.cmd start`) also recognizes the saved Python environment when Node.js/npm are on PATH. The start scripts additionally find the Node.js executable saved by the installer.
+
+To upgrade, stop the app, run `git pull`, rerun your platform's installer, then restart and refresh the browser. Existing profiles and AWS credentials are preserved. For ZIP downloads, extract the new version into a separate folder, copy your profile metadata file, and run the installer there.
+
+Manual dependency setup remains available with the runtimes installed:
+
+```sh
+npm ci --ignore-scripts
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+npm start
+```
+
+On native Windows, use `npm.cmd`, `python -m venv .venv`, and `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`. For manual WSL installation, use the Linux-home environment instructions above. Copy `profiles.example.txt` to `profiles.txt` only on a fresh setup; do not replace an existing personal file. The Node.js server has no runtime npm dependencies.
 
 **Upgrading from v1.3.0:** `npm ci` removes the app's obsolete Playwright Node.js dependency. Previously downloaded Chromium binaries and `.state/browser` (or `browser/` under a custom state directory) are neither used nor automatically deleted. The old browser profile may contain sensitive cookies and sign-in data; keep it private and out of shared files. Browser download caches may be shared with other projects.
 
@@ -174,8 +189,8 @@ npm.cmd start
 | --- | --- | --- |
 | `PROFILES_FILE` | `profiles.txt` beside the server | Local config file; relative paths resolve from the working directory |
 | `PORT` | `3000` | Loopback web server port |
-| `PYTHON` | Project `.venv` Python when present; otherwise `python3` or Windows `python` | Override the Python executable; its environment must contain `requirements.txt` packages |
-| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for legacy selection metadata; old v1.3.0 browser data is not loaded |
+| `PYTHON` | Installer-saved environment, then project `.venv`, then `python3` or Windows `python` | Override the Python executable; its environment must contain `requirements.txt` packages |
+| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for legacy selection metadata; installer executable paths always use the app’s `.state` directory |
 
 For example, `PORT=8080 npm start` changes the port on macOS/Linux. To choose a specific Python installation, replace the example path below with the full path to your installed Python 3.11+ executable:
 
@@ -286,7 +301,7 @@ Use **Resource Lookup** when you know a resource's ID, exact name, or ARN and ne
 
 1. Choose a **Source identity**. Profiles are grouped by their exact `source_profile` and resolved MFA device; a batch cannot mix groups.
 2. Choose one **Resource type** and enter its **Exact ID, name, or ARN**. Queries are single-line, limited to 256 characters, and do not support wildcard or substring searches.
-3. Under **Search scope**, select 1–25 profiles. Each regional resource is checked only in that profile's resolved configured region. S3 searches owned buckets across regions and reports the bucket's actual region when available.
+3. Under **Search scope**, use **Select all** to include all profiles in the group (up to 250), or choose a subset. When everything is selected, the button says **All selected**. Groups larger than 250 need separate searches of at most 250 profiles. Each regional resource is checked only in that profile's resolved configured region. S3 searches owned buckets across regions and reports the bucket's actual region when available. Route 53 hosted zones are global and are checked regardless of the profile's region.
 4. Enter a fresh code in **Lookup MFA code**, then choose **Search resources**. To search another source identity or another batch of profiles, start a new search with a fresh code.
 5. Review both the matches and each profile's coverage/status. Use **Cancel search** to stop an active search or **Clear results** to remove displayed metadata.
 
@@ -299,14 +314,17 @@ Use **Resource Lookup** when you know a resource's ID, exact name, or ARN and ne
 | S3 bucket | Bucket name or bucket ARN; buckets owned by the target account | `s3:ListAllMyBuckets`, `s3:GetBucketLocation` |
 | RDS DB instance | DB instance identifier or DB instance ARN | `rds:DescribeDBInstances` |
 | Lambda function | Function name or unqualified function ARN | `lambda:GetFunctionConfiguration` |
+| EKS cluster | Cluster name or cluster ARN | `eks:DescribeCluster` |
+| ElastiCache | Cache cluster, replication group, or serverless cache ID/name or ARN | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `elasticache:DescribeServerlessCaches` |
+| Route 53 hosted zone | Exact domain, hosted zone ID (with or without `/hostedzone/`), or hosted zone ARN | `route53:GetHostedZone`, `route53:ListHostedZonesByName` |
 
-This scope does not include RDS clusters, Lambda versions/aliases, S3 objects, buckets merely shared from another account, or regions absent from the selected profiles. A `Name` tag is not necessarily unique, so multiple exact matches can be valid. Lambda lookup does not download function code or return environment variables.
+This scope does not include Route 53 DNS records, EKS workloads or node groups, ElastiCache snapshots, RDS clusters, Lambda versions/aliases, S3 objects, buckets merely shared from another account, or regions absent from the selected profiles. A `Name` tag is not necessarily unique, so multiple exact matches can be valid. Lambda lookup does not download function code or return environment variables. ElastiCache name searches check all three cache kinds; an ARN restricts the search to its kind. Route 53 domain matching accepts a trailing dot and returns all matching owned public/private hosted zones, subject to the search limits. A zone shared for VPC association does not establish ownership.
 
-Searches are bounded: the Python worker has a 150-second deadline, the server terminates a worker after 180 seconds, and results are limited to 100 matches per profile. Paginated EC2 filters and S3 scans stop after 10 pages per filter/scan. Hitting a limit is reported as incomplete. A denied request, timeout, cancelled or unsearched profile, or partial scan **does not establish that a resource does not exist**. Even a completed no-match result applies only to the selected account, resource type, and region/ownership scope. If S3 ownership is confirmed but reading its location is denied, the confirmed match can remain with an unknown region and an access-denied status.
+Searches are bounded: the Python worker has a nine-minute deadline, the server terminates a worker after ten minutes, and results are limited to 100 matches per profile. Paginated scans stop after 10 pages per filter/scan. The server caps total worker output at 32 MiB. Hitting a limit is reported as incomplete. A denied request, timeout, cancelled or unsearched profile, or partial scan **does not establish that a resource does not exist**. Even a completed no-match result applies only to the selected account, resource type, and region/ownership scope. If S3 ownership is confirmed but reading its location is denied, the confirmed match can remain with an unknown region and an access-denied status.
 
 Each search calls [AWS STS GetSessionToken](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetSessionToken.html) once for the chosen source identity with a fresh MFA code and a 900-second duration. The worker uses that temporary IAM-user session to assume each target role separately for 900 seconds. It passes the configured external ID when needed and supplies a restrictive session policy containing only the selected resource type's read actions. Credentials stay inside the worker and are discarded when it exits; they are not returned as exports, saved to disk, or reused by another search. This does not change the separate **Get CLI credentials** requirement for fresh MFA on every request.
 
-The source user still needs permission to assume the target roles, and their existing trust policies must allow it. The target roles need the read permissions above. [lookup-permissions.example.json](lookup-permissions.example.json) is a target-role permission example for all seven supported types; review it and narrow resources where the API supports that. The app does not attach policies or grant permissions. Its per-search session policy cannot add permissions missing from the target role. `GetSessionToken` itself does not require an IAM permission grant. MFA is evaluated when assuming the role; assumed-role credentials do not satisfy a separate MFA-context requirement on downstream resource policies. See [AWS MFA-protected API access](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html).
+The source user still needs permission to assume the target roles, and their existing trust policies must allow it. The target roles need the read permissions above. [lookup-permissions.example.json](lookup-permissions.example.json) is a target-role permission example for all ten supported types; review it and narrow resources where the API supports that. The app does not attach policies or grant permissions. Its per-search session policy cannot add permissions missing from the target role. `GetSessionToken` itself does not require an IAM permission grant. MFA is evaluated when assuming the role; assumed-role credentials do not satisfy a separate MFA-context requirement on downstream resource policies. See [AWS MFA-protected API access](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html).
 
 The browser displays only resource metadata and scan statuses. **Clear results**, page exit/reload, or **Refresh** clears the local display. The server keeps only the most recent lookup's metadata in memory, replaces it when a new lookup starts, and expires it 10 minutes after the lookup finishes. Clearing the display does not immediately delete that server snapshot; stopping the server clears its memory. The browser also expires displayed results. Neither cancelling nor clearing a search revokes temporary AWS credentials before their normal expiration. Treat account, resource, and naming information as private when sharing screenshots or support reports.
 
@@ -339,6 +357,6 @@ This is a **credential-capable application for a trusted single-user desktop**. 
 npm test
 ```
 
-Tests use temporary fixtures and mocked AWS responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, resource lookup, Console-link validation, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, resource-read permissions, and your role policies must be verified in your own environment.
+Tests use temporary fixtures and mocked AWS responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, resource lookup, Console-link validation, installer workflows with mocked tools, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, resource-read permissions, and your role policies must be verified in your own environment.
 
 The implementation has not received an independent security audit or production certification. Review and test it for your environment before distributing it to clients.

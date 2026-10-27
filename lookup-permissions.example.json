@@ -12,7 +12,13 @@
         "s3:ListAllMyBuckets",
         "s3:GetBucketLocation",
         "rds:DescribeDBInstances",
-        "lambda:GetFunctionConfiguration"
+        "lambda:GetFunctionConfiguration",
+        "eks:DescribeCluster",
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeServerlessCaches",
+        "route53:GetHostedZone",
+        "route53:ListHostedZonesByName"
       ],
       "Resource": "*"
     }

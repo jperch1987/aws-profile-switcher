@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
 import { readFile, mkdir, writeFile, rename, unlink } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -33,10 +33,23 @@ function resolveLocalPath(value) {
 const quotePosix = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
 const quotePowerShell = (value) => "'" + value.replaceAll("'", "''") + "'";
 
-export function pythonExecutable() {
-  if (process.env.PYTHON) return process.env.PYTHON;
-  const local = path.join(APP_DIR, '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
-  return existsSync(local) ? local : (process.platform === 'win32' ? 'python' : 'python3');
+export function pythonExecutable({ env = process.env, platform = process.platform, release = os.release(), appDir = APP_DIR,
+  exists = existsSync, read = readFileSync } = {}) {
+  if (env.PYTHON) return env.PYTHON;
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const wsl = platform === 'linux' && (env.WSL_DISTRO_NAME || env.WSL_INTEROP || /microsoft/i.test(release));
+  const marker = platform === 'win32' ? 'python-windows.txt' : wsl ? 'python-wsl' : 'python-unix';
+  const saved = paths.join(appDir, '.state', marker);
+  if (exists(saved)) {
+    let executable = '';
+    try { executable = read(saved, 'utf8').replace(/^\uFEFF/, '').trim(); } catch { /* Show a safe reinstall instruction below. */ }
+    if (!executable || /[\u0000-\u001f\u007f]/.test(executable) || !paths.isAbsolute(executable) || !exists(executable)) {
+      throw new Error('The installed Python environment is unavailable. Run the installer again or set PYTHON to a working interpreter.');
+    }
+    return executable;
+  }
+  const local = paths.join(appDir, '.venv', platform === 'win32' ? 'Scripts' : 'bin', platform === 'win32' ? 'python.exe' : 'python');
+  return exists(local) ? local : (platform === 'win32' ? 'python' : 'python3');
 }
 
 export function workerFailureMessage(error, stderr, kind) {
@@ -243,7 +256,7 @@ export function createProfileServer(options = {}) {
         sendJson(res, 200, lookup.get(url.searchParams.get('id')));
       } else if (req.method === 'POST' && url.pathname === '/api/lookup') {
         if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before searching AWS resources.', 403);
-        const body = await readJson(req, 64 * 1024);
+        const body = await readJson(req, 4 * 1024 * 1024);
         try {
           if (authenticationPending) throw new AppError('CLI authentication is in progress. Wait before starting a lookup.', 409);
           if (lookup.running()) throw new AppError('A resource lookup is already running. Finish or cancel it first.', 409);

@@ -1,0 +1,3 @@
+# Author: jperch1987
+# Keep shell scripts usable in WSL even when cloned with Windows Git.
+* text=auto eol=lf

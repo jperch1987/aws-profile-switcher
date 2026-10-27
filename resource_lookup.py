@@ -17,13 +17,13 @@ import aws_session
 from profiles import ProfileConfigError
 
 
-MAX_REQUEST_BYTES = 65536
-MAX_PROFILES = 25
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_PROFILES = 250
 MAX_PAGES = 10
 MAX_RESULTS = 100
 PAGE_SIZE = 100
 MAX_PAGE_ITEMS = 1000
-SCAN_SECONDS = 150
+SCAN_SECONDS = 540
 SESSION_SECONDS = 900
 READ_ACTIONS = {
     "ec2": ["ec2:DescribeInstances"],
@@ -33,6 +33,14 @@ READ_ACTIONS = {
     "s3": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
     "rds": ["rds:DescribeDBInstances"],
     "lambda": ["lambda:GetFunctionConfiguration"],
+    "eks": ["eks:DescribeCluster"],
+    "elasticache": ["elasticache:DescribeCacheClusters", "elasticache:DescribeReplicationGroups", "elasticache:DescribeServerlessCaches"],
+    "route53": ["route53:GetHostedZone", "route53:ListHostedZonesByName"],
+}
+ELASTICACHE_TYPES = {
+    "cluster": ("describe_cache_clusters", "CacheClusterId", "CacheClusters", "MaxRecords", "Marker"),
+    "replicationgroup": ("describe_replication_groups", "ReplicationGroupId", "ReplicationGroups", "MaxRecords", "Marker"),
+    "serverlesscache": ("describe_serverless_caches", "ServerlessCacheName", "ServerlessCaches", "MaxResults", "NextToken"),
 }
 EC2_TYPES = {
     "ec2": ("instance", "i", "describe_instances", "InstanceId", "Reservations", "instance-id"),
@@ -79,6 +87,25 @@ def _bucket_name(value):
                 and not value.endswith("--x-s3"))
 
 
+def _zone_id(value):
+    if not isinstance(value, str):
+        return None
+    value = value.removeprefix("/hostedzone/")
+    return value if re.fullmatch(r"Z[A-Z0-9]{1,31}", value) else None
+
+
+def _dns_name(value):
+    # Use ASCII/Punycode domain names; ignore DNS case and a single root dot.
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    value = value.removesuffix(".").lower()
+    if not 1 <= len(value) <= 253:
+        return None
+    if all(re.fullmatch(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?", label) for label in value.split(".")):
+        return value + "."
+    return None
+
+
 def parse_query(resource_type, query):
     if not isinstance(resource_type, str) or resource_type not in READ_ACTIONS or not _text(query) or query != query.strip():
         raise LookupError("Choose a supported resource type and enter an exact name, ID, or ARN using at most 256 single-line characters.")
@@ -92,6 +119,11 @@ def parse_query(resource_type, query):
             if service != "s3" or region or account or not _bucket_name(resource):
                 raise LookupError("Use a general-purpose S3 bucket name or bucket ARN, without an object path.")
             result["value"] = resource
+        elif resource_type == "route53":
+            match = re.fullmatch(r"hostedzone/(Z[A-Z0-9]{1,31})", resource)
+            if service != "route53" or region or account or not match:
+                raise LookupError("Use a Route 53 hosted zone ARN, without an account ID or region.")
+            result["value"] = match.group(1)
         else:
             if not aws_session.REGION_PATTERN.fullmatch(region) or not re.fullmatch(r"[0-9]{12}", account):
                 raise LookupError("The resource ARN must contain a supported region and a twelve-digit account ID.")
@@ -101,8 +133,13 @@ def parse_query(resource_type, query):
                 if service != "ec2" or not match:
                     raise LookupError("The resource ARN does not match the selected resource type.")
                 result["value"] = match.group(1)
+            elif resource_type == "elasticache":
+                match = re.fullmatch(r"(cluster|replicationgroup|serverlesscache):([^:]+)", resource)
+                if service != "elasticache" or not match:
+                    raise LookupError("Use an ElastiCache cache cluster, replication group, or serverless cache ARN.")
+                result.update(kind=match.group(1), value=match.group(2))
             else:
-                prefix = "db:" if resource_type == "rds" else "function:"
+                prefix = {"rds": "db:", "lambda": "function:", "eks": "cluster/"}[resource_type]
                 if service != resource_type or not resource.startswith(prefix):
                     raise LookupError("The resource ARN does not match the selected resource type.")
                 result["value"] = resource[len(prefix):]
@@ -115,6 +152,23 @@ def parse_query(resource_type, query):
         raise LookupError("Enter a Lambda function name or unqualified function ARN, without an alias or version.")
     if resource_type == "rds" and (not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,62}", value) or value.endswith("-") or "--" in value):
         raise LookupError("Enter an RDS DB instance identifier or DB instance ARN.")
+    if resource_type == "eks" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", value):
+        raise LookupError("Enter an EKS cluster name or cluster ARN.")
+    if resource_type == "elasticache":
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,49}", value) or value.endswith("-") or "--" in value:
+            raise LookupError("Enter an ElastiCache cache cluster, replication group, or serverless cache name or ARN.")
+        if result.get("kind") in {"replicationgroup", "serverlesscache"} and len(value) > 40:
+            raise LookupError("ElastiCache replication group and serverless cache identifiers contain at most 40 characters.")
+        result["value"] = value.lower()
+    if resource_type == "route53":
+        zone_id = _zone_id(value)
+        if zone_id:
+            result.update(value=zone_id, kind="id")
+        else:
+            domain = _dns_name(value)
+            if not domain:
+                raise LookupError("Enter a Route 53 hosted zone ID, hosted zone ARN, or an ASCII/Punycode domain name.")
+            result.update(value=domain, kind="name")
     return result
 
 
@@ -124,12 +178,13 @@ def validate_request(config_file, payload):
     names = payload["profiles"]
     if (not isinstance(names, list) or not 1 <= len(names) <= MAX_PROFILES
             or any(not _text(name, 2048) for name in names) or len(set(names)) != len(names)):
-        raise LookupError("Select between one and twenty-five unique role profiles.")
+        raise LookupError("Select between one and 250 unique role profiles.")
     if not isinstance(payload["mfaCode"], str) or not re.fullmatch(r"[0-9]{6}", payload["mfaCode"]):
         raise LookupError("Enter a fresh six-digit MFA code for the selected source profile.")
     query = parse_query(payload["resourceType"], payload["query"])
     try:
-        profiles = [aws_session._selected_profile(config_file, name) for name in names]
+        config = aws_session.read_profiles(config_file)
+        profiles = [aws_session._selected_profile(config_file, name, config=config) for name in names]
     except (aws_session.SessionError, ProfileConfigError):
         raise LookupError("A selected role profile is missing or invalid. Check its role, source profile, MFA device, and region, then refresh.") from None
     if len({(profile["source_profile"], profile["mfa_serial"]) for profile in profiles}) != 1:
@@ -154,7 +209,7 @@ def _scan_failure(error, *, authenticating=False):
         return ScanError("access_denied")
     if code in {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException", "SignatureDoesNotMatch"}:
         return ScanError("auth_failed")
-    if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault", "ResourceNotFoundException", "NoSuchBucket", "InvalidInstanceID.NotFound", "InvalidVolume.NotFound", "InvalidGroup.NotFound", "InvalidVpcID.NotFound"}:
+    if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault", "ResourceNotFoundException", "NoSuchBucket", "InvalidInstanceID.NotFound", "InvalidVolume.NotFound", "InvalidGroup.NotFound", "InvalidVpcID.NotFound", "CacheClusterNotFound", "CacheClusterNotFoundFault", "ReplicationGroupNotFound", "ReplicationGroupNotFoundFault", "ServerlessCacheNotFoundFault", "NoSuchHostedZone"}:
         return ScanError("not_found")
     return ScanError("error")
 
@@ -176,7 +231,10 @@ def _client(session, config_class, service, region, credentials):
     }
     if service == "s3":
         options["s3"] = {"addressing_style": "path", "us_east_1_regional_endpoint": "regional"}
-    return session.client(service, region_name=region, endpoint_url=f"https://{service}.{region}.amazonaws.com", verify=True,
+    endpoint = f"https://{service}.{region}.amazonaws.com"
+    if service == "route53":
+        region, endpoint = "us-east-1", "https://route53.amazonaws.com"
+    return session.client(service, region_name=region, endpoint_url=endpoint, verify=True,
                           aws_access_key_id=credentials["AccessKeyId"], aws_secret_access_key=credentials["SecretAccessKey"],
                           aws_session_token=credentials.get("SessionToken"), config=config_class(**options))
 
@@ -376,6 +434,109 @@ def _lambda(client, selected, query, rows, deadline):
     _add(rows, _row(selected, "lambda", query["value"], query["value"], expected))
 
 
+def _eks(client, selected, query, rows, deadline):
+    response = _call(client, "describe_cluster", {"name": query["value"]}, deadline)
+    cluster = response.get("cluster") if isinstance(response, dict) else None
+    expected = f"arn:aws:eks:{selected['region']}:{selected['role_arn'].split(':')[4]}:cluster/{query['value']}"
+    if not isinstance(cluster, dict) or cluster.get("name") != query["value"] or cluster.get("arn") != expected:
+        raise ScanError("error", MESSAGES["invalid_response"])
+    _add(rows, _row(selected, "eks", query["value"], query["value"], expected))
+
+
+def _elasticache(client, selected, query, rows, deadline):
+    failure = None
+    kinds = [query["kind"]] if query.get("kind") else ELASTICACHE_TYPES
+    for kind in kinds:
+        # Only cache clusters support names longer than 40 characters.
+        if kind in {"replicationgroup", "serverlesscache"} and len(query["value"]) > 40:
+            continue
+        operation, id_key, response_key, size_key, token_key = ELASTICACHE_TYPES[kind]
+        parameters = {id_key: query["value"], size_key: PAGE_SIZE}
+        try:
+            for page in _pages(client, operation, parameters, deadline, token_key):
+                caches = _list(page, response_key)
+                if len(caches) > MAX_PAGE_ITEMS:
+                    raise ScanError("error", MESSAGES["limit"])
+                for cache in caches:
+                    identifier, arn = cache.get(id_key), cache.get("ARN")
+                    expected = f"arn:aws:elasticache:{selected['region']}:{selected['role_arn'].split(':')[4]}:{kind}:{query['value']}"
+                    if not isinstance(identifier, str) or identifier != query["value"] or arn != expected:
+                        raise ScanError("error", MESSAGES["invalid_response"])
+                    _add(rows, _row(selected, "elasticache", identifier, identifier, arn))
+        except Exception as error:
+            current = _scan_failure(error)
+            if current.status == "not_found":
+                continue
+            if current.status in {"auth_failed", "skipped"}:
+                raise current
+            # A name can exist in more than one subtype. Preserve later matches
+            # even if another subtype is denied, but report an incomplete check.
+            if failure is None:
+                failure = current
+    if failure is not None:
+        raise failure
+
+
+def _route53(client, selected, query, rows, deadline):
+    target_id = query["value"] if query["kind"] == "id" else None
+    if target_id:
+        response = _call(client, "get_hosted_zone", {"Id": target_id}, deadline)
+        zone = response.get("HostedZone") if isinstance(response, dict) else None
+        if not isinstance(zone, dict) or _zone_id(zone.get("Id")) != target_id:
+            raise ScanError("error", MESSAGES["invalid_response"])
+        name = _dns_name(zone.get("Name"))
+        if not name:
+            raise ScanError("error", MESSAGES["invalid_response"])
+    else:
+        name = query["value"]
+    # These listings contain zones created by the current account. Confirm an
+    # ID lookup here too: hosted zone ARNs do not themselves contain an owner.
+    parameters = {"DNSName": name, "MaxItems": str(PAGE_SIZE)}
+    seen = set()
+    for _ in range(MAX_PAGES):
+        response = _call(client, "list_hosted_zones_by_name", parameters, deadline)
+        zones = _list(response, "HostedZones")
+        if len(zones) > MAX_PAGE_ITEMS:
+            raise ScanError("error", MESSAGES["limit"])
+        for zone in zones:
+            raw_name = zone.get("Name")
+            if not _text(raw_name, 1024):
+                raise ScanError("error", MESSAGES["invalid_response"])
+            # Unrelated zones may use Route 53 escape sequences outside this
+            # search's supported ASCII/Punycode input. The ordered exact-name
+            # range has already ended, so their other metadata is irrelevant.
+            if raw_name.removesuffix(".").lower() != name.removesuffix("."):
+                return
+            zone_id, zone_name = _zone_id(zone.get("Id")), _dns_name(raw_name)
+            if not zone_id or not zone_name:
+                raise ScanError("error", MESSAGES["invalid_response"])
+            if target_id and zone_id != target_id:
+                continue
+            _add(rows, _row(selected, "route53", zone_id, zone_name.removesuffix("."),
+                            f"arn:aws:route53:::hostedzone/{zone_id}", "global"))
+            if target_id:
+                return
+        truncated = response.get("IsTruncated")
+        if not isinstance(truncated, bool):
+            raise ScanError("error", MESSAGES["invalid_response"])
+        if not truncated:
+            return
+        raw_next_name = response.get("NextDNSName")
+        if not _text(raw_next_name, 1024):
+            raise ScanError("error", MESSAGES["invalid_response"])
+        if raw_next_name.removesuffix(".").lower() != name.removesuffix("."):
+            return
+        next_name, next_id = _dns_name(raw_next_name), _zone_id(response.get("NextHostedZoneId"))
+        if not next_name or not next_id:
+            raise ScanError("error", MESSAGES["invalid_response"])
+        cursor = (next_name, next_id)
+        if cursor in seen:
+            raise ScanError("error", MESSAGES["limit"])
+        seen.add(cursor)
+        parameters = {"DNSName": next_name, "HostedZoneId": next_id, "MaxItems": str(PAGE_SIZE)}
+    raise ScanError("error", MESSAGES["limit"])
+
+
 def _emit_check(emit, selected, status, rows, message=None):
     emit({"event": "profile", "check": {"profile": selected["profile"],
           "accountId": selected["role_arn"].split(":")[4], "region": selected["region"],
@@ -434,8 +595,14 @@ def scan(config_file, payload, emit):
                             _s3(client, selected, query, rows, deadline)
                         elif resource_type == "rds":
                             _rds(client, selected, query, rows, deadline)
-                        else:
+                        elif resource_type == "lambda":
                             _lambda(client, selected, query, rows, deadline)
+                        elif resource_type == "eks":
+                            _eks(client, selected, query, rows, deadline)
+                        elif resource_type == "elasticache":
+                            _elasticache(client, selected, query, rows, deadline)
+                        else:
+                            _route53(client, selected, query, rows, deadline)
                     _emit_check(emit, selected, "found" if rows else "not_found", rows)
                 except Exception as error:
                     failure = _scan_failure(error)

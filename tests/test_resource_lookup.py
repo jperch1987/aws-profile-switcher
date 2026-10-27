@@ -55,7 +55,8 @@ class LookupTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.profiles = {"dev": selected(), "prod": selected("prod", role_arn=f"arn:aws:iam::{ACCOUNT}:role/Production")}
-        self.profile_reader = self.stack.enter_context(patch.object(aws_session, "_selected_profile", side_effect=lambda _, name: self.profiles[name]))
+        self.config_reader = self.stack.enter_context(patch.object(aws_session, "read_profiles", side_effect=lambda _: {"file": CONFIG, "profiles": list(self.profiles.values())}))
+        self.profile_reader = self.stack.enter_context(patch.object(aws_session, "_selected_profile", wraps=aws_session._selected_profile))
         self.source_client = Mock()
         self.source_client.get_session_token.return_value = {"Credentials": credentials("SOURCE_SESSION")}
         self.sts = Mock()
@@ -117,7 +118,7 @@ class LookupTests(unittest.TestCase):
 
     def test_all_request_and_profile_validation_happens_before_aws(self):
         invalid = [None, {}, {**request(), "extra": "PRIVATE"}, {**request(), "profiles": []},
-                   {**request(), "profiles": ["dev", "dev"]}, {**request(), "profiles": ["dev"] * 26},
+                   {**request(), "profiles": ["dev", "dev"]}, {**request(), "profiles": [f"profile-{n}" for n in range(251)]},
                    {**request(), "mfaCode": 123456}, {**request(), "mfaCode": "12345"},
                    {**request(), "query": "line\nbreak"}, {**request(), "query": "x" * 257},
                    {**request(), "resourceType": []}, {**request(), "resourceType": "unsupported"}]
@@ -274,7 +275,7 @@ class LookupTests(unittest.TestCase):
             events = self.scan(request(profiles=["dev", "prod"]))
             self.assertEqual([event["check"]["status"] for event in events], ["skipped", "skipped"])
         self.source_client.get_session_token.assert_not_called()
-        with patch.object(lookup.time, "monotonic", side_effect=[0, 1, 2, 3, 200, 201]):
+        with patch.object(lookup.time, "monotonic", side_effect=[0, 1, 2, 3, 600, 601]):
             events = self.scan(request(profiles=["dev", "prod"]))
         self.assertEqual([event["check"]["status"] for event in events], ["skipped", "skipped"])
         self.resource.describe_instances.assert_not_called()
@@ -359,6 +360,214 @@ class LookupTests(unittest.TestCase):
             self.assertEqual(event["check"]["status"], expected)
             self.assertNotIn("PRIVATE", json.dumps(event))
             self.assertNotIn("012345", event["check"]["message"])
+
+    def test_all_250_profiles_are_checked_with_one_mfa_session(self):
+        self.profiles = {f"account-{n}": selected(f"account-{n}") for n in range(250)}
+        events = self.scan(request(profiles=list(self.profiles)))
+        self.assertEqual(len(events), 250)
+        self.assertTrue(all(event["check"]["status"] == "found" for event in events))
+        self.assertEqual(self.sts.assume_role.call_count, 250)
+        self.source_client.get_session_token.assert_called_once()
+        self.config_reader.assert_called_once_with(CONFIG)
+
+    def test_invalid_profile_in_shared_config_snapshot_stops_before_mfa(self):
+        self.profiles["prod"]["role_arn"] = "invalid"
+        with self.assertRaisesRegex(lookup.LookupError, "selected role profile"):
+            self.scan(request(profiles=["dev", "prod"]))
+        self.config_reader.assert_called_once_with(CONFIG)
+        self.sdk.assert_not_called()
+        self.source_client.get_session_token.assert_not_called()
+
+    def test_eks_name_and_arn_are_confirmed_without_exposing_cluster_secrets(self):
+        arn = f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/example-eks"
+        self.resource.describe_cluster.return_value = {"cluster": {"name": "example-eks", "arn": arn,
+            "connectorConfig": {"activationCode": "PRIVATE"}, "certificateAuthority": {"data": "PRIVATE"}}}
+        for query in ["example-eks", arn]:
+            event = self.scan(request("eks", query))[0]
+            self.assertEqual(event["check"]["status"], "found")
+            self.assertEqual(event["results"][0]["arn"], arn)
+            self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.describe_cluster.assert_called_with(name="example-eks")
+        self.resource.describe_cluster.return_value["cluster"]["arn"] = arn.replace(ACCOUNT, "999999999999")
+        self.assertEqual(self.scan(request("eks", "example-eks"))[0]["check"]["status"], "error")
+        self.resource.describe_cluster.side_effect = aws_error("ResourceNotFoundException")
+        self.assertEqual(self.scan(request("eks", "example-eks"))[0]["check"]["status"], "not_found")
+
+    def test_new_types_reject_unsupported_arns_and_names_before_authentication(self):
+        invalid = [("eks", "bad/name"), ("eks", f"arn:aws:eks:{REGION}:{ACCOUNT}:nodegroup/name/group/id"),
+            ("elasticache", "bad--name"), ("elasticache", f"arn:aws:elasticache:{REGION}:{ACCOUNT}:snapshot:example"),
+            ("elasticache", f"arn:aws:elasticache:{REGION}:{ACCOUNT}:replicationgroup:" + "a" * 41),
+            ("elasticache", f"arn:aws:elasticache:{REGION}:{ACCOUNT}:serverlesscache:" + "a" * 41),
+            ("route53", "arn:aws:route53:us-east-1::hostedzone/Z12345"),
+            ("route53", f"arn:aws:route53::{ACCOUNT}:hostedzone/Z12345"),
+            ("route53", "arn:aws:route53:::healthcheck/Z12345"),
+            ("route53", "*.example.com"), ("route53", "example..com"), ("route53", "example.com/path")]
+        for resource_type, query in invalid:
+            with self.subTest(resource_type=resource_type, query=query), self.assertRaises(lookup.LookupError):
+                self.scan(request(resource_type, query))
+        self.sdk.assert_not_called()
+
+    def test_new_regional_arns_skip_different_accounts_before_mfa(self):
+        for resource_type, resource in [("eks", "cluster/example"), ("elasticache", "cluster:example")]:
+            event = self.scan(request(resource_type, f"arn:aws:{resource_type}:{REGION}:999999999999:{resource}"))[0]
+            self.assertEqual(event["check"]["status"], "skipped")
+        self.sdk.assert_not_called()
+
+    def cache_response(self, kind, name="example-cache"):
+        _, id_key, response_key, _, _ = lookup.ELASTICACHE_TYPES[kind]
+        return {response_key: [{id_key: name, "ARN": f"arn:aws:elasticache:{REGION}:{ACCOUNT}:{kind}:{name}", "AuthToken": "PRIVATE"}]}
+
+    def test_elasticache_plain_name_searches_all_subtypes_and_preserves_collisions(self):
+        for kind, (operation, _, _, _, _) in lookup.ELASTICACHE_TYPES.items():
+            getattr(self.resource, operation).return_value = self.cache_response(kind)
+        event = self.scan(request("elasticache", "Example-Cache"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 3)
+        self.assertEqual(len({row["arn"] for row in event["results"]}), 3)
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.describe_cache_clusters.assert_called_once_with(CacheClusterId="example-cache", MaxRecords=100)
+        self.resource.describe_replication_groups.assert_called_once_with(ReplicationGroupId="example-cache", MaxRecords=100)
+        self.resource.describe_serverless_caches.assert_called_once_with(ServerlessCacheName="example-cache", MaxResults=100)
+
+    def test_elasticache_arn_only_queries_its_subtype(self):
+        for kind, (operation, _, _, _, _) in lookup.ELASTICACHE_TYPES.items():
+            self.resource.reset_mock()
+            arn = f"arn:aws:elasticache:{REGION}:{ACCOUNT}:{kind}:example-cache"
+            getattr(self.resource, operation).return_value = self.cache_response(kind)
+            event = self.scan(request("elasticache", arn))[0]
+            self.assertEqual(event["check"]["status"], "found")
+            for other_kind, (other_operation, _, _, _, _) in lookup.ELASTICACHE_TYPES.items():
+                if other_kind != kind:
+                    getattr(self.resource, other_operation).assert_not_called()
+
+    def test_long_elasticache_cluster_names_skip_impossible_subtypes(self):
+        name = "a" * 50
+        self.resource.describe_cache_clusters.return_value = self.cache_response("cluster", name)
+        event = self.scan(request("elasticache", name))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["results"][0]["resourceId"], name)
+        self.resource.describe_replication_groups.assert_not_called()
+        self.resource.describe_serverless_caches.assert_not_called()
+
+    def test_elasticache_absent_subtypes_do_not_hide_later_matches(self):
+        self.resource.describe_cache_clusters.side_effect = aws_error("CacheClusterNotFound")
+        self.resource.describe_replication_groups.side_effect = aws_error("ReplicationGroupNotFoundFault")
+        self.resource.describe_serverless_caches.return_value = self.cache_response("serverlesscache")
+        event = self.scan(request("elasticache", "example-cache"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 1)
+        self.resource.describe_serverless_caches.side_effect = aws_error("ServerlessCacheNotFoundFault")
+        self.assertEqual(self.scan(request("elasticache", "example-cache"))[0]["check"]["status"], "not_found")
+
+    def test_elasticache_partial_denial_keeps_other_matches_and_reports_incomplete(self):
+        self.resource.describe_cache_clusters.side_effect = aws_error("AccessDenied")
+        self.resource.describe_replication_groups.side_effect = aws_error("ReplicationGroupNotFoundFault")
+        self.resource.describe_serverless_caches.return_value = self.cache_response("serverlesscache")
+        event = self.scan(request("elasticache", "example-cache"))[0]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertNotIn("PRIVATE", json.dumps(event))
+
+    def test_elasticache_serverless_pagination_is_bounded_and_validates_owner(self):
+        arn = f"arn:aws:elasticache:{REGION}:{ACCOUNT}:serverlesscache:example-cache"
+        response = self.cache_response("serverlesscache")
+        self.resource.describe_serverless_caches.side_effect = [{"ServerlessCaches": [], "NextToken": "NEXT"}, response]
+        event = self.scan(request("elasticache", arn))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(self.resource.describe_serverless_caches.call_args.kwargs["NextToken"], "NEXT")
+        response["ServerlessCaches"][0]["ARN"] = arn.replace(ACCOUNT, "999999999999")
+        self.resource.describe_serverless_caches.side_effect = None
+        self.resource.describe_serverless_caches.return_value = response
+        event = self.scan(request("elasticache", arn))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(event["results"], [])
+        self.resource.describe_serverless_caches.return_value = {"ServerlessCaches": [], "NextToken": "REPEAT"}
+        self.assertEqual(self.scan(request("elasticache", arn))[0]["check"]["status"], "error")
+
+    def zone(self, zone_id="Z12345", name="example.com."):
+        return {"Id": f"/hostedzone/{zone_id}", "Name": name, "CallerReference": "PRIVATE", "Config": {"PrivateZone": True}}
+
+    def test_route53_domain_normalizes_case_and_returns_all_owned_zones_globally(self):
+        self.profiles["dev"]["region"] = "eu-west-1"
+        self.resource.list_hosted_zones_by_name.side_effect = [
+            {"HostedZones": [self.zone()], "IsTruncated": True, "NextDNSName": "example.com.", "NextHostedZoneId": "Z67890"},
+            {"HostedZones": [self.zone("Z67890"), self.zone("Z99999", "example.net.")], "IsTruncated": False}]
+        event = self.scan(request("route53", "EXAMPLE.com"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["check"]["region"], "eu-west-1")
+        self.assertEqual([row["resourceId"] for row in event["results"]], ["Z12345", "Z67890"])
+        self.assertTrue(all(row["region"] == "global" for row in event["results"]))
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.assertEqual(self.resource.list_hosted_zones_by_name.call_args.kwargs, {"DNSName": "example.com.", "HostedZoneId": "Z67890", "MaxItems": "100"})
+        route_client = next(options for service, options in self.clients if service == "route53")
+        self.assertEqual(route_client["region_name"], "us-east-1")
+        self.assertEqual(route_client["endpoint_url"], "https://route53.amazonaws.com")
+        self.resource.get_hosted_zone.assert_not_called()
+
+    def test_route53_id_and_arn_require_confirmation_in_account_owned_listing(self):
+        self.resource.get_hosted_zone.return_value = {"HostedZone": self.zone()}
+        for query in ["Z12345", "/hostedzone/Z12345", "arn:aws:route53:::hostedzone/Z12345"]:
+            self.resource.list_hosted_zones_by_name.return_value = {"HostedZones": [self.zone()], "IsTruncated": False}
+            event = self.scan(request("route53", query))[0]
+            self.assertEqual(event["check"]["status"], "found")
+            self.assertEqual(event["results"][0]["arn"], "arn:aws:route53:::hostedzone/Z12345")
+        self.resource.get_hosted_zone.assert_called_with(Id="Z12345")
+        self.resource.list_hosted_zones_by_name.return_value = {"HostedZones": [self.zone("Z67890")], "IsTruncated": False}
+        event = self.scan(request("route53", "Z12345"))[0]
+        self.assertEqual(event["check"]["status"], "not_found")
+        self.assertEqual(event["results"], [])
+
+    def test_route53_denial_and_malformed_pagination_never_report_absence(self):
+        self.resource.list_hosted_zones_by_name.side_effect = aws_error("AccessDenied")
+        self.assertEqual(self.scan(request("route53", "example.com"))[0]["check"]["status"], "access_denied")
+        self.resource.list_hosted_zones_by_name.side_effect = None
+        for response in [{"HostedZones": []}, {"HostedZones": [], "IsTruncated": True},
+            {"HostedZones": [self.zone()], "IsTruncated": True, "NextDNSName": "example.com.", "NextHostedZoneId": "Z12345"}]:
+            self.resource.list_hosted_zones_by_name.return_value = response
+            event = self.scan(request("route53", "example.com"))[0]
+            self.assertEqual(event["check"]["status"], "error")
+            self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.get_hosted_zone.side_effect = aws_error("NoSuchHostedZone")
+        self.assertEqual(self.scan(request("route53", "Z12345"))[0]["check"]["status"], "not_found")
+
+    def test_route53_result_limit_preserves_confirmed_zones(self):
+        self.resource.list_hosted_zones_by_name.return_value = {"HostedZones": [self.zone(f"Z{n:05}") for n in range(101)], "IsTruncated": False}
+        event = self.scan(request("route53", "example.com"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 100)
+
+    def test_route53_unrelated_escaped_names_end_the_exact_name_range(self):
+        responses = [
+            {"HostedZones": [self.zone(), self.zone("Z67890", r"foo\052.com.")], "IsTruncated": False},
+            {"HostedZones": [self.zone()], "IsTruncated": True, "NextDNSName": r"foo\052.com.", "NextHostedZoneId": "Z67890"},
+        ]
+        for response in responses:
+            self.resource.list_hosted_zones_by_name.reset_mock()
+            self.resource.list_hosted_zones_by_name.return_value = response
+            event = self.scan(request("route53", "example.com"))[0]
+            self.assertEqual(event["check"]["status"], "found")
+            self.assertEqual([row["resourceId"] for row in event["results"]], ["Z12345"])
+            self.resource.list_hosted_zones_by_name.assert_called_once()
+        self.resource.list_hosted_zones_by_name.return_value = {
+            "HostedZones": [self.zone("invalid", "example.com.")], "IsTruncated": False}
+        self.assertEqual(self.scan(request("route53", "example.com"))[0]["check"]["status"], "error")
+
+    def test_example_policy_matches_all_supported_resource_read_actions(self):
+        policy = json.loads((Path(__file__).resolve().parents[1] / "lookup-permissions.example.json").read_text())
+        self.assertEqual(set(policy["Statement"][0]["Action"]), {action for actions in lookup.READ_ACTIONS.values() for action in actions})
+
+    def test_large_selected_scope_survives_worker_stdin_without_truncation(self):
+        names = [f"profile-{n}-" + "\u90e8" * 256 for n in range(250)]
+        payload = json.dumps(request(profiles=names), ensure_ascii=False).encode()
+        self.assertGreater(len(payload), 65536)
+        output = io.StringIO()
+        def scan(config_file, decoded, emit):
+            self.assertEqual(config_file, CONFIG)
+            self.assertEqual(decoded["profiles"], names)
+            emit({"event": "complete"})
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(lookup, "scan", side_effect=scan), redirect_stdout(output):
+            self.assertEqual(lookup.main(["--file", CONFIG]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"event": "complete"})
 
     def test_stdout_protocol_is_ndjson_metadata_only_and_stderr_is_empty(self):
         output, errors = io.StringIO(), io.StringIO()

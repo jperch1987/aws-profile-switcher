@@ -124,28 +124,57 @@ test('lookup starts with explicit scopes grouped by source profile and MFA devic
   assert.equal(ui.requests.length, 1);
 });
 
-test('more than 25 eligible profiles are never silently selected or truncated', async () => {
-  const list = Array.from({ length: 26 }, (_, index) => ({ ...profiles[0], profile: `role-${index}` }));
+test('Select all includes every profile beyond the former 25-profile limit, through 250', async () => {
+  for (const total of [26, 250]) {
+    const list = Array.from({ length: total }, (_, index) => ({ ...profiles[0], profile: `role-${index}` }));
+    const ui = await app({ list, start: (options) => {
+      const body = JSON.parse(options.body);
+      return response(snapshot({ names: body.profiles, list }));
+    } });
+    assert.equal(ui.get('lookup-profiles').children.length, total);
+    assert.equal(ui.get('lookup-select-all').disabled, false);
+    assert.equal(ui.get('lookup-select-all').textContent, 'All selected');
+    ui.get('lookup-select-none').dispatch('click');
+    assert.ok(ui.get('lookup-profiles').children.every((row) => !row.children[0].checked));
+    assert.equal(ui.get('lookup-select-all').textContent, 'Select all');
+    assert.equal(ui.get('lookup-select-all').disabled, false);
+    ui.get('lookup-mfa').value = '123456';
+    ui.get('lookup-select-all').dispatch('click');
+    assert.ok(ui.get('lookup-profiles').children.every((row) => row.children[0].checked));
+    assert.equal(ui.get('lookup-select-all').textContent, 'All selected');
+    assert.equal(ui.get('lookup-select-all').disabled, false);
+    assert.equal(ui.get('lookup-submit').disabled, false);
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.match(ui.get('lookup-scope-summary').textContent, new RegExp(`${total} of ${total} profiles selected`));
+    await ui.search();
+    const sent = JSON.parse(ui.requests.at(-1).options.body);
+    assert.deepEqual(sent.profiles, list.map(({ profile }) => profile));
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /invalid lookup response/);
+  }
+});
+
+test('more than 250 eligible profiles have an explained limit and are never silently selected or truncated', async () => {
+  const list = Array.from({ length: 251 }, (_, index) => ({ ...profiles[0], profile: `role-${index}` }));
   const ui = await app({ list, start: (options) => {
     const body = JSON.parse(options.body);
     return response(snapshot({ names: body.profiles, list }));
   } });
-  assert.equal(ui.get('lookup-profiles').children.length, 26);
+  assert.equal(ui.get('lookup-profiles').children.length, 251);
   assert.ok(ui.get('lookup-profiles').children.every((row) => !row.children[0].checked));
-  assert.match(ui.get('lookup-scope-summary').textContent, /none have been selected automatically/);
+  assert.match(ui.get('lookup-scope-summary').textContent, /250-profile search limit.*Select all is unavailable.*None have been selected automatically/);
   assert.equal(ui.get('lookup-select-all').disabled, true);
   await ui.search();
   assert.equal(ui.requests.length, 1);
-  for (let index = 0; index < 26; index++) ui.choose(index, true);
+  for (let index = 0; index < 251; index++) ui.choose(index, true);
   assert.equal(ui.get('lookup-submit').disabled, true);
-  assert.match(ui.get('lookup-scope-summary').textContent, /26 of 26.*no more than 25/);
+  assert.match(ui.get('lookup-scope-summary').textContent, /251 of 251.*no more than 250/);
   await ui.search();
   assert.equal(ui.requests.length, 1);
-  ui.choose(25, false);
+  ui.choose(250, false);
   await ui.search();
   const sent = JSON.parse(ui.requests.at(-1).options.body);
-  assert.equal(sent.profiles.length, 25);
-  assert.deepEqual(sent.profiles, list.slice(0, 25).map(({ profile }) => profile));
+  assert.equal(sent.profiles.length, 250);
+  assert.deepEqual(sent.profiles, list.slice(0, 250).map(({ profile }) => profile));
 });
 
 test('lookup requires its own fresh six-digit MFA and validates bounded exact queries before sending', async () => {
@@ -256,6 +285,48 @@ test('S3 uses global scope wording and displays its verified bucket region', asy
   assert.equal(ui.get('lookup-results-body').children[0].children[2].textContent, 'ap-southeast-2');
   assert.match(ui.get('lookup-checks').children[0].children[1].textContent, /us-east-1 · S3 global lookup/);
   assert.equal(JSON.parse(ui.requests.at(-1).options.body).resourceType, 's3');
+});
+
+test('EKS and ElastiCache options send exact queries and display account and configured region', async () => {
+  for (const [type, query, label, placeholder] of [['eks', 'production-cluster', 'EKS cluster', /production-cluster/], ['elasticache', 'orders-cache', 'ElastiCache cache', /replication group.*serverless cache/]]) {
+    assert.ok(html.includes(`<option value="${type}">${label}</option>`));
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: type, query, results: [result(0, { resourceType: type, resourceId: query, name: query })], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    ui.get('lookup-type').value = type;
+    ui.get('lookup-type').dispatch('change');
+    assert.match(ui.get('lookup-query').placeholder, placeholder);
+    assert.match(ui.get('lookup-region-help').textContent, /configured region/);
+    await ui.search({ type, query });
+    assert.equal(JSON.parse(ui.requests.at(-1).options.body).resourceType, type);
+    const row = ui.get('lookup-results-body').children[0];
+    assert.equal(row.children[0].textContent, '111111111111');
+    assert.equal(row.children[2].textContent, 'us-east-1');
+    assert.equal(row.children[3].children[0].textContent, query);
+  }
+});
+
+test('Route 53 searches hosted zones globally and keeps configured regions out of absence claims', async () => {
+  assert.ok(html.includes('<option value="route53">Route 53 hosted zone</option>'));
+  for (const found of [true, false]) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'route53', query: 'example.com', results: found ? [result(0, { resourceType: 'route53', resourceId: 'Z0123456789ABC', name: 'example.com.', arn: 'arn:aws:route53:::hostedzone/Z0123456789ABC', region: 'global' })] : [], checks: [check(0, found ? 'found' : 'not_found'), check(1, 'not_found')] })) });
+    ui.get('lookup-type').value = 'route53';
+    ui.get('lookup-type').dispatch('change');
+    assert.match(ui.get('lookup-region-help').textContent, /hosted zone lookup is global.*individual DNS records are outside/);
+    assert.match(ui.get('lookup-query').placeholder, /example.com.*Z0123456789ABC/);
+    await ui.search({ type: 'route53', query: 'example.com' });
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /invalid lookup response/);
+    assert.match(ui.get('lookup-checks').children[0].children[1].textContent, /Route 53 global lookup/);
+    if (found) assert.equal(ui.get('lookup-results-body').children[0].children[2].textContent, 'global');
+    else assert.equal(ui.get('lookup-no-results').textContent, 'No exact match was returned from the checked profiles. Other accounts were not searched.');
+  }
+});
+
+test('resource rows cannot claim another region except for explicitly global lookup types', async () => {
+  for (const [resourceType, region] of [['eks', 'eu-west-1'], ['elasticache', 'global'], ['route53', 'us-east-1'], ['s3', 'unexpected-region']]) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType, query: 'example', results: [result(0, { resourceType, region })], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    await ui.search({ type: resourceType, query: 'example' });
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+  }
 });
 
 test('explicit cancellation carries the job ID and CSRF token and rejects stale polling updates', async () => {

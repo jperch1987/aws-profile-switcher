@@ -7,13 +7,36 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult, workerFailureMessage } from '../server.mjs';
+import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult, workerFailureMessage, pythonExecutable } from '../server.mjs';
 import { buildConsoleTarget } from '../console-target.mjs';
 import { createLookupManager } from '../resource-lookup.mjs';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 
 const execFileAsync = promisify(execFile);
+test('installer interpreter selection isolates WSL, Unix and Windows and honors explicit overrides', () => {
+  const files = new Map([
+    ['/app/.state/python-wsl', '/home/user/.venvs/app/bin/python\n'],
+    ['/app/.state/python-unix', '/app/.venv/bin/python\n'],
+    ['C:\\app\\.state\\python-windows.txt', '\uFEFFC:\\app\\.venv\\Scripts\\python.exe\r\n'],
+  ]);
+  const executables = new Set(['/home/user/.venvs/app/bin/python', '/app/.venv/bin/python', 'C:\\app\\.venv\\Scripts\\python.exe']);
+  const options = { env: {}, platform: 'linux', release: 'Linux', appDir: '/app',
+    exists: (file) => files.has(file) || executables.has(file), read: (file) => files.get(file) };
+  assert.equal(pythonExecutable({ ...options, env: { PYTHON: '/custom/python', WSL_DISTRO_NAME: 'Debian' } }), '/custom/python');
+  assert.equal(pythonExecutable({ ...options, env: { WSL_DISTRO_NAME: 'Debian' } }), '/home/user/.venvs/app/bin/python');
+  assert.equal(pythonExecutable({ ...options, release: '5.15-microsoft-standard-WSL2' }), '/home/user/.venvs/app/bin/python');
+  assert.equal(pythonExecutable({ ...options, platform: 'darwin' }), '/app/.venv/bin/python');
+  assert.equal(pythonExecutable({ ...options, platform: 'win32', appDir: 'C:\\app' }), 'C:\\app\\.venv\\Scripts\\python.exe');
+  files.set('/app/.state/python-unix', '/missing/python');
+  assert.throws(() => pythonExecutable(options), /Run the installer again/);
+  files.set('/app/.state/python-unix', '/usr/bin/python\nmalformed');
+  assert.throws(() => pythonExecutable(options), /Run the installer again/);
+  files.delete('/app/.state/python-unix');
+  assert.equal(pythonExecutable(options), '/app/.venv/bin/python');
+  assert.equal(pythonExecutable({ ...options, exists: () => false }), 'python3');
+});
+
 test('worker failures identify the last known Console stage without exposing raw diagnostics', () => {
   const trace = 'PRIVATE_KEY_TOKEN_123456\nnot json\n';
   const killed = { killed: true };
@@ -141,7 +164,7 @@ test('resource lookup endpoints require CSRF, isolate authentication, and return
   assert.equal((await app.request('/api/lookup', { method: 'POST', headers: { 'content-type': 'application/json' }, body })).status, 403);
   assert.equal((await app.request('/api/lookup', { method: 'POST', headers: { ...headers, origin: 'https://foreign.example' }, body })).status, 403);
   assert.equal((await app.request('/api/lookup', { method: 'POST', headers, body: JSON.stringify({ profiles: ['dev'], query: 'x', resourceType: 'ec2' }) })).status, 400);
-  const longNames = JSON.stringify({ profiles: Array.from({ length: 20 }, (_, i) => `profile-${i}-${'x'.repeat(250)}`), resourceType: 'ec2', query: 'example-server', mfaCode: '012345' });
+  const longNames = JSON.stringify({ profiles: Array.from({ length: 250 }, (_, i) => `profile-${i}-${'界'.repeat(300)}`), resourceType: 'ec2', query: 'example-server', mfaCode: '012345' });
   assert.ok(Buffer.byteLength(longNames) > 4096);
   assert.equal((await app.request('/api/lookup', { method: 'POST', headers, body: longNames })).status, 404, 'lookup accepts bounded larger scopes before validating names');
   assert.equal((await app.request('/api/cli', { method: 'POST', headers, body: longNames })).status, 413, 'CLI keeps the smaller request cap');

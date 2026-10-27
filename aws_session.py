@@ -49,8 +49,10 @@ class SessionError(ValueError):
     """An actionable diagnostic safe to display without AWS response details."""
 
 
-def _selected_profile(config_file: str | Path, profile_name: str) -> dict[str, str]:
-    result = read_profiles(config_file)
+def _selected_profile(config_file: str | Path, profile_name: str, *, config: dict | None = None) -> dict[str, str]:
+    # A lookup validates many roles against one already-parsed metadata snapshot.
+    # Ordinary CLI requests still read a fresh snapshot for each switch.
+    result = read_profiles(config_file) if config is None else config
     available = {profile["profile"]: profile for profile in result["profiles"]}
     selected = available.get(profile_name)
     if selected is None:
