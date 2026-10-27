@@ -2,11 +2,11 @@
 
 Author: jperch1987
 
-A local web app built with **Node.js and Python**. Choose a role from a local AWS config-format text file and either copy temporary credentials for a terminal or switch roles automatically in a separate app-controlled AWS browser.
+A local web app built with **Node.js and Python**. Choose a role from a local AWS config-format text file and either copy temporary credentials for a terminal or open AWS's prefilled Switch Role page in your current browser.
 
-Clients need Node.js, Python, the packages in `requirements.txt` (including **boto3**), and the pinned **Playwright** package and Chromium browser for automatic Console switching. **Codex and browser extensions are not required.** AWS CLI is optional for the app itself; install it separately to run `aws` commands. The repository contains source code and dependency manifests; each client installs the dependencies and browser binaries locally.
+Clients need Node.js, Python, the packages in `requirements.txt` (including **boto3**), and their existing browser. **No separate browser, Codex, or browser extension is required.** AWS CLI is optional for the app itself; install it separately to run `aws` commands. Download or clone the repository, install the Python dependencies locally, and configure your profiles.
 
-**Get CLI credentials** requires a fresh six-digit MFA code in the app and produces five ready-to-copy environment assignments. It uses an IAM user's long-term keys through `source_profile`; SSO, `credential_process`, web identity, temporary source credentials, and role chaining are not supported by this CLI flow. **Open AWS Console** uses the identity signed in to the dedicated browser instead. You complete sign-in and any AWS MFA prompts in that browser; the app then submits the AWS Switch Role form. A manual switch-page link remains available for your ordinary browser.
+**Get CLI credentials** requires a fresh six-digit MFA code in the app and produces five ready-to-copy environment assignments. It uses an IAM user's long-term keys through `source_profile`; SSO, `credential_process`, web identity, temporary source credentials, and role chaining are not supported by this CLI flow. **Open AWS Switch Role** opens a new tab in your current browser, using its AWS sign-in session. Review the prefilled account and role, then click **Switch Role** on AWS. AWS handles any sign-in and MFA prompts there.
 
 ## Install Python and Node.js
 
@@ -57,7 +57,7 @@ npm --version
 python3 --version
 ```
 
-Add the `export PATH=...` line to `~/.zshrc` if you want it applied in future Zsh terminals. The [Node.js formula](https://formulae.brew.sh/formula/node@24) is keg-only; the [Python formula](https://formulae.brew.sh/formula/python@3.14) puts the `python3` alias in its `libexec/bin` directory. Continue with the app installation below; Homebrew does not install the app's Python packages, Playwright package, or Chromium browser.
+Add the `export PATH=...` line to `~/.zshrc` if you want it applied in future Zsh terminals. The [Node.js formula](https://formulae.brew.sh/formula/node@24) is keg-only; the [Python formula](https://formulae.brew.sh/formula/python@3.14) puts the `python3` alias in its `libexec/bin` directory. Continue with the app installation below; Homebrew does not install the app's Python packages.
 
 ### Linux
 
@@ -99,8 +99,7 @@ This installs Node.js 24 and npm for your user. Run `nvm use 24` in a new termin
 
 - **Multiple Python versions:** create `.venv` using the desired Python version. The server selects the project's virtual environment automatically unless `PYTHON` is set. A `PYTHON` override must be one executable path, without arguments; `py -3` is not a valid value. Install `requirements.txt` with that same interpreter.
 - **Missing boto3:** install `requirements.txt` into the Python environment used by the server, then restart it. A previously set `PYTHON` override takes precedence over `.venv`.
-- **PowerShell blocks `npm.ps1`:** use `npm.cmd` and `npx.cmd` in place of `npm` and `npx`. You can also start with `node server.mjs`.
-- **Chromium is missing:** from the project folder, run `npm ci`, then `npx playwright install chromium`. On supported Linux distributions, use `npx playwright install --with-deps chromium` to install the required system libraries too. See [Playwright browser installation](https://playwright.dev/docs/browsers).
+- **PowerShell blocks `npm.ps1`:** use `npm.cmd` in place of `npm`. You can also start with `node server.mjs`.
 
 Virtual environment activation is optional: the commands below call its Python executable directly.
 
@@ -115,19 +114,18 @@ python3 -m venv "$HOME/.venvs/aws-profile-switcher-wsl"
 "$HOME/.venvs/aws-profile-switcher-wsl/bin/python" -m pip install -r requirements.txt
 export PYTHON="$HOME/.venvs/aws-profile-switcher-wsl/bin/python"
 npm ci
-npx playwright install --with-deps chromium
 npm start
 ```
 
 Use Python 3.11 or newer and install Node.js using the Linux instructions above. Do not reuse a Windows `.venv` inside WSL. Set `PYTHON` to this same Linux interpreter each time you start the app; it takes precedence over any `.venv` in the checkout.
 
-Automatic Console switching launches a visible **Linux** Chromium window, so WSL needs **WSL 2 with WSLg**. Microsoft documents GUI support on Windows 10 build 19044+ and Windows 11; WSL 1 cannot run this flow. If the browser cannot open, follow [Microsoft's WSL GUI setup and troubleshooting](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps). Without a working Linux display, run the app natively on Windows or use the manual switch-page link. Install browser dependencies inside the same WSL distribution as the server.
+Open the app in your usual Windows browser at [http://127.0.0.1:3000](http://127.0.0.1:3000). The Console link opens in that browser; the server does not launch a Linux browser.
 
 For CLI credentials, the source keys must exist in **WSL's** `~/.aws/credentials`, not only in your Windows home. Match the credentials section to `source_profile` exactly. For example, `source_profile = work-user` requires a `[work-user]` section containing that source user's keys; putting them only under `[default]` will not satisfy that configuration. Keep the MFA device identifier in `mfa_serial` in the profile config as described below.
 
 ## Install and run the app
 
-Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Install the Node.js dependencies, Chromium, and Python dependencies, then configure your roles. Configure source credentials as well if you need CLI credentials.
+Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Run the setup commands below and configure your roles. Configure source credentials as well if you need CLI credentials.
 
 macOS/Linux:
 
@@ -135,7 +133,6 @@ macOS/Linux:
 git clone https://github.com/jperch1987/aws-profile-switcher.git profile-switcher
 cd profile-switcher
 npm ci
-npx playwright install chromium
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp profiles.example.txt profiles.txt
@@ -149,7 +146,6 @@ Windows PowerShell:
 git clone https://github.com/jperch1987/aws-profile-switcher.git profile-switcher
 cd profile-switcher
 npm.cmd ci
-npx.cmd playwright install chromium
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item profiles.example.txt profiles.txt
@@ -157,9 +153,9 @@ Copy-Item profiles.example.txt profiles.txt
 npm.cmd start
 ```
 
-On supported Linux distributions, replace the browser installation command with `npx playwright install --with-deps chromium` to include system libraries; installing these may require administrator privileges. See [Playwright installation requirements](https://playwright.dev/docs/browsers).
+You can also start with `node server.mjs`. Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and stop the server with Ctrl+C. Example account IDs, MFA devices, and roles are placeholders and will not grant AWS access. When upgrading an existing checkout, run `git pull`, `npm ci`, and the Python dependency installation command, then restart the server and refresh the app. Use `npm.cmd` on PowerShell. Do not overwrite your personal `profiles.txt`. The Node.js server uses its standard library and has no runtime npm dependencies.
 
-You can also start with `node server.mjs`. Open [http://127.0.0.1:3000](http://127.0.0.1:3000) and stop the server with Ctrl+C. Example account IDs, MFA devices, and roles are placeholders and will not grant AWS access. When upgrading an existing checkout, run `git pull`, `npm ci`, `npx playwright install chromium`, and the Python dependency installation command, then restart the server and refresh the app. Use the `.cmd` commands on PowerShell. Do not overwrite your personal `profiles.txt`. Playwright loads only when automatic Console switching is requested; metadata and CLI features do not launch Chromium.
+**Upgrading from v1.3.0:** `npm ci` removes the app's obsolete Playwright Node.js dependency. Previously downloaded Chromium binaries and `.state/browser` (or `browser/` under a custom state directory) are neither used nor automatically deleted. The old browser profile may contain sensitive cookies and sign-in data; keep it private and out of shared files. Browser download caches may be shared with other projects.
 
 To keep your metadata file outside the checkout:
 
@@ -177,7 +173,7 @@ npm.cmd start
 | `PROFILES_FILE` | `profiles.txt` beside the server | Local config file; relative paths resolve from the working directory |
 | `PORT` | `3000` | Loopback web server port |
 | `PYTHON` | Project `.venv` Python when present; otherwise `python3` or Windows `python` | Override the Python executable; its environment must contain `requirements.txt` packages |
-| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for legacy selection metadata and the sensitive persistent Chromium profile in `browser/` |
+| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for legacy selection metadata; old v1.3.0 browser data is not loaded |
 
 For example, `PORT=8080 npm start` changes the port on macOS/Linux. To choose a specific Python installation, replace the example path below with the full path to your installed Python 3.11+ executable:
 
@@ -262,7 +258,7 @@ For PowerShell:
 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_SECURITY_TOKEN', 'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_ROLE_SESSION_NAME' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
 ```
 
-Every **Get CLI credentials** request needs a fresh MFA code and creates a new one-hour STS session. The exported credentials can be reused until they expire; pasting the same valid exports does not request MFA again. The app does not reuse a cached session for a new request or refresh credentials in the background. Request a new set whenever you switch roles or the session expires. Console switching uses the separate browser session and AWS's sign-in/MFA prompts; requesting CLI credentials does not sign in that browser.
+Every **Get CLI credentials** request needs a fresh MFA code and creates a new one-hour STS session. The exported credentials can be reused until they expire; pasting the same valid exports does not request MFA again. The app does not reuse a cached session for a new request or refresh credentials in the background. Request a new set whenever you switch roles or the session expires. Console switching uses your current browser's AWS session and AWS's sign-in/MFA prompts; requesting CLI credentials does not sign in that browser.
 
 If your authenticator changes codes every 30 seconds, wait for a newly displayed code and submit it promptly. The CLI helper's 45-second response timeout does not extend the code's validity, and the app never retries a code automatically. AWS validates the code when it processes the role request.
 
@@ -285,33 +281,25 @@ For advanced terminal-only use, `aws_session.py` remains available as an optiona
 ## Open a role in AWS Console
 
 1. Select a role profile and review its target account and full role name.
-2. Choose **Open AWS Console**. The server opens a separate Chromium window controlled by this app.
-3. If AWS asks you to sign in, do so in that window and complete any AWS MFA prompt there. Use the identity authorized to assume the selected role.
-4. The app opens AWS's Switch Role form with the intended account and role prefilled, checks those fields, and clicks **Switch Role** automatically. Review the account and role shown inside AWS before working, and choose your Console region there.
+2. Choose **Open AWS Switch Role**. AWS's Switch Role page opens in a new tab in the browser you are already using, with the account and role prefilled.
+3. Sign in to AWS in that browser if needed, using an identity authorized to assume the role. Complete any AWS MFA prompts there. If sign-in does not return you to the form, open the link again.
+4. Review the form and click **Switch Role** on AWS. Confirm the account and role shown in the AWS Console before working, and choose your Console region there.
 
-The app shows progress while switching. Canceling a pending switch closes its pending tab; a switch already submitted to AWS cannot be undone by canceling. Stopping the server closes the managed browser. Your ordinary Chrome/Edge session is separate: the app does not copy its cookies, control its tabs, or sign it out. The app's MFA field and local source access keys are used for CLI credentials, not this Console workflow.
+The app opens a normal link; it does not click AWS's confirmation button or control the new tab. The app's MFA field and local source access keys are used for CLI credentials, not this Console action. It does not log you out or replace your browser's original sign-in identity.
 
-The dedicated browser keeps its own profile in `.state/browser` by default, or `browser/` under `PROFILE_SWITCHER_STATE_DIR`. **This directory contains sensitive cookies and other sign-in data on disk.** The default `.state/` location is ignored by Git; keep custom state directories outside the checkout or exclude them too. Sign out through AWS when finished with a client account. Closing the window or stopping the app does not erase that browser profile or revoke its AWS sessions; keep the directory private and never distribute it with the repository.
+AWS authorizes a role switch using the browser's original sign-in identity, even after switching to another role. AWS controls sign-in and MFA requirements; this flow does not force a fresh MFA challenge on every switch. Root-user sessions cannot switch roles, roles requiring `ExternalId` cannot use the form, and the complete role path/name must be no more than 64 characters. See [AWS Console switching restrictions](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-console.html).
 
-AWS authorizes each role switch using the browser's original sign-in identity, even after switching to another role. AWS decides when MFA is required; this flow does not force a fresh MFA challenge on every switch. Root-user sessions cannot switch roles, roles requiring `ExternalId` cannot use the form, and the complete role path/name must be no more than 64 characters. See [AWS Console switching restrictions](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-console.html).
+The link supports commercial AWS role ARNs (`arn:aws:iam::...:role/...`) and is restricted to `https://signin.aws.amazon.com/switchrole`. The app does not discover SSO permission sets, configure an identity provider, or change IAM policies. Use your organization's approved sign-in process.
 
-This is local browser automation of the normal AWS form, not an AWS-supported URL parameter for automatic confirmation. If AWS changes the page, access is denied, sign-in expires, or the form cannot be verified, review the browser and app status and retry or use the manual link. A completed form submission is not independent verification of the final AWS identity. Never bypass a warning or work in an account you have not confirmed.
-
-### Manual Switch Role fallback
-
-**Open switch page manually in this browser** opens the standard form in a new tab in your ordinary browser. Sign in there first, then review and click **Switch Role** yourself. It uses that browser's original sign-in identity and does not use local keys or the app's MFA field. It has the same AWS form restrictions as automatic switching.
-
-Both Console actions support commercial AWS role ARNs (`arn:aws:iam::...:role/...`). The app does not discover SSO permission sets, configure an identity provider, or change IAM policies. Use your organization's approved sign-in process.
-
-Getting CLI credentials does not change either browser's AWS session, and switching a Console role does not configure a terminal.
+Getting CLI credentials does not change your browser's AWS session, and switching a Console role does not configure a terminal.
 
 ## Local operation and security
 
-The Node server serves local assets, invokes Python for CLI authentication, and controls the dedicated Chromium browser through Playwright. The Python helper reads source keys and contacts AWS STS over HTTPS; CLI responses intentionally contain temporary credentials in the displayed exports. Source keys are never returned to the browser. Chromium contacts AWS directly and persists its own sensitive browser profile. Local UI assets have no external scripts, fonts, or telemetry.
+The Node server serves local assets and invokes Python for CLI authentication. The Python helper reads source keys and contacts AWS STS over HTTPS; CLI responses intentionally contain temporary credentials in the displayed exports. Source keys are never returned to the browser. Console switching uses a normal AWS link in your current browser. Local UI assets have no external scripts, fonts, or telemetry.
 
 The authentication helper uses fixed AWS destinations and does not honor custom endpoint or proxy overrides. Networks that require an outbound proxy may need an approved network configuration before authentication can work.
 
-This is a **credential-capable application for a trusted single-user desktop**. It binds to `127.0.0.1`, checks Host/origin headers, and requires a per-process token for state-changing and authentication requests. These controls are not user authentication: another local process or user that can reach the port can access the app, request CLI authentication, and operate the managed browser using its signed-in session. Do not expose it through a LAN listener, public proxy, or shared hosting. See [SECURITY.md](SECURITY.md) for credential handling, the trust boundary, and distribution guidance.
+This is a **credential-capable application for a trusted single-user desktop**. It binds to `127.0.0.1`, checks Host/origin headers, and requires a per-process token for state-changing and authentication requests. These controls are not user authentication: another local process or user that can reach the port can access the app and submit authentication requests. Do not expose it through a LAN listener, public proxy, or shared hosting. See [SECURITY.md](SECURITY.md) for credential handling, the trust boundary, and distribution guidance.
 
 ## Validation
 
@@ -319,8 +307,6 @@ This is a **credential-capable application for a trusted single-user desktop**. 
 npm test
 ```
 
-After installing Chromium, `npm run test:browser` also exercises the controller with a real headless browser and simulated AWS pages. All browser requests in that check are intercepted locally; it does not sign in to AWS.
-
-Tests use temporary fixtures and mocked AWS/browser responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, browser-control guards, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, automatic form submission, and your role policies must be verified in your own environment.
+Tests use temporary fixtures and mocked AWS responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, Console-link validation, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, and your role policies must be verified in your own environment.
 
 The implementation has not received an independent security audit or production certification. Review and test it for your environment before distributing it to clients.

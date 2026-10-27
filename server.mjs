@@ -9,7 +9,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildConsoleTarget } from './console-target.mjs';
-import { createManagedConsole, ManagedConsoleError } from './managed-console.mjs';
 
 const execFileAsync = promisify(execFile);
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -60,13 +59,6 @@ export function workerFailureMessage(error, stderr, kind) {
     return 'The Python CLI helper timed out before reporting progress. Check the app\'s Python environment and restart it, then retry with a newly displayed MFA code.';
   }
   return message;
-}
-
-function browserStatusPayload(status) {
-  const states = ['idle', 'starting', 'waiting-for-login', 'switching', 'opened', 'error', 'cancelled'];
-  if (!status || !states.includes(status.state) || (status.profile !== null && typeof status.profile !== 'string')
-    || typeof status.message !== 'string' || status.message.length > 1000) throw new AppError('The managed browser returned an invalid status.', 502);
-  return { state: status.state, profile: status.profile, message: status.message };
 }
 
 export function buildCredentialCommands(result) {
@@ -154,7 +146,6 @@ export function createProfileServer(options = {}) {
   const python = options.python || pythonExecutable();
   const token = randomBytes(32).toString('hex');
   const stateFile = path.join(stateDirectory, 'active-profile.json');
-  const browserConsole = options.browserConsole || createManagedConsole({ browserDirectory: path.join(stateDirectory, 'browser') });
   let authenticationPending = false;
 
   async function createSession(kind, profile, mfaCode) {
@@ -245,27 +236,6 @@ export function createProfileServer(options = {}) {
       } else if (req.method === 'GET' && url.pathname === '/api/active') {
         const { profiles } = await readProfiles();
         sendJson(res, 200, activePayload(await readActive(profiles)));
-      } else if (req.method === 'GET' && url.pathname === '/api/browser-console') {
-        sendJson(res, 200, browserStatusPayload(browserConsole.status()));
-      } else if (req.method === 'POST' && ['/api/browser-console', '/api/browser-console/cancel'].includes(url.pathname)) {
-        if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before opening the managed browser.', 403);
-        const body = await readJson(req);
-        if (url.pathname.endsWith('/cancel')) {
-          if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).length) throw new AppError('Cancellation does not accept credentials or other parameters.');
-          sendJson(res, 200, browserStatusPayload(await browserConsole.cancel()));
-        } else {
-          if (!body || typeof body.profile !== 'string' || Object.keys(body).length !== 1) throw new AppError('Choose a profile only. Complete browser sign-in and MFA in AWS.');
-          const { profiles } = await readProfiles();
-          const profile = profiles.find((entry) => entry.profile === body.profile);
-          if (!profile) throw new AppError('This profile no longer exists. Refresh the profile list.', 404);
-          const target = buildConsoleTarget(profile);
-          if (!target.url) throw new AppError(target.reason, 422);
-          try { sendJson(res, 202, browserStatusPayload(browserConsole.start(profile))); }
-          catch (error) {
-            if (error instanceof ManagedConsoleError) throw new AppError(error.message, error.statusCode);
-            throw error;
-          }
-        }
       } else if (req.method === 'POST' && url.pathname === '/api/active') {
         if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before switching profiles.', 403);
         const body = await readJson(req);
@@ -308,9 +278,6 @@ export function createProfileServer(options = {}) {
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
-  const closeBrowser = () => { void Promise.resolve().then(() => browserConsole.close()).catch(() => {}); };
-  server.on('close', closeBrowser);
-  server.on('shutdown', closeBrowser);
   return server;
 }
 
@@ -326,5 +293,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     process.exitCode = 1;
   });
   server.listen(port, '127.0.0.1', () => console.log(`Profile Switcher: http://127.0.0.1:${port}`));
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { server.emit('shutdown'); server.close(); });
 }

@@ -2,9 +2,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, browserStatus: null, browserVersion: 0, browserTimer: null, browserMutation: false, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
+const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, loadVersion: 0, token: "", shell: "posix", loading: false, switching: false, loaded: false, copyTimer: null };
 
-function busy() { return state.loading || state.switching || state.authenticating; }
+function busy() { return state.loading || state.switching; }
 function clearMfa() { $("mfa-code").value = ""; }
 
 function forgetCredentials() {
@@ -93,14 +93,17 @@ function approvedConsoleUrl(value) {
   if (typeof value !== "string" || !value) return null;
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && url.hostname === "signin.aws.amazon.com" && url.pathname === "/switchrole" && !url.username && !url.password && !url.port ? url.href : null;
+    if (url.protocol !== "https:" || url.hostname !== "signin.aws.amazon.com" || url.pathname !== "/switchrole" || url.username || url.password || url.port || url.hash) return null;
+    if ([...url.searchParams.keys()].some((key) => !["account", "roleName"].includes(key)) || url.searchParams.getAll("account").length !== 1 || url.searchParams.getAll("roleName").length !== 1) return null;
+    const role = url.searchParams.get("roleName");
+    if (!/^[0-9]{12}$/.test(url.searchParams.get("account")) || !role || role.length > 64 || !/^[\x21-\x7e]+$/.test(role) || !/^[A-Za-z0-9_+=,.@-]+$/.test(role.slice(role.lastIndexOf("/") + 1))) return null;
+    return url.href;
   } catch { return null; }
 }
 
 function clearConsoleAction() {
   $("console-link").hidden = true;
   $("console-link").removeAttribute("href");
-  $("console-button").disabled = true;
   $("mfa-code").disabled = true;
   $("console-reason").hidden = true;
   $("console-reason").textContent = "";
@@ -186,10 +189,8 @@ function renderDetails() {
   const enabled = selected.auth?.enabled === true;
   $("switch-label").textContent = state.switching ? "Authenticating…" : "Get CLI credentials";
   $("switch-button").disabled = busy() || !enabled;
-  $("switch-help").textContent = "Enter a fresh MFA code here for CLI credentials. Console sign-in happens inside the separate AWS browser.";
-  $("console-label").textContent = state.authenticating ? "Switching in AWS…" : "Open AWS Console";
+  $("switch-help").textContent = "Enter a fresh MFA code here for CLI credentials. Console switching uses your existing AWS browser session.";
   const url = approvedConsoleUrl(selected.console?.url);
-  $("console-button").disabled = busy() || !url;
   $("mfa-code").disabled = busy() || !enabled;
   $("detail-mfa").textContent = selected.auth?.mfaSerial || "Not set";
   $("detail-mfa").classList.toggle("not-set", !selected.auth?.mfaSerial);
@@ -201,7 +202,6 @@ function renderDetails() {
     $("console-reason").textContent = typeof selected.console?.reason === "string" && selected.console.reason ? selected.console.reason : "This profile does not have a supported AWS Console role.";
     $("console-reason").hidden = false;
   }
-  renderBrowserStatus();
   if (busy()) return;
   if (url) {
     $("console-link").href = url;
@@ -241,7 +241,7 @@ function renderCommand() {
 }
 
 function renderBusy() {
-  $("refresh-button").disabled = state.loading || state.switching || state.browserMutation;
+  $("refresh-button").disabled = busy();
   $("profile-search").disabled = busy();
   $("refresh-button").classList.toggle("is-loading", state.loading);
   $("refresh-button").querySelector("span").textContent = state.loading ? "Reading…" : "Refresh";
@@ -258,9 +258,8 @@ function setLoading(loading) {
 }
 
 async function loadProfiles(isRefresh = false) {
-  if (state.loading || state.switching || state.browserMutation) return;
-  const browserVersion = stopBrowserPolling();
-  state.authenticating = false;
+  if (busy()) return;
+  const loadVersion = ++state.loadVersion;
   const previousSelection = state.selected;
   clearMfa();
   clearNotice();
@@ -276,7 +275,7 @@ async function loadProfiles(isRefresh = false) {
   showEmptyList("Reading profiles…", "Refreshing the local configuration file.");
   try {
     const data = await request("/api/profiles");
-    if (browserVersion !== state.browserVersion) return;
+    if (loadVersion !== state.loadVersion) return;
     if (!Array.isArray(data.profiles) || !data.profiles.every((profile) => profile && typeof profile.profile === "string" && [profile.role_arn, profile.source_profile, profile.region].every((value) => value == null || typeof value === "string"))) throw new Error("The local server returned invalid profile data.");
     state.profiles = data.profiles;
     state.token = data.token;
@@ -289,11 +288,9 @@ async function loadProfiles(isRefresh = false) {
     renderProfiles();
     renderDetails();
     renderActive();
-    await pollBrowserStatus(browserVersion);
-    if (browserVersion !== state.browserVersion) return;
     if (isRefresh && $("notice").hidden) announce(`Configuration refreshed. ${state.profiles.length} ${state.profiles.length === 1 ? "profile is" : "profiles are"} available.`);
   } catch (error) {
-    if (browserVersion !== state.browserVersion) return;
+    if (loadVersion !== state.loadVersion) return;
     announce(error.message, true);
     state.profiles = [];
     state.selected = null;
@@ -307,7 +304,7 @@ async function loadProfiles(isRefresh = false) {
     $("browser-footer").textContent = "Waiting for a readable configuration file";
     renderActive();
   } finally {
-    if (browserVersion === state.browserVersion) setLoading(false);
+    if (loadVersion === state.loadVersion) setLoading(false);
   }
 }
 
@@ -348,113 +345,6 @@ async function switchProfile() {
       clearMfa();
       state.switching = false;
       renderBusy();
-    }
-  }
-}
-
-const browserPendingStates = new Set(["starting", "waiting-for-login", "switching"]);
-const browserStates = new Set(["idle", ...browserPendingStates, "opened", "error", "cancelled"]);
-
-function stopBrowserPolling() {
-  clearTimeout(state.browserTimer);
-  state.browserTimer = null;
-  return ++state.browserVersion;
-}
-
-function renderBrowserStatus() {
-  const status = state.browserStatus;
-  const target = status?.profile ? `“${status.profile}”: ` : "";
-  $("browser-status").textContent = status && status.state !== "idle" ? `${target}${status.message}` : "A separate browser opens AWS. Sign in and complete MFA there when asked; the app then clicks Switch Role.";
-  $("browser-status").classList.toggle("is-error", status?.state === "error");
-  $("browser-status").setAttribute("role", status?.state === "error" ? "alert" : "status");
-  $("cancel-console").hidden = !state.authenticating;
-  $("cancel-console").disabled = !state.authenticating || state.browserMutation;
-}
-
-function applyBrowserStatus(result) {
-  if (!result || !browserStates.has(result.state) || !(result.profile === null || typeof result.profile === "string") || typeof result.message !== "string" || result.message.length > 2000 || (browserPendingStates.has(result.state) && !result.profile)) throw new Error("The local server returned invalid browser status. Refresh to check the AWS browser.");
-  state.browserStatus = { state: result.state, profile: result.profile, message: result.message };
-  state.authenticating = browserPendingStates.has(result.state);
-  renderBusy();
-  renderBrowserStatus();
-  if (result.state === "error") {
-    announce(result.message, true);
-    $("notice").scrollIntoView?.({ block: "nearest" });
-  }
-}
-
-function failBrowserStatus(message) {
-  state.browserStatus = { state: "error", profile: state.browserStatus?.profile || state.selected, message };
-  state.authenticating = false;
-  announce(message, true);
-  renderBusy();
-  renderBrowserStatus();
-}
-
-function scheduleBrowserPoll(version) {
-  clearTimeout(state.browserTimer);
-  state.browserTimer = null;
-  if (version === state.browserVersion && state.authenticating) state.browserTimer = setTimeout(() => pollBrowserStatus(version), 1500);
-}
-
-async function pollBrowserStatus(version) {
-  try {
-    const result = await request("/api/browser-console");
-    if (version !== state.browserVersion) return;
-    applyBrowserStatus(result);
-    scheduleBrowserPoll(version);
-  } catch (error) {
-    if (version === state.browserVersion) failBrowserStatus(error.message);
-  }
-}
-
-async function openConsole(event) {
-  event.preventDefault();
-  if (busy()) return;
-  const selected = state.profiles.find((profile) => profile.profile === state.selected);
-  clearMfa();
-  clearCredentials();
-  if (!approvedConsoleUrl(selected?.console?.url)) return;
-  const version = stopBrowserPolling();
-  state.authenticating = true;
-  state.browserMutation = true;
-  state.browserStatus = { state: "starting", profile: selected.profile, message: "Opening the separate AWS browser…" };
-  clearNotice();
-  renderBusy();
-  try {
-    const result = await request("/api/browser-console", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile }) });
-    if (version !== state.browserVersion) return;
-    applyBrowserStatus(result);
-    scheduleBrowserPoll(version);
-  } catch (error) {
-    if (version === state.browserVersion) failBrowserStatus(error.message);
-  } finally {
-    if (version === state.browserVersion) {
-      state.browserMutation = false;
-      renderBusy();
-      renderBrowserStatus();
-    }
-  }
-}
-
-async function cancelConsole() {
-  if (!state.authenticating || state.browserMutation) return;
-  const version = stopBrowserPolling();
-  state.browserMutation = true;
-  renderBrowserStatus();
-  renderBusy();
-  try {
-    const result = await request("/api/browser-console/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: "{}" });
-    if (version !== state.browserVersion) return;
-    applyBrowserStatus(result);
-    scheduleBrowserPoll(version);
-  } catch (error) {
-    if (version === state.browserVersion) failBrowserStatus(error.message);
-  } finally {
-    if (version === state.browserVersion) {
-      state.browserMutation = false;
-      renderBusy();
-      renderBrowserStatus();
     }
   }
 }
@@ -509,11 +399,9 @@ async function copyCommand() {
 
 function clearPageSecrets() {
   state.authVersion++;
-  stopBrowserPolling();
-  state.browserMutation = false;
+  state.loadVersion++;
   state.loading = false;
   state.switching = false;
-  state.authenticating = false;
   clearMfa();
   clearCredentials();
   renderBusy();
@@ -522,8 +410,6 @@ function clearPageSecrets() {
 $("refresh-button").addEventListener("click", () => loadProfiles(true));
 $("profile-search").addEventListener("input", renderProfiles);
 $("switch-button").addEventListener("click", switchProfile);
-$("console-form").addEventListener("submit", openConsole);
-$("cancel-console").addEventListener("click", cancelConsole);
 $("mfa-code").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); switchProfile(); } });
 $("console-link").addEventListener("click", () => { clearMfa(); clearCredentials(); });
 $("console-link").addEventListener("auxclick", () => { clearMfa(); clearCredentials(); });
