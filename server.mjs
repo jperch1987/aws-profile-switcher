@@ -9,6 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildConsoleTarget } from './console-target.mjs';
+import { createLookupManager, LookupError } from './resource-lookup.mjs';
 
 const execFileAsync = promisify(execFile);
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -125,7 +126,7 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-async function readJson(req) {
+async function readJson(req, maximumBytes = MAX_BODY_BYTES) {
   if (req.headers['content-type']?.split(';')[0].trim() !== 'application/json') {
     throw new AppError('Use application/json for this request.', 415);
   }
@@ -133,7 +134,7 @@ async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new AppError('Request is too large.', 413);
+    if (size > maximumBytes) throw new AppError('Request is too large.', 413);
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
@@ -147,6 +148,7 @@ export function createProfileServer(options = {}) {
   const token = randomBytes(32).toString('hex');
   const stateFile = path.join(stateDirectory, 'active-profile.json');
   let authenticationPending = false;
+  const lookup = options.lookupManager || createLookupManager({ python, configFile });
 
   async function createSession(kind, profile, mfaCode) {
     const handler = kind === 'cli' ? options.cliSession : options.consoleSession;
@@ -236,6 +238,26 @@ export function createProfileServer(options = {}) {
       } else if (req.method === 'GET' && url.pathname === '/api/active') {
         const { profiles } = await readProfiles();
         sendJson(res, 200, activePayload(await readActive(profiles)));
+      } else if (req.method === 'GET' && url.pathname === '/api/lookup') {
+        if ([...url.searchParams.keys()].join(',') !== 'id') throw new AppError('Choose a valid lookup.', 400);
+        sendJson(res, 200, lookup.get(url.searchParams.get('id')));
+      } else if (req.method === 'POST' && url.pathname === '/api/lookup') {
+        if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before searching AWS resources.', 403);
+        const body = await readJson(req, 64 * 1024);
+        try {
+          if (authenticationPending) throw new AppError('CLI authentication is in progress. Wait before starting a lookup.', 409);
+          if (lookup.running()) throw new AppError('A resource lookup is already running. Finish or cancel it first.', 409);
+          const { profiles } = await readProfiles();
+          // Recheck after the asynchronous config read to prevent two starts
+          // racing with each other or a newly started CLI authentication.
+          if (authenticationPending) throw new AppError('CLI authentication is in progress. Wait before starting a lookup.', 409);
+          sendJson(res, 202, lookup.start(body, profiles));
+        } finally { if (body && typeof body === 'object') body.mfaCode = ''; }
+      } else if (req.method === 'POST' && url.pathname === '/api/lookup/cancel') {
+        if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before cancelling a lookup.', 403);
+        const body = await readJson(req);
+        if (!body || typeof body !== 'object' || Object.keys(body).join(',') !== 'id') throw new AppError('Choose a valid lookup to cancel.');
+        sendJson(res, 200, lookup.cancel(body.id));
       } else if (req.method === 'POST' && url.pathname === '/api/active') {
         if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before switching profiles.', 403);
         const body = await readJson(req);
@@ -254,6 +276,7 @@ export function createProfileServer(options = {}) {
           throw new AppError('Choose a profile and enter the six-digit MFA code.');
         }
         if (authenticationPending) throw new AppError('An AWS sign-in is already in progress. Wait before trying again.', 409);
+        if (lookup.running()) throw new AppError('A resource lookup is in progress. Finish or cancel it before authenticating again.', 409);
         authenticationPending = true;
         try {
           const { profiles } = await readProfiles();
@@ -273,11 +296,13 @@ export function createProfileServer(options = {}) {
         throw new AppError('Not found.', 404);
       }
     } catch (error) {
-      if (!res.headersSent && !res.destroyed) sendJson(res, error.status || 500, { error: error instanceof AppError ? error.message : 'An unexpected local server error occurred.' });
+      if (!res.headersSent && !res.destroyed) sendJson(res, error.status || 500, { error: error instanceof AppError || error instanceof LookupError ? error.message : 'An unexpected local server error occurred.' });
     }
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
+  server.on('close', () => lookup.close());
+  server.on('shutdown', () => lookup.close());
   return server;
 }
 
@@ -293,4 +318,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     process.exitCode = 1;
   });
   server.listen(port, '127.0.0.1', () => console.log(`Profile Switcher: http://127.0.0.1:${port}`));
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { server.emit('shutdown'); server.close(); });
 }

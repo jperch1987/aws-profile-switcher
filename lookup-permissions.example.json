@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "jperch1987ResourceLookupReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVpcs",
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "rds:DescribeDBInstances",
+        "lambda:GetFunctionConfiguration"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

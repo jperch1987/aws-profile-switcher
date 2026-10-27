@@ -9,6 +9,9 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult, workerFailureMessage } from '../server.mjs';
 import { buildConsoleTarget } from '../console-target.mjs';
+import { createLookupManager } from '../resource-lookup.mjs';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
 const execFileAsync = promisify(execFile);
 test('worker failures identify the last known Console stage without exposing raw diagnostics', () => {
@@ -119,6 +122,45 @@ function assertConsoleUrl(target, accountId, roleName) {
   assert.equal(url.searchParams.get('account'), accountId);
   assert.equal(url.searchParams.get('roleName'), roleName);
 }
+
+test('resource lookup endpoints require CSRF, isolate authentication, and return only job metadata', async (t) => {
+  let child;
+  let input = '';
+  const manager = createLookupManager({ python: 'unused', configFile: '/unused/config', spawnProcess: () => {
+    child = new EventEmitter(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.stdin.on('data', (chunk) => { input += chunk; });
+    child.kill = () => { queueMicrotask(() => child.emit('close', 1)); };
+    return child;
+  } });
+  const app = await fixture(t, exampleConfig, { lookupManager: manager,
+    cliSession: () => assert.fail('Lookup must not request CLI credentials'),
+    consoleSession: () => assert.fail('Lookup must not request a federation session') });
+  const { token } = (await app.request('/api/profiles')).json();
+  const headers = { 'content-type': 'application/json', 'x-csrf-token': token };
+  const body = JSON.stringify({ profiles: ['dev'], resourceType: 'ec2', query: 'example-server', mfaCode: '012345' });
+  assert.equal((await app.request('/api/lookup', { method: 'POST', headers: { 'content-type': 'application/json' }, body })).status, 403);
+  assert.equal((await app.request('/api/lookup', { method: 'POST', headers: { ...headers, origin: 'https://foreign.example' }, body })).status, 403);
+  assert.equal((await app.request('/api/lookup', { method: 'POST', headers, body: JSON.stringify({ profiles: ['dev'], query: 'x', resourceType: 'ec2' }) })).status, 400);
+  const longNames = JSON.stringify({ profiles: Array.from({ length: 20 }, (_, i) => `profile-${i}-${'x'.repeat(250)}`), resourceType: 'ec2', query: 'example-server', mfaCode: '012345' });
+  assert.ok(Buffer.byteLength(longNames) > 4096);
+  assert.equal((await app.request('/api/lookup', { method: 'POST', headers, body: longNames })).status, 404, 'lookup accepts bounded larger scopes before validating names');
+  assert.equal((await app.request('/api/cli', { method: 'POST', headers, body: longNames })).status, 413, 'CLI keeps the smaller request cap');
+  const started = await app.request('/api/lookup', { method: 'POST', headers, body });
+  assert.equal(started.status, 202);
+  const job = started.json(); assert.equal(job.state, 'running');
+  assert.doesNotMatch(started.text, /mfaCode|012345|credentials/);
+  assert.equal(JSON.parse(input).mfaCode, '012345');
+  assert.equal((await app.request(`/api/lookup?id=${job.id}`)).json().id, job.id);
+  assert.equal((await app.request(`/api/lookup?id=${job.id}&id=${job.id}`)).status, 400);
+  assert.equal((await app.request('/api/lookup?id=missing')).status, 404);
+  assert.equal((await app.request('/api/lookup', { method: 'POST', headers, body })).status, 409);
+  assert.equal((await app.request('/api/cli', { method: 'POST', headers, body: JSON.stringify({ profile: 'dev', mfaCode: '012345' }) })).status, 409);
+  assert.equal((await app.request('/api/lookup/cancel', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: job.id }) })).status, 403);
+  assert.equal((await app.request('/api/lookup/cancel', { method: 'POST', headers, body: JSON.stringify({ id: job.id, extra: true }) })).status, 400);
+  const cancelled = (await app.request('/api/lookup/cancel', { method: 'POST', headers, body: JSON.stringify({ id: job.id }) })).json();
+  assert.equal(cancelled.state, 'cancelled'); assert.equal(cancelled.checks[0].status, 'skipped');
+  await assert.rejects(readFile(path.join(app.stateDirectory, 'active-profile.json')), { code: 'ENOENT' });
+});
 
 test('removed browser automation endpoints return 404 without creating state or authenticating', async (t) => {
   const app = await fixture(t, exampleConfig, {

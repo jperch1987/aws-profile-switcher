@@ -1,0 +1,404 @@
+// Author: jperch1987
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import vm from 'node:vm';
+
+const source = await readFile(new URL('../public/app.js', import.meta.url), 'utf8');
+const html = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+const START_TIME = Date.parse('2030-01-01T00:00:00Z');
+const JOB_ID = '0123456789abcdef0123456789abcdef';
+const profiles = [
+  { profile: 'dev', role_arn: 'arn:aws:iam::111111111111:role/ReadOnly', source_profile: 'base', region: 'us-east-1', auth: { enabled: true, mfaSerial: 'arn:aws:iam::999999999999:mfa/user' }, console: { url: 'https://signin.aws.amazon.com/switchrole?account=111111111111&roleName=ReadOnly' } },
+  { profile: 'production', role_arn: 'arn:aws:iam::222222222222:role/ReadOnly', source_profile: 'base', region: 'eu-west-1', auth: { enabled: true, mfaSerial: 'arn:aws:iam::999999999999:mfa/user' }, console: { url: 'https://signin.aws.amazon.com/switchrole?account=222222222222&roleName=ReadOnly' } },
+];
+function response(body, ok = true) { return { ok, json: async () => body }; }
+function snapshot({ state = 'running', names = ['dev', 'production'], resourceType = 'ec2', query = 'i-0123456789abcdef0', checks = [], results = [], message = 'Checking selected profiles.', expiresAt, list = profiles } = {}) {
+  return { id: JOB_ID, state, query, resourceType, profiles: names.map((name) => {
+    const profile = list.find((item) => item.profile === name);
+    return { profile: name, accountId: profile.role_arn.match(/::([0-9]{12}):/)[1], region: profile.region };
+  }), results, checks, completed: checks.length, total: names.length, message, ...(expiresAt ? { expiresAt } : {}) };
+}
+function check(index, status, message = status) {
+  return { profile: profiles[index].profile, accountId: profiles[index].role_arn.match(/::([0-9]{12}):/)[1], region: profiles[index].region, status, message };
+}
+function result(index = 0, extra = {}) {
+  return { profile: profiles[index].profile, accountId: profiles[index].role_arn.match(/::([0-9]{12}):/)[1], region: profiles[index].region, resourceType: 'ec2', resourceId: 'i-0123456789abcdef0', name: 'example-server', arn: '', ...extra };
+}
+function cliResult() {
+  const values = { AWS_ACCESS_KEY_ID: 'TEST_KEY', AWS_SECRET_ACCESS_KEY: 'TEST_SECRET', AWS_SESSION_TOKEN: 'TEST_TOKEN', AWS_REGION: 'us-east-1', AWS_DEFAULT_REGION: 'us-east-1' };
+  return { profile: profiles[0], roleArn: profiles[0].role_arn, expiration: new Date(START_TIME + 3600_000).toISOString(), commands: { posix: Object.entries(values).map(([key, value]) => `export ${key}='${value}'`).join('\n'), powershell: Object.entries(values).map(([key, value]) => `$Env:${key} = '${value}'`).join('\n') } };
+}
+
+class Element {
+  constructor(tag = 'div') {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.events = new Map();
+    this.attributes = new Map();
+    this.classes = new Set();
+    this.classList = { toggle: (name, on) => on ? this.classes.add(name) : this.classes.delete(name) };
+    this.value = '';
+    this.textContent = '';
+    this.hidden = false;
+    this.disabled = false;
+    this.dataset = {};
+    this.style = {};
+  }
+  setAttribute(name, value) { this.attributes.set(name, value); }
+  removeAttribute(name) { this.attributes.delete(name); if (name === 'href') delete this.href; }
+  append(...elements) { for (const element of elements) { element.parent = this; this.children.push(...(element.tagName === 'FRAGMENT' ? element.children : [element])); } }
+  replaceChildren(...elements) { this.children = []; this.append(...elements); }
+  addEventListener(name, handler) { this.events.set(name, handler); }
+  dispatch(name, fields = {}) { return this.events.get(name)?.({ preventDefault() {}, ...fields }); }
+  querySelector() { return this.label ||= new Element('span'); }
+  focus() { this.focused = true; }
+  scrollIntoView() { this.scrolledIntoView = true; }
+  select() {}
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
+}
+
+async function app({ list = profiles, start, poll, cancel, cli } = {}) {
+  const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"/g)].map((match) => [match[2], new Element(match[1])]));
+  const requests = [];
+  const timers = new Map();
+  const windowEvents = new Map();
+  let time = START_TIME;
+  let timerId = 1;
+  class ClockDate extends Date { constructor(...args) { super(...(args.length ? args : [time])); } static now() { return time; } }
+  const tabs = ['posix', 'powershell'].map((shell) => Object.assign(new Element('button'), { dataset: { shell } }));
+  const context = vm.createContext({
+    URL, Set, Map, Date: ClockDate,
+    setTimeout: (callback, delay) => { const id = timerId++; timers.set(id, { callback, due: time + delay }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    navigator: { clipboard: { writeText: async () => {} } },
+    window: { location: { href: 'http://127.0.0.1:3000/' }, addEventListener: (name, handler) => windowEvents.set(name, handler), open() { assert.fail('No programmatic browser windows'); } },
+    document: {
+      getElementById: (id) => { assert.ok(elements.has(id), `Missing DOM element ${id}`); return elements.get(id); },
+      createElement: (tag) => new Element(tag), createDocumentFragment: () => new Element('fragment'),
+      querySelector: () => new Element('span'), querySelectorAll: () => tabs, addEventListener() {}, body: new Element('body'),
+    },
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      if (url === '/api/profiles') return response({ profiles: list, token: 'TEST_CSRF' });
+      if (url === '/api/lookup' && options?.method === 'POST') return start ? start(options) : response(snapshot());
+      if (url.startsWith('/api/lookup?id=')) return poll ? poll(url, options) : response(snapshot());
+      if (url === '/api/lookup/cancel') return cancel ? cancel(options) : response(snapshot({ state: 'cancelled', checks: [check(0, 'skipped'), check(1, 'skipped')], message: 'Search cancelled.' }));
+      if (url === '/api/cli') return cli ? cli(options) : response(cliResult());
+      assert.fail(`Unexpected API ${url}`);
+    },
+  });
+  vm.runInContext(source, context);
+  await new Promise(setImmediate);
+  const get = (id) => elements.get(id);
+  assert.equal(get('notice').textContent, '');
+  return {
+    get, context, requests, windowEvents,
+    async flush() { await new Promise(setImmediate); },
+    async advance(milliseconds) { time += milliseconds; for (const [id, timer] of [...timers]) if (timer.due <= time && timers.has(id)) { timers.delete(id); timer.callback(); } await new Promise(setImmediate); },
+    async search({ query = 'i-0123456789abcdef0', type = 'ec2', code = '000123' } = {}) { get('lookup-query').value = query; get('lookup-type').value = type; get('lookup-mfa').value = code; return get('lookup-submit').dispatch('click'); },
+    choose(index, checked) { const input = get('lookup-profiles').children[index].children[0]; input.checked = checked; input.dispatch('change'); },
+  };
+}
+
+test('lookup starts with explicit scopes grouped by source profile and MFA device, without AWS requests', async () => {
+  const list = [...profiles,
+    { ...profiles[0], profile: 'other-source', source_profile: 'other' },
+    { ...profiles[0], profile: 'other-device', auth: { enabled: true, mfaSerial: 'arn:aws:iam::999999999999:mfa/other' } },
+    { profile: 'base', role_arn: '', source_profile: '', region: 'us-east-1', auth: { enabled: false }, console: { url: null } },
+  ];
+  const ui = await app({ list });
+  assert.deepEqual(ui.requests.map(({ url }) => url), ['/api/profiles']);
+  assert.equal(ui.get('lookup-group').children.length, 3);
+  assert.equal(ui.get('lookup-profiles').children.length, 2);
+  assert.ok(ui.get('lookup-profiles').children.every((row) => row.children[0].checked));
+  assert.match(ui.get('lookup-source-help').textContent, /1 profile needs/);
+  assert.match(ui.get('lookup-region-help').textContent, /configured region/);
+  ui.get('lookup-mfa').value = '000123';
+  ui.get('lookup-group').value = ui.get('lookup-group').children[2].value;
+  ui.get('lookup-group').dispatch('change');
+  assert.equal(ui.get('lookup-profiles').children.length, 1);
+  assert.equal(ui.get('lookup-profiles').children[0].children[0].value, 'other-device');
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.match(ui.get('lookup-source-help').textContent, /mfa\/other/);
+  assert.equal(ui.requests.length, 1);
+});
+
+test('more than 25 eligible profiles are never silently selected or truncated', async () => {
+  const list = Array.from({ length: 26 }, (_, index) => ({ ...profiles[0], profile: `role-${index}` }));
+  const ui = await app({ list, start: (options) => {
+    const body = JSON.parse(options.body);
+    return response(snapshot({ names: body.profiles, list }));
+  } });
+  assert.equal(ui.get('lookup-profiles').children.length, 26);
+  assert.ok(ui.get('lookup-profiles').children.every((row) => !row.children[0].checked));
+  assert.match(ui.get('lookup-scope-summary').textContent, /none have been selected automatically/);
+  assert.equal(ui.get('lookup-select-all').disabled, true);
+  await ui.search();
+  assert.equal(ui.requests.length, 1);
+  for (let index = 0; index < 26; index++) ui.choose(index, true);
+  assert.equal(ui.get('lookup-submit').disabled, true);
+  assert.match(ui.get('lookup-scope-summary').textContent, /26 of 26.*no more than 25/);
+  await ui.search();
+  assert.equal(ui.requests.length, 1);
+  ui.choose(25, false);
+  await ui.search();
+  const sent = JSON.parse(ui.requests.at(-1).options.body);
+  assert.equal(sent.profiles.length, 25);
+  assert.deepEqual(sent.profiles, list.slice(0, 25).map(({ profile }) => profile));
+});
+
+test('lookup requires its own fresh six-digit MFA and validates bounded exact queries before sending', async () => {
+  const ui = await app();
+  ui.get('mfa-code').value = '654321';
+  for (const code of ['', '12345', '1234567', '12 456', 'abcdef']) {
+    await ui.search({ code });
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.match(ui.get('lookup-status').textContent, /fresh six-digit/);
+  }
+  for (const query of ['', '   ', 'x'.repeat(257), 'name\nother']) {
+    await ui.search({ query });
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.match(ui.get('lookup-status').textContent, /up to 256/);
+  }
+  assert.deepEqual(ui.requests.map(({ url }) => url), ['/api/profiles']);
+  await ui.search({ query: '  i-0123456789abcdef0  ', code: '001234' });
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.equal(ui.get('mfa-code').value, '');
+  assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'ec2', query: 'i-0123456789abcdef0', mfaCode: '001234' });
+  assert.equal(ui.requests.at(-1).options.headers['X-CSRF-Token'], 'TEST_CSRF');
+});
+
+test('lookup prevents duplicate starts and CLI authentication, while the normal Console link stays usable', async () => {
+  let resolveStart;
+  const ui = await app({ start: () => new Promise((resolve) => { resolveStart = resolve; }) });
+  const pending = ui.search();
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.equal(ui.get('lookup-submit').disabled, true);
+  assert.equal(ui.get('switch-button').disabled, true);
+  assert.equal(ui.get('lookup-cancel').disabled, true);
+  assert.equal(ui.get('console-link').hidden, false);
+  assert.equal(ui.get('refresh-button').disabled, false);
+  await ui.search();
+  ui.get('mfa-code').value = '654321';
+  await ui.get('switch-button').dispatch('click');
+  ui.get('console-link').dispatch('click');
+  assert.equal(ui.get('mfa-code').value, '');
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.equal(ui.requests.filter(({ options }) => options.method === 'POST').length, 1);
+  resolveStart(response(snapshot()));
+  await pending;
+  assert.equal(ui.get('lookup-cancel').disabled, false);
+  assert.match(ui.get('lookup-progress').textContent, /0 of 2 profiles processed/);
+});
+
+test('a CLI request disables lookup and does not consume the separate lookup MFA', async () => {
+  let resolveCli;
+  const ui = await app({ cli: () => new Promise((resolve) => { resolveCli = resolve; }) });
+  ui.get('mfa-code').value = '654321';
+  const cli = ui.get('switch-button').dispatch('click');
+  assert.equal(ui.get('lookup-submit').disabled, true);
+  await ui.search();
+  assert.equal(ui.requests.filter(({ url }) => url === '/api/lookup').length, 0);
+  resolveCli(response(cliResult()));
+  await cli;
+  assert.equal(ui.get('lookup-submit').disabled, false);
+  assert.match(ui.get('terminal-command').textContent, /TEST_SECRET/);
+});
+
+test('polling does not overlap, renders text-only matches, and preserves every profile outcome', async () => {
+  let resolvePoll;
+  let polls = 0;
+  const ui = await app({ poll: () => { polls++; return new Promise((resolve) => { resolvePoll = resolve; }); } });
+  await ui.search();
+  await ui.advance(1499);
+  assert.equal(polls, 0);
+  await ui.advance(1);
+  await ui.advance(15_000);
+  assert.equal(polls, 1);
+  const unsafeName = '<img src=x onerror=alert(1)>';
+  resolvePoll(response(snapshot({ state: 'complete', results: [result(0, { name: unsafeName })], checks: [check(0, 'found', 'Matched one resource.'), check(1, 'access_denied', 'The role cannot describe EC2 instances.')], message: 'Lookup finished with partial coverage.' })));
+  await ui.flush();
+  assert.match(ui.get('lookup-progress').textContent, /2 of 2 profiles processed · 1 match/);
+  const row = ui.get('lookup-results-body').children[0];
+  assert.equal(row.children[0].textContent, '111111111111');
+  assert.equal(row.children[1].textContent, 'dev');
+  assert.equal(row.children[2].textContent, 'us-east-1');
+  assert.equal(row.children[3].children[1].textContent, unsafeName);
+  assert.equal(ui.get('lookup-checks').children.length, 2);
+  assert.equal(ui.get('lookup-checks').children[1].children[0].children[1].textContent, 'Access denied');
+  assert.match(ui.get('lookup-coverage-note').textContent, /do not prove a resource is absent/);
+  assert.equal(ui.get('switch-button').disabled, false);
+  await ui.advance(30_000);
+  assert.equal(polls, 1);
+});
+
+test('all failure and skipped statuses remain visible and no matches never implies global absence', async () => {
+  for (const status of ['access_denied', 'auth_failed', 'error', 'skipped']) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', checks: [check(0, 'not_found'), check(1, status)], message: 'Finished with incomplete coverage.' })) });
+    await ui.search();
+    assert.match(ui.get('lookup-no-results').textContent, /does not prove the resource is absent/);
+    assert.equal(ui.get('lookup-checks').children.length, 2);
+    assert.equal(ui.get('lookup-checks').children[1].className.includes('is-warning'), true);
+    assert.equal(ui.get('lookup-cancel').hidden, true);
+  }
+  const ui = await app({ start: () => response(snapshot({ state: 'complete', checks: [check(0, 'not_found'), check(1, 'not_found')] })) });
+  await ui.search();
+  assert.match(ui.get('lookup-no-results').textContent, /Other accounts and regions were not searched/);
+});
+
+test('S3 uses global scope wording and displays its verified bucket region', async () => {
+  const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 's3', query: 'example-bucket', results: [result(0, { resourceType: 's3', resourceId: 'example-bucket', name: 'example-bucket', arn: 'arn:aws:s3:::example-bucket', region: 'ap-southeast-2' })], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+  ui.get('lookup-type').value = 's3';
+  ui.get('lookup-type').dispatch('change');
+  assert.match(ui.get('lookup-region-help').textContent, /global/);
+  await ui.search({ type: 's3', query: 'example-bucket' });
+  assert.equal(ui.get('lookup-results-body').children[0].children[2].textContent, 'ap-southeast-2');
+  assert.match(ui.get('lookup-checks').children[0].children[1].textContent, /us-east-1 · S3 global lookup/);
+  assert.equal(JSON.parse(ui.requests.at(-1).options.body).resourceType, 's3');
+});
+
+test('explicit cancellation carries the job ID and CSRF token and rejects stale polling updates', async () => {
+  let resolveOldPoll;
+  const ui = await app({ poll: () => new Promise((resolve) => { resolveOldPoll = resolve; }) });
+  await ui.search();
+  await ui.advance(1500);
+  await ui.get('lookup-cancel').dispatch('click');
+  const cancellation = ui.requests.find(({ url }) => url === '/api/lookup/cancel');
+  assert.deepEqual(JSON.parse(cancellation.options.body), { id: JOB_ID });
+  assert.equal(cancellation.options.headers['X-CSRF-Token'], 'TEST_CSRF');
+  resolveOldPoll(response(snapshot({ state: 'complete', results: [result()], checks: [check(0, 'found'), check(1, 'not_found')], message: 'Stale success.' })));
+  await ui.flush();
+  assert.match(ui.get('lookup-status').textContent, /cancelled/);
+  assert.doesNotMatch(ui.get('lookup-status').textContent, /Stale/);
+  assert.equal(ui.get('lookup-results-body').children.length, 0);
+  assert.equal(ui.get('switch-button').disabled, false);
+});
+
+test('failed cancellation and status checks never claim the search has stopped', async () => {
+  const ui = await app({ poll: () => response({ error: 'Status unavailable.' }, false), cancel: () => response({ error: 'Cancellation unavailable.' }, false) });
+  await ui.search();
+  await ui.advance(1500);
+  assert.match(ui.get('lookup-status').textContent, /Search status is uncertain; cancellation has not been confirmed/);
+  await ui.get('lookup-cancel').dispatch('click');
+  assert.match(ui.get('lookup-status').textContent, /Cancellation was not confirmed.*may still be running/);
+  assert.equal(ui.get('lookup-cancel').hidden, false);
+  assert.equal(ui.get('switch-button').disabled, true);
+  ui.get('lookup-clear').dispatch('click');
+  await ui.flush();
+  assert.match(ui.get('lookup-status').textContent, /cleared from this page.*may continue/);
+  assert.equal(ui.get('lookup-results-panel').hidden, true);
+  assert.equal(ui.get('switch-button').disabled, false);
+});
+
+test('refresh and pagehide discard results and send only best-effort cancellation for active jobs', async () => {
+  for (const action of ['refresh', 'pagehide', 'clear']) {
+    let resolvePoll;
+    const ui = await app({ poll: () => new Promise((resolve) => { resolvePoll = resolve; }) });
+    await ui.search();
+    await ui.advance(1500);
+    ui.get('lookup-mfa').value = '654321';
+    if (action === 'refresh') await ui.get('refresh-button').dispatch('click');
+    else if (action === 'pagehide') ui.windowEvents.get('pagehide')();
+    else ui.get('lookup-clear').dispatch('click');
+    resolvePoll(response(snapshot({ state: 'complete', results: [result()], checks: [check(0, 'found'), check(1, 'not_found')], message: 'Late completion.' })));
+    await ui.flush();
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.equal(ui.get('lookup-results-panel').hidden, true);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /Late completion/);
+    const cancellations = ui.requests.filter(({ url }) => url === '/api/lookup/cancel');
+    assert.equal(cancellations.length, 1);
+    assert.equal(cancellations[0].options.keepalive, true);
+    if (action === 'pagehide') {
+      ui.windowEvents.get('pageshow')({ persisted: true });
+      await ui.flush();
+      assert.equal(ui.requests.filter(({ url }) => url === '/api/profiles').length, 2);
+    }
+    const count = ui.requests.length;
+    await ui.advance(30_000);
+    assert.equal(ui.requests.length, count);
+  }
+});
+
+test('a search response arriving after pagehide is discarded and its still-running job is cancelled best-effort', async () => {
+  let resolveStart;
+  const ui = await app({ start: () => new Promise((resolve) => { resolveStart = resolve; }) });
+  const pending = ui.search();
+  ui.windowEvents.get('pagehide')();
+  resolveStart(response(snapshot()));
+  await pending;
+  await ui.flush();
+  assert.equal(ui.get('lookup-results-panel').hidden, true);
+  assert.equal(ui.requests.filter(({ url }) => url === '/api/lookup/cancel').length, 1);
+  assert.equal(ui.get('lookup-mfa').value, '');
+});
+
+test('completed lookup metadata expires locally and Clear results never sends another AWS request', async () => {
+  for (const expiry of [false, true]) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', results: [result()], checks: [check(0, 'found'), check(1, 'not_found')], expiresAt: new Date(START_TIME + 600_000).toISOString() })) });
+    await ui.search();
+    assert.equal(ui.get('lookup-results-body').children.length, 1);
+    if (expiry) await ui.advance(600_001);
+    else ui.get('lookup-clear').dispatch('click');
+    assert.equal(ui.get('lookup-results-panel').hidden, true);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.equal(ui.requests.length, 2);
+  }
+});
+
+test('invalid or failed lookup responses never render returned resource metadata', async () => {
+  for (const body of [
+    response({ ...snapshot(), query: 'different-query', results: [result()] }),
+    response({ ...snapshot(), id: 'invalid-id', results: [result()] }),
+    response({ ...snapshot(), checks: [check(0, 'unknown_status')], completed: 1, results: [result()] }),
+    response({ ...snapshot(), results: [result(0, { profile: 'not-selected' })] }),
+    response({ error: 'Source MFA authentication failed.' }, false),
+  ]) {
+    const ui = await app({ start: () => body });
+    await ui.search();
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.equal(ui.get('lookup-results-panel').hidden, true);
+    assert.equal(ui.get('lookup-status').attributes.get('role'), 'alert');
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.equal(ui.get('switch-button').disabled, false);
+  }
+});
+
+test('lookup scope and response validation use role region, source fallback, then us-east-1', async () => {
+  for (const { roleRegion, sourceRegion, expectedRegion } of [
+    { roleRegion: undefined, sourceRegion: 'ap-southeast-2', expectedRegion: 'ap-southeast-2' },
+    { roleRegion: '', sourceRegion: '', expectedRegion: 'us-east-1' },
+    { roleRegion: 'eu-central-1', sourceRegion: 'ap-southeast-2', expectedRegion: 'eu-central-1' },
+  ]) {
+    const role = { ...profiles[0], region: roleRegion };
+    const source = { profile: 'base', role_arn: '', source_profile: '', region: sourceRegion, auth: { enabled: false }, console: { url: null } };
+    const scope = { profile: 'dev', accountId: '111111111111', region: expectedRegion };
+    const completed = {
+      ...snapshot({ state: 'complete', names: ['dev'], list: [role], checks: [{ ...scope, status: 'found', message: 'Found in the effective region.' }], results: [result(0, { region: expectedRegion })] }),
+      profiles: [scope],
+    };
+    const ui = await app({ list: [role, source], start: () => response(completed) });
+    const scopeRow = ui.get('lookup-profiles').children[0];
+    assert.equal(scopeRow.children[0].attributes.get('aria-label'), `Search dev in ${expectedRegion}`);
+    assert.equal(scopeRow.children[1].children[1].textContent, `111111111111 · ${expectedRegion}`);
+    await ui.search();
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /invalid lookup response/);
+    assert.equal(ui.get('lookup-results-body').children[0].children[2].textContent, expectedRegion);
+    assert.equal(ui.get('lookup-checks').children[0].children[1].textContent, `111111111111 · ${expectedRegion}`);
+  }
+});
+
+test('terminal error and cancellation snapshots count remaining skipped scopes as processed', async () => {
+  for (const state of ['error', 'cancelled']) {
+    const ui = await app({ start: () => response(snapshot({ state, checks: [check(0, 'auth_failed', 'Authentication failed.'), check(1, 'skipped', 'No lookup was performed.')], message: state === 'error' ? 'Search failed.' : 'Search cancelled.' })) });
+    await ui.search();
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /invalid lookup response/);
+    assert.match(ui.get('lookup-progress').textContent, /2 of 2 profiles processed/);
+    assert.equal(ui.get('lookup-checks').children.length, 2);
+    assert.equal(ui.get('lookup-checks').children[1].children[0].children[1].textContent, 'Not checked');
+    assert.match(ui.get('lookup-no-results').textContent, /does not prove the resource is absent/);
+    assert.equal(ui.get('lookup-cancel').hidden, true);
+    assert.equal(ui.get('switch-button').disabled, false);
+  }
+});

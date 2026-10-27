@@ -5,7 +5,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#18272c" />
-    <title>Profile switcher · AWS Console &amp; CLI</title>
+    <title>Profile switcher · AWS Console, CLI &amp; Resource Lookup</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="/app.js" defer></script>
   </head>
@@ -17,9 +17,10 @@
       </a>
       <div class="workspace-label">WORKSPACE</div>
       <div class="sidebar-current"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="14" y="4" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="4" y="14" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="14" y="14" width="6" height="6" rx="1.5" stroke="currentColor" stroke-width="1.5"/></svg>Profiles<span class="sidebar-count" id="sidebar-count">—</span></div>
+      <a class="sidebar-tool" href="#resource-lookup"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.5"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>Resource Lookup<span aria-hidden="true">↗</span></a>
       <div class="sidebar-guide">
         <p class="eyebrow">A little less context switching.</p>
-        <p>Your AWS profiles, in one place. Open a role in the console or take a profile to your terminal.</p>
+        <p>Your AWS profiles, in one place. Switch roles, get CLI credentials, or locate a resource across accounts.</p>
         <ol><li><span>01</span>Choose your profile</li><li><span>02</span>Choose Console or CLI</li><li><span>03</span>Complete sign-in and continue</li></ol>
       </div>
       <div class="sidebar-footer"><span class="local-dot" aria-hidden="true"></span><strong>Local app, AWS sign-in</strong><p>Console uses your AWS session.<br />CLI uses local keys and MFA.</p><div class="runtime-label">NODE.JS <span>+</span> PYTHON</div></div>
@@ -30,7 +31,7 @@
         <div class="breadcrumb">Workspace <span>/</span> Profiles</div>
         <span class="local-badge"><span class="local-dot" aria-hidden="true"></span> Local workspace</span>
       </header>
-      <div class="page-title"><div><p class="eyebrow">YOUR NEXT CONTEXT</p><h1>Profile switcher<span>.</span></h1><p>One config. The right context for your console and CLI.</p></div><span class="config-format">AWS CONFIG</span></div>
+      <div class="page-title"><div><p class="eyebrow">YOUR NEXT CONTEXT</p><h1>Profile switcher<span>.</span></h1><p>Switch roles, get CLI credentials, and find resources across your accounts.</p></div><span class="config-format">AWS CONFIG</span></div>
 
       <section class="source-bar" aria-label="Configuration source">
         <span class="source-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8l-5-5Z" stroke="currentColor" stroke-width="1.5"/><path d="M14 3v5h5M8 12h8M8 16h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
@@ -81,6 +82,34 @@
         <div class="terminal-box"><span class="terminal-prompt" aria-hidden="true">$</span><code id="terminal-command"># Temporary export commands appear after MFA authentication</code><button class="copy-button" id="copy-button" type="button" disabled><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><rect x="7" y="7" width="9" height="10" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M12 7V4.5A1.5 1.5 0 0 0 10.5 3h-6A1.5 1.5 0 0 0 3 4.5v7A1.5 1.5 0 0 0 4.5 13H7" stroke="currentColor" stroke-width="1.4"/></svg><span id="copy-label">Copy commands</span></button></div>
         <div class="credential-session"><p id="session-expiry" aria-live="polite">Credentials are cleared here on expiry, refresh, or profile change.</p><button class="button button-quiet" id="clear-credentials" type="button" disabled>Clear credentials</button></div>
         <div class="terminal-note"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M10 9v4M10 6.5v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><p>Temporary credentials: treat as passwords. Clipboard and shell history may retain them. Use a fresh terminal with no existing AWS overrides, including <code>AWS_PROFILE</code> and <code>AWS_SECURITY_TOKEN</code>, and do not use <code>--profile</code>. Clear here does not clear your clipboard or terminal. A failed request leaves your terminal unchanged. Credentials expire and do not refresh automatically.</p></div>
+      </section>
+
+      <section class="lookup-section" id="resource-lookup" aria-labelledby="lookup-heading" aria-busy="false">
+        <div class="lookup-heading"><div><p class="eyebrow">FIND THE RIGHT ACCOUNT</p><h2 id="lookup-heading">Resource Lookup</h2><p>Find an exact resource across selected roles, with a clear record of every account checked.</p></div><span class="lookup-readonly">READ-ONLY SEARCH</span></div>
+        <div class="lookup-input-grid">
+          <div class="lookup-field"><label for="lookup-type">Resource type</label><select id="lookup-type"><option value="ec2">EC2 instance</option><option value="ebs">EBS volume</option><option value="security-group">Security group</option><option value="vpc">VPC</option><option value="s3">S3 bucket</option><option value="rds">RDS database</option><option value="lambda">Lambda function</option></select></div>
+          <div class="lookup-field lookup-query-field"><label for="lookup-query">Exact ID, name, or ARN</label><input id="lookup-query" type="text" maxlength="256" placeholder="For example: i-0123456789abcdef0" autocomplete="off" spellcheck="false" aria-describedby="lookup-query-help" /><p id="lookup-query-help">Exact matches only. Up to 256 characters; no wildcard search.</p></div>
+          <div class="lookup-field lookup-source-field"><label for="lookup-group">Source identity</label><select id="lookup-group" aria-describedby="lookup-source-help"><option value="">Reading profiles…</option></select><p id="lookup-source-help">Profiles are grouped by their source profile and MFA device.</p></div>
+        </div>
+        <div class="lookup-scope">
+          <div class="lookup-scope-heading"><h3>Search scope</h3><div class="lookup-scope-actions"><button class="button button-quiet" id="lookup-select-all" type="button">Select all</button><button class="button button-quiet" id="lookup-select-none" type="button">Clear selection</button></div></div>
+          <p class="lookup-scope-summary" id="lookup-scope-summary" aria-live="polite">Choose up to 25 profiles sharing a source identity and MFA device.</p>
+          <div class="lookup-profiles" id="lookup-profiles" role="group" aria-label="Profiles to search"></div>
+          <p class="lookup-region-help" id="lookup-region-help">Searches only each selected profile’s configured region: role region, then source region, or us-east-1 by default. Other regions are outside this search.</p>
+        </div>
+        <div class="lookup-auth-row"><div class="lookup-field lookup-mfa-field"><label for="lookup-mfa">Lookup MFA code</label><input id="lookup-mfa" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" spellcheck="false" placeholder="6-digit code" aria-describedby="lookup-auth-help" /></div><button class="button button-primary" id="lookup-submit" type="button"><span id="lookup-submit-label">Search resources</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.5"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button class="button button-quiet" id="lookup-cancel" type="button" hidden>Cancel search</button><button class="button button-quiet" id="lookup-clear" type="button" disabled>Clear results</button></div>
+        <p class="lookup-auth-help" id="lookup-auth-help">Enter a fresh MFA code for each read-only lookup. This code is separate from CLI authentication. Console switching continues through your existing browser session and needs no MFA code in this app.</p>
+        <div class="lookup-status" id="lookup-status" role="status" aria-live="polite">No lookup runs until you select Search resources.</div>
+        <p class="lookup-progress" id="lookup-progress" aria-live="polite" hidden></p>
+        <div class="lookup-results" id="lookup-results-panel" hidden>
+          <h3 id="lookup-results-heading">Search results</h3>
+          <div class="lookup-table-scroll" id="lookup-results-table"><table><caption class="visually-hidden">Matching AWS resources by account, profile, and region</caption><thead><tr><th scope="col">Account</th><th scope="col">Profile</th><th scope="col">Region</th><th scope="col">Resource / Name</th></tr></thead><tbody id="lookup-results-body"></tbody></table></div>
+          <p class="lookup-empty" id="lookup-no-results">No matches returned yet.</p>
+          <div class="lookup-coverage-heading"><h3>Checks by profile</h3><span>Review coverage before concluding</span></div>
+          <ul class="lookup-checks" id="lookup-checks"></ul>
+          <p class="lookup-coverage-note" id="lookup-coverage-note">Failed or skipped checks do not prove a resource is absent.</p>
+          <p class="lookup-retention">Results contain resource metadata only. They clear when you refresh or leave this page, or when the completed search expires.</p>
+        </div>
       </section>
 
       <section class="console-guide" aria-labelledby="guide-heading">

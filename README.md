@@ -2,11 +2,13 @@
 
 Author: jperch1987
 
-A local web app built with **Node.js and Python**. Choose a role from a local AWS config-format text file and either copy temporary credentials for a terminal or open AWS's prefilled Switch Role page in your current browser.
+A local web app built with **Node.js and Python**. Choose roles from a local AWS config-format text file to copy temporary credentials for a terminal, open AWS's prefilled Switch Role page in your current browser, or look up a resource across selected roles.
 
 Clients need Node.js, Python, the packages in `requirements.txt` (including **boto3**), and their existing browser. **No separate browser, Codex, or browser extension is required.** AWS CLI is optional for the app itself; install it separately to run `aws` commands. Download or clone the repository, install the Python dependencies locally, and configure your profiles.
 
 **Get CLI credentials** requires a fresh six-digit MFA code in the app and produces five ready-to-copy environment assignments. It uses an IAM user's long-term keys through `source_profile`; SSO, `credential_process`, web identity, temporary source credentials, and role chaining are not supported by this CLI flow. **Open AWS Switch Role** opens a new tab in your current browser, using its AWS sign-in session. Review the prefilled account and role, then click **Switch Role** on AWS. AWS handles any sign-in and MFA prompts there.
+
+**Resource Lookup** searches for an exact resource ID, name, or ARN using the configured roles and regions. Each search requires fresh MFA for one source identity and can include up to 25 profiles sharing that source and MFA device. It returns resource metadata, not credentials. It uses the existing boto3 dependency and requires no AWS Resource Explorer setup.
 
 ## Install Python and Node.js
 
@@ -121,11 +123,11 @@ Use Python 3.11 or newer and install Node.js using the Linux instructions above.
 
 Open the app in your usual Windows browser at [http://127.0.0.1:3000](http://127.0.0.1:3000). The Console link opens in that browser; the server does not launch a Linux browser.
 
-For CLI credentials, the source keys must exist in **WSL's** `~/.aws/credentials`, not only in your Windows home. Match the credentials section to `source_profile` exactly. For example, `source_profile = work-user` requires a `[work-user]` section containing that source user's keys; putting them only under `[default]` will not satisfy that configuration. Keep the MFA device identifier in `mfa_serial` in the profile config as described below.
+For CLI credentials and Resource Lookup, the source keys must exist in **WSL's** `~/.aws/credentials`, not only in your Windows home. Match the credentials section to `source_profile` exactly. For example, `source_profile = work-user` requires a `[work-user]` section containing that source user's keys; putting them only under `[default]` will not satisfy that configuration. Keep the MFA device identifier in `mfa_serial` in the profile config as described below.
 
 ## Install and run the app
 
-Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Run the setup commands below and configure your roles. Configure source credentials as well if you need CLI credentials.
+Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Run the setup commands below and configure your roles. Configure source credentials as well if you need CLI credentials or Resource Lookup.
 
 macOS/Linux:
 
@@ -211,9 +213,9 @@ region = us-east-1
 
 Use `[default]` or `[profile name]` sections. Quote names containing spaces, such as `[profile "team dev"]`. Comments and UTF-8 are accepted. The reader tolerates a BOM; use UTF-8 without a BOM if AWS CLI will read the same file. The parser rejects duplicate or malformed entries, limits files to 1 MiB and 1,000 profiles, and excludes credentials and unrelated sections from the metadata returned to the browser.
 
-For CLI MFA authentication, each selected role needs `role_arn`, `source_profile`, and a valid `mfa_serial`. Put `mfa_serial` on the role or on its referenced source profile; a role's own setting takes precedence. Use the virtual device ARN or hardware device serial associated with the **source IAM user**, which may be in a different account from the target role. Set `region` on each role to choose its CLI region; if absent, the helper uses the source profile's region, then `us-east-1`. These are explicit helper fallbacks, not general inheritance from `[default]`. Use `external_id` on a role only when required by its trust policy; such roles are supported by the CLI flow but cannot use the AWS Console Switch Role form.
+For CLI and lookup MFA authentication, each selected role needs `role_arn`, `source_profile`, and a valid `mfa_serial`. Put `mfa_serial` on the role or on its referenced source profile; a role's own setting takes precedence. Use the virtual device ARN or hardware device serial associated with the **source IAM user**, which may be in a different account from the target role. Set `region` on each role to choose its CLI and lookup region; if absent, the helper uses the source profile's region, then `us-east-1`. These are explicit helper fallbacks, not general inheritance from `[default]`. Use `external_id` on a role only when required by its trust policy; such roles are supported by CLI and lookup but cannot use the AWS Console Switch Role form.
 
-For CLI authentication, store the source IAM user's long-term credentials in the normal AWS shared credentials file, usually `~/.aws/credentials` (`%USERPROFILE%\.aws\credentials` on Windows):
+For CLI and lookup authentication, store the source IAM user's long-term credentials in the normal AWS shared credentials file, usually `~/.aws/credentials` (`%USERPROFILE%\.aws\credentials` on Windows):
 
 ```ini
 [default]
@@ -223,7 +225,7 @@ aws_secret_access_key = YOUR_SOURCE_IAM_USER_SECRET_ACCESS_KEY
 
 Replace the placeholders locally. Credentials-file section names omit the `profile` prefix: a source named `work-user` uses `[work-user]` there and `[profile work-user]` in your config. The helper uses the standard credentials-file location; it does not honor `AWS_SHARED_CREDENTIALS_FILE` overrides. Existing static keys in the source's config section are also supported, but keeping them in the credentials file separates secrets from the profile metadata. Protect this file with your operating system's user permissions. Do not put credentials in Git, browser fields, screenshots, or support messages.
 
-The helper reads the specified source's keys directly. It does not use a cached assumed-role session, exported credentials from a previous switch, SSO, `credential_process`, web identity, or a chain of roles. Unsupported source setups fail with an explanation. The source user needs permission to assume the target role, and that role's trust policy must allow it. The app supplies the device serial and fresh MFA code to [AWS STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html); AWS decides whether access is allowed.
+The helper reads the specified source's keys directly. It does not use a cached assumed-role session, exported credentials from a previous switch, SSO, `credential_process`, web identity, or a chain of roles. Unsupported source setups fail with an explanation. The source user needs permission to assume the target role, and that role's trust policy must allow it. For CLI requests, the app supplies the device serial and fresh MFA code to [AWS STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html); AWS decides whether access is allowed. Resource Lookup uses the separate, short-lived batch authentication described below.
 
 Prefer a metadata-only profile file. The parser reads its bytes before filtering fields, and the authentication helper can read source credentials. Personal `profiles.txt`, `.venv/`, and `.state/` are ignored by Git. Edit the config and click **Refresh** to reload it. The app never edits your source config or credentials file.
 
@@ -278,6 +280,36 @@ Temporary credentials are returned over the loopback HTTP connection and held in
 
 For advanced terminal-only use, `aws_session.py` remains available as an optional helper that prompts for MFA in the terminal. It is separate from the web app's copy-and-paste workflow.
 
+## Find a resource across profiles
+
+Use **Resource Lookup** when you know a resource's ID, exact name, or ARN and need to find which configured role can see it. It queries AWS directly and needs no AWS Resource Explorer index or other discovery service.
+
+1. Choose a **Source identity**. Profiles are grouped by their exact `source_profile` and resolved MFA device; a batch cannot mix groups.
+2. Choose one **Resource type** and enter its **Exact ID, name, or ARN**. Queries are single-line, limited to 256 characters, and do not support wildcard or substring searches.
+3. Under **Search scope**, select 1–25 profiles. Each regional resource is checked only in that profile's resolved configured region. S3 searches owned buckets across regions and reports the bucket's actual region when available.
+4. Enter a fresh code in **Lookup MFA code**, then choose **Search resources**. To search another source identity or another batch of profiles, start a new search with a fresh code.
+5. Review both the matches and each profile's coverage/status. Use **Cancel search** to stop an active search or **Clear results** to remove displayed metadata.
+
+| Resource type | Exact match supported | Required target-role read permission |
+| --- | --- | --- |
+| EC2 instance | Instance ID, `Name` tag, or instance ARN | `ec2:DescribeInstances` |
+| EBS volume | Volume ID, `Name` tag, or volume ARN | `ec2:DescribeVolumes` |
+| Security group | Group ID, group name, `Name` tag, or security-group ARN | `ec2:DescribeSecurityGroups` |
+| VPC | VPC ID, `Name` tag, or VPC ARN | `ec2:DescribeVpcs` |
+| S3 bucket | Bucket name or bucket ARN; buckets owned by the target account | `s3:ListAllMyBuckets`, `s3:GetBucketLocation` |
+| RDS DB instance | DB instance identifier or DB instance ARN | `rds:DescribeDBInstances` |
+| Lambda function | Function name or unqualified function ARN | `lambda:GetFunctionConfiguration` |
+
+This scope does not include RDS clusters, Lambda versions/aliases, S3 objects, buckets merely shared from another account, or regions absent from the selected profiles. A `Name` tag is not necessarily unique, so multiple exact matches can be valid. Lambda lookup does not download function code or return environment variables.
+
+Searches are bounded: the Python worker has a 150-second deadline, the server terminates a worker after 180 seconds, and results are limited to 100 matches per profile. Paginated EC2 filters and S3 scans stop after 10 pages per filter/scan. Hitting a limit is reported as incomplete. A denied request, timeout, cancelled or unsearched profile, or partial scan **does not establish that a resource does not exist**. Even a completed no-match result applies only to the selected account, resource type, and region/ownership scope. If S3 ownership is confirmed but reading its location is denied, the confirmed match can remain with an unknown region and an access-denied status.
+
+Each search calls [AWS STS GetSessionToken](https://docs.aws.amazon.com/STS/latest/APIReference/API_GetSessionToken.html) once for the chosen source identity with a fresh MFA code and a 900-second duration. The worker uses that temporary IAM-user session to assume each target role separately for 900 seconds. It passes the configured external ID when needed and supplies a restrictive session policy containing only the selected resource type's read actions. Credentials stay inside the worker and are discarded when it exits; they are not returned as exports, saved to disk, or reused by another search. This does not change the separate **Get CLI credentials** requirement for fresh MFA on every request.
+
+The source user still needs permission to assume the target roles, and their existing trust policies must allow it. The target roles need the read permissions above. [lookup-permissions.example.json](lookup-permissions.example.json) is a target-role permission example for all seven supported types; review it and narrow resources where the API supports that. The app does not attach policies or grant permissions. Its per-search session policy cannot add permissions missing from the target role. `GetSessionToken` itself does not require an IAM permission grant. MFA is evaluated when assuming the role; assumed-role credentials do not satisfy a separate MFA-context requirement on downstream resource policies. See [AWS MFA-protected API access](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html).
+
+The browser displays only resource metadata and scan statuses. **Clear results**, page exit/reload, or **Refresh** clears the local display. The server keeps only the most recent lookup's metadata in memory, replaces it when a new lookup starts, and expires it 10 minutes after the lookup finishes. Clearing the display does not immediately delete that server snapshot; stopping the server clears its memory. The browser also expires displayed results. Neither cancelling nor clearing a search revokes temporary AWS credentials before their normal expiration. Treat account, resource, and naming information as private when sharing screenshots or support reports.
+
 ## Open a role in AWS Console
 
 1. Select a role profile and review its target account and full role name.
@@ -295,7 +327,7 @@ Getting CLI credentials does not change your browser's AWS session, and switchin
 
 ## Local operation and security
 
-The Node server serves local assets and invokes Python for CLI authentication. The Python helper reads source keys and contacts AWS STS over HTTPS; CLI responses intentionally contain temporary credentials in the displayed exports. Source keys are never returned to the browser. Console switching uses a normal AWS link in your current browser. Local UI assets have no external scripts, fonts, or telemetry.
+The Node server serves local assets and invokes Python for CLI authentication and Resource Lookup. The Python helpers read source keys and contact AWS STS over HTTPS; lookup also calls the selected AWS service's read APIs. CLI responses intentionally contain temporary credentials in the displayed exports, while lookup responses contain only resource metadata and statuses. Source keys are never returned to the browser. Console switching uses a normal AWS link in your current browser. Local UI assets have no external scripts, fonts, or telemetry.
 
 The authentication helper uses fixed AWS destinations and does not honor custom endpoint or proxy overrides. Networks that require an outbound proxy may need an approved network configuration before authentication can work.
 
@@ -307,6 +339,6 @@ This is a **credential-capable application for a trusted single-user desktop**. 
 npm test
 ```
 
-Tests use temporary fixtures and mocked AWS responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, Console-link validation, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, and your role policies must be verified in your own environment.
+Tests use temporary fixtures and mocked AWS responses; they do not require customer credentials or make live AWS authentication requests. They cover metadata parsing, MFA/session handling, command generation, resource lookup, Console-link validation, and local server behavior. Development checks run on macOS; Windows, Linux, and WSL installations require validation on those platforms. Real AWS sign-in, MFA, resource-read permissions, and your role policies must be verified in your own environment.
 
 The implementation has not received an independent security audit or production certification. Review and test it for your environment before distributing it to clients.
