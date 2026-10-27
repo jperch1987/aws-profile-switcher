@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { buildCommands, createProfileServer, authenticationTarget, validateFederationResult } from '../server.mjs';
+import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult } from '../server.mjs';
 import { buildConsoleTarget } from '../console-target.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -67,6 +67,7 @@ async function fixture(t, config = exampleConfig, serverOptions = {}) {
   await start();
   return {
     configFile,
+    stateDirectory,
     request: (url, options) => request(server, url, options),
     async restart() { await close(server); await start(); },
     async select(profile, token) {
@@ -115,8 +116,7 @@ test('lists metadata and console links, persists selection, and leaves config un
   const selected = await app.select('dev', data.token);
   assert.equal(selected.status, 200);
   assert.deepEqual(selected.json().profile, dev);
-  assert.match(selected.json().commands.posix, /'--profile=dev'/);
-  assert.match(selected.json().commands.posix, /aws_session\.py/);
+  assert.equal(selected.json().commands, null);
   await app.restart();
   assert.deepEqual((await app.request('/api/active')).json().profile, dev);
   assert.equal((await app.request('/api/profiles')).json().activeProfile, 'dev');
@@ -181,39 +181,6 @@ test('serves only allowlisted public files', async (t) => {
     assert.equal(response.status, 404, `${url} must not serve a private file`);
     assert.deepEqual(response.json(), { error: 'Not found.' });
   }
-});
-
-test('CLI commands invoke the MFA helper literally and apply exports only on success', { skip: process.platform === 'win32' }, async (t) => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'switch-command-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const helper = path.join(directory, "helper's file.mjs");
-  await writeFile(helper, String.raw`const args = process.argv.slice(2);
-const quote = (v) => "'" + v.replaceAll("'", "'\\''") + "'";
-process.stdout.write('export AWS_SESSION_TOKEN=' + quote(JSON.stringify(args)) + '\nexport AWS_ACCESS_KEY_ID=fresh-test-key\n');
-if (args.includes('--profile=fail')) process.exit(1);
-`);
-  const configFile = "/tmp/config's $(printf substituted) `printf substituted` file.txt";
-  const profile = { profile: "--team's $(printf substituted) `printf substituted`; [test] \\ $HOME", region: 'ap-southeast-1' };
-  const stale = { ...process.env, AWS_ACCESS_KEY_ID: 'stale', AWS_SECRET_ACCESS_KEY: 'stale',
-    AWS_SESSION_TOKEN: 'stale', AWS_PROFILE: 'stale', AWS_DEFAULT_PROFILE: 'stale',
-    AWS_REGION: 'stale', AWS_DEFAULT_REGION: 'stale', AWS_ROLE_ARN: 'stale',
-    AWS_CONTAINER_CREDENTIALS_FULL_URI: 'http://localhost/TEST_ONLY', AWS_CONTAINER_AUTHORIZATION_TOKEN: 'TEST_ONLY' };
-  const command = buildCommands(profile, configFile, process.execPath, helper).posix;
-  const dump = `"${process.execPath}" -e 'process.stdout.write(JSON.stringify(process.env))'`;
-  const output = await execFileAsync('/bin/sh', ['-c', `${command}\n${dump}`], { env: stale });
-  const env = JSON.parse(output.stdout);
-  assert.deepEqual(JSON.parse(env.AWS_SESSION_TOKEN), [`--file=${configFile}`, `--profile=${profile.profile}`, '--shell', 'posix']);
-  assert.equal(env.AWS_ACCESS_KEY_ID, 'fresh-test-key');
-  for (const key of ['AWS_SECRET_ACCESS_KEY', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_ROLE_ARN']) assert.equal(env[key], undefined);
-  const failed = buildCommands({profile:'fail'}, configFile, process.execPath, helper).posix;
-  await assert.rejects(execFileAsync('/bin/sh', ['-c', failed], { env: stale }));
-  const after = await execFileAsync('/bin/sh', ['-c', `${failed}\n${dump}`], { env: stale });
-  assert.match(after.stderr, /AWS switch failed/);
-  const failedEnv = JSON.parse(after.stdout);
-  assert.equal(failedEnv.AWS_ACCESS_KEY_ID, undefined);
-  assert.equal(failedEnv.AWS_SESSION_TOKEN, undefined);
-  assert.equal(failedEnv.AWS_CONTAINER_CREDENTIALS_FULL_URI, undefined);
-  assert.equal(failedEnv.AWS_CONTAINER_AUTHORIZATION_TOKEN, undefined);
 });
 
 test('console targets encode IAM paths as data and ignore unrelated profile fields', () => {
@@ -306,6 +273,7 @@ test('console rejects concurrent attempts and unlocks after errors without leaki
   const pending = app.request('/api/console',options);
   await started;
   assert.equal((await app.request('/api/console',options)).status,409);
+  assert.equal((await app.request('/api/cli',options)).status,409);
   release();
   const failed = await pending;
   assert.equal(failed.status,500);
@@ -349,15 +317,81 @@ test('MFA readiness uses role or source device without inferring browser authent
   }
 });
 
-test('POSIX helper secrets are not echoed by xtrace and trace state is restored', { skip:process.platform==='win32' }, async(t)=>{
-  const directory=await mkdtemp(path.join(os.tmpdir(),'switch-trace-'));
-  t.after(()=>rm(directory,{recursive:true,force:true}));
-  const helper=path.join(directory,'helper.mjs');
-  await writeFile(helper,`process.stdout.write("export AWS_SECRET_ACCESS_KEY='TEST_ONLY_SECRET'\\nexport AWS_SESSION_TOKEN='TEST_ONLY_TOKEN'\\n"); if(process.argv.includes('--profile=fail'))process.exit(1);`);
-  for(const profile of ['dev','fail']) {
-    const command=buildCommands({profile},'/unused/config',process.execPath,helper).posix;
-    const {stdout,stderr}=await execFileAsync('/bin/bash',['-xc',`${command}\ncase $- in *x*) printf 'trace-restored' ;; esac`]);
-    assert.equal(stdout,'trace-restored');
-    assert.doesNotMatch(stderr,/TEST_ONLY_SECRET|TEST_ONLY_TOKEN/);
+
+function fakeCliSession(profile) {
+  return {
+    credentials: {AccessKeyId:'TEST_ONLY_ACCESS_KEY',SecretAccessKey:'TEST_ONLY_SECRET',SessionToken:'TEST_ONLY_TOKEN'},
+    region:'ap-southeast-1', expiration:new Date(Date.now()+3600000).toISOString(), roleArn:profile.role_arn,
+  };
+}
+
+test('CLI credential exports require fresh MFA and never persist or restore secrets',async(t)=>{
+  const calls=[];
+  const app=await fixture(t,exampleConfig,{cliSession:async(profile,code)=>{
+    calls.push({profile:profile.profile,code});
+    return {...fakeCliSession(profile),sourceSecret:'DO_NOT_RETURN_SOURCE_KEY'};
+  }});
+  const {token}=(await app.request('/api/profiles')).json();
+  const post=(body,csrf=token,headers={})=>app.request('/api/cli',{method:'POST',headers:{'content-type':'application/json','x-csrf-token':csrf,...headers},body:JSON.stringify(body)});
+  assert.equal((await app.request('/api/cli')).status,404);
+  assert.equal((await post({profile:'dev',mfaCode:'012345'},'wrong')).status,403);
+  assert.equal((await post({profile:'dev',mfaCode:'012345'},token,{origin:'https://foreign.invalid'})).status,403);
+  assert.equal((await post({profile:'dev',mfaCode:'012345'},token,{'sec-fetch-site':'cross-site'})).status,403);
+  for(const mfaCode of [123456,'12345','1234567','１２３４５６',null])assert.equal((await post({profile:'dev',mfaCode})).status,400);
+  assert.equal((await post({profile:'default',mfaCode:'012345'})).status,422);
+  assert.equal((await post({profile:'missing',mfaCode:'012345'})).status,404);
+  assert.deepEqual(calls,[]);
+  for(const mfaCode of ['012345','654321']){
+    const response=await post({profile:'dev',mfaCode});
+    assert.equal(response.status,200);
+    assert.equal(response.headers['cache-control'],'no-store');
+    const payload=response.json();
+    assert.deepEqual(Object.keys(payload).sort(),['commands','expiration','profile','roleArn']);
+    assert.equal(payload.commands.posix.split('\n').length,5);
+    assert.equal(payload.commands.powershell.split('\n').length,5);
+    assert.match(payload.commands.posix,/export AWS_SESSION_TOKEN='TEST_ONLY_TOKEN'/);
+    assert.doesNotMatch(response.text,/DO_NOT_RETURN|012345|654321|aws_session\.py|Invoke-Expression|eval/);
+  }
+  assert.deepEqual(calls,[{profile:'dev',code:'012345'},{profile:'dev',code:'654321'}]);
+  assert.equal(await readFile(app.configFile,'utf8'),exampleConfig);
+  await assert.rejects(readFile(path.join(app.stateDirectory,'active-profile.json'),'utf8'),{code:'ENOENT'});
+  for(const endpoint of ['/api/profiles','/api/active'])assert.doesNotMatch((await app.request(endpoint)).text,/TEST_ONLY_/);
+  await app.restart();
+  assert.deepEqual((await app.request('/api/active')).json(),{profile:null,commands:null});
+});
+
+test('short exports apply literal temporary values and region without helper commands', {skip:process.platform==='win32'},async()=>{
+  const result=fakeCliSession({role_arn:'arn:aws:iam::123456789012:role/Dev'});
+  result.credentials.SecretAccessKey="TEST_ONLY_'$(printf${IFS}substituted)'`false`";
+  result.credentials.SessionToken="TEST_ONLY_'$HOME;\\token";
+  const {commands}=validateCliResult(result);
+  assert.equal(commands.posix.split('\n').length,5);
+  assert.ok(commands.posix.split('\n').every(line=>line.startsWith('export AWS_')));
+  assert.ok(commands.powershell.split('\n').every(line=>line.startsWith('$Env:AWS_')));
+  const script=commands.posix+`\n"${process.execPath}" -e 'process.stdout.write(JSON.stringify({key:process.env.AWS_ACCESS_KEY_ID,secret:process.env.AWS_SECRET_ACCESS_KEY,token:process.env.AWS_SESSION_TOKEN,region:process.env.AWS_REGION,defaultRegion:process.env.AWS_DEFAULT_REGION}))'`;
+  const {stdout}=await execFileAsync('/bin/sh',['-c',script],{env:{PATH:process.env.PATH}});
+  assert.deepEqual(JSON.parse(stdout),{key:result.credentials.AccessKeyId,secret:result.credentials.SecretAccessKey,token:result.credentials.SessionToken,region:result.region,defaultRegion:result.region});
+  assert.match(buildCredentialCommands(result).powershell,/TEST_ONLY_''/);
+});
+
+test('invalid or failed CLI sessions return no credential output',async(t)=>{
+  let mode='failed';
+  const app=await fixture(t,exampleConfig,{cliSession:async(profile)=>{
+    const result=fakeCliSession(profile);
+    if(mode==='failed')throw new Error('TEST_ONLY_SECRET');
+    if(mode==='expired')result.expiration='2000-01-01T00:00:00Z';
+    if(mode==='future')result.expiration=new Date(Date.now()+7200000).toISOString();
+    if(mode==='token')result.credentials.SessionToken='TEST_ONLY_TOKEN\ninvalid';
+    if(mode==='missing')delete result.credentials.SecretAccessKey;
+    if(mode==='region')result.region='us-east-1;bad';
+    if(mode==='role')result.roleArn='arn:aws:iam::999999999999:role/Other';
+    return result;
+  }});
+  const {token}=(await app.request('/api/profiles')).json();
+  for(mode of ['failed','expired','future','token','missing','region','role']){
+    const result=await app.request('/api/cli',{method:'POST',headers:{'content-type':'application/json','x-csrf-token':token},body:'{"profile":"dev","mfaCode":"012345"}'});
+    assert.equal(result.status,mode==='failed'?500:502);
+    assert.deepEqual(Object.keys(result.json()),['error']);
+    assert.doesNotMatch(result.text,/TEST_ONLY_|012345/);
   }
 });

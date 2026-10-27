@@ -259,6 +259,20 @@ def console_session(config_file: str | Path, profile_name: str, mfa_code: str) -
     }
 
 
+def cli_session(config_file: str | Path, profile_name: str, mfa_code: str) -> dict:
+    """Return only newly assumed role credentials to the local CLI session UI."""
+    result = assume_profile(config_file, profile_name, mfa_code)
+    credentials = result["credentials"]
+    return {
+        "credentials": {
+            key: credentials[key] for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+        },
+        "region": result["region"],
+        "expiration": credentials["Expiration"].astimezone(timezone.utc).isoformat(),
+        "roleArn": result["roleArn"],
+    }
+
+
 def shell_exports(result: dict, shell: str) -> str:
     credentials = result["credentials"]
     values = {
@@ -292,16 +306,16 @@ def _prompt_mfa() -> str:
 def _worker_request() -> tuple[str, str]:
     raw = sys.stdin.buffer.read(MAX_WORKER_BYTES + 1)
     if len(raw) > MAX_WORKER_BYTES:
-        raise SessionError("The console sign-in request is too large.")
+        raise SessionError("The sign-in request is too large.")
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeError):
-        raise SessionError("Invalid console sign-in request.") from None
+        raise SessionError("Invalid sign-in request.") from None
     if not isinstance(payload, dict) or set(payload) != {"profile", "mfaCode"}:
-        raise SessionError("Invalid console sign-in request.")
+        raise SessionError("Invalid sign-in request.")
     profile_name, mfa_code = payload["profile"], payload["mfaCode"]
     if not isinstance(profile_name, str) or not 1 <= len(profile_name) <= 2048 or not isinstance(mfa_code, str):
-        raise SessionError("Invalid console sign-in request.")
+        raise SessionError("Invalid sign-in request.")
     return profile_name, mfa_code
 
 
@@ -310,12 +324,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--file", required=True, help="Local AWS config file")
     parser.add_argument("--profile", help="Role profile for an interactive CLI session")
     parser.add_argument("--shell", choices=("posix", "powershell"), default="posix")
-    parser.add_argument("--console-worker", action="store_true", help=argparse.SUPPRESS)
+    workers = parser.add_mutually_exclusive_group()
+    workers.add_argument("--console-worker", action="store_true", help=argparse.SUPPRESS)
+    workers.add_argument("--cli-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
-        if args.console_worker:
+        if args.console_worker or args.cli_worker:
             profile_name, mfa_code = _worker_request()
-            output = json.dumps(console_session(args.file, profile_name, mfa_code), ensure_ascii=True)
+            create_session = console_session if args.console_worker else cli_session
+            output = json.dumps(create_session(args.file, profile_name, mfa_code), ensure_ascii=True)
         else:
             if not args.profile:
                 raise SessionError("Choose a profile with --profile.")

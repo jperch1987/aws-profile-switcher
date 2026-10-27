@@ -83,6 +83,34 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(second["roleArn"], ROLE)
         self.assertEqual(self.client.close.call_count, 2)
 
+    def test_cli_worker_uses_fresh_mfa_sessions_and_preserves_leading_zeroes(self):
+        outputs = []
+        self.client.assume_role.side_effect = [
+            {"Credentials": credentials(AccessKeyId="TEST_FIRST_SESSION_KEY")},
+            {"Credentials": credentials(AccessKeyId="TEST_SECOND_SESSION_KEY")},
+        ]
+        with patch.object(aws_session, "_prompt_mfa") as prompt, patch.object(aws_session, "_signin_token") as federation:
+            for code in ("012345", "000123"):
+                output, errors = io.StringIO(), io.StringIO()
+                payload = json.dumps({"profile": "dev", "mfaCode": code}).encode("utf-8")
+                with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
+                self.assertEqual(errors.getvalue(), "")
+                result = json.loads(output.getvalue())
+                self.assertEqual(set(result), {"credentials", "region", "expiration", "roleArn"})
+                self.assertEqual(set(result["credentials"]), {"AccessKeyId", "SecretAccessKey", "SessionToken"})
+                self.assertNotIn("TEST_SOURCE", output.getvalue())
+                self.assertNotIn(code, output.getvalue())
+                outputs.append(result)
+            prompt.assert_not_called()
+            federation.assert_not_called()
+        self.assertEqual(self.sdk.Session.call_count, 2)
+        self.assertEqual([call.kwargs["TokenCode"] for call in self.client.assume_role.call_args_list], ["012345", "000123"])
+        self.assertNotEqual(outputs[0]["credentials"]["AccessKeyId"], outputs[1]["credentials"]["AccessKeyId"])
+        self.assertEqual(outputs[0]["region"], "ap-southeast-1")
+        self.assertEqual(outputs[0]["roleArn"], ROLE)
+        self.assertGreater(datetime.fromisoformat(outputs[0]["expiration"]), datetime.now(timezone.utc))
+
     def test_invalid_otp_is_rejected_before_reading_config_or_using_sdk(self):
         for code in ("", "12345", "1234567", " 123456", "123456\n", "１２３４５６", "abcdef", 123456, None):
             with self.subTest(code=code), self.assertRaisesRegex(aws_session.SessionError, "six-digit"):
@@ -278,6 +306,49 @@ class FederationTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
+    def test_cli_worker_emits_only_allowlisted_temporary_credentials_and_metadata(self):
+        temporary = credentials()
+        temporary["unexpected"] = "PRIVATE_EXTRA_FIELD"
+        result = {
+            "credentials": temporary, "region": "us-east-1", "roleArn": ROLE,
+            "sourceCredentials": {"SecretAccessKey": "PRIVATE_SOURCE_SECRET"},
+        }
+        output, errors = io.StringIO(), io.StringIO()
+        payload = b'{"profile":"dev","mfaCode":"012345"}'
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result) as assume, patch.object(aws_session, "_signin_token") as federation, redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
+        assume.assert_called_once_with(CONFIG, "dev", "012345")
+        federation.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("PRIVATE", output.getvalue())
+        self.assertEqual(json.loads(output.getvalue()), {
+            "credentials": {key: temporary[key] for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")},
+            "region": "us-east-1", "roleArn": ROLE,
+            "expiration": temporary["Expiration"].astimezone(timezone.utc).isoformat(),
+        })
+
+    def test_cli_worker_failure_has_no_stdout_or_raw_error_details(self):
+        for failure in (RuntimeError("PRIVATE_SOURCE_KEY_MFA_012345"), aws_session.SessionError("AWS rejected the source credentials.")):
+            with self.subTest(error=type(failure).__name__):
+                output, errors = io.StringIO(), io.StringIO()
+                payload = b'{"profile":"dev","mfaCode":"012345"}'
+                with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=failure), redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(set(json.loads(errors.getvalue())), {"error"})
+                self.assertNotIn("PRIVATE", errors.getvalue())
+                self.assertNotIn("012345", errors.getvalue())
+
+    def test_worker_modes_are_mutually_exclusive(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(aws_session, "_worker_request") as request, redirect_stdout(output), redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as exited:
+                aws_session.main(["--file", CONFIG, "--console-worker", "--cli-worker"])
+        self.assertEqual(exited.exception.code, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("not allowed", errors.getvalue())
+        request.assert_not_called()
+
     def test_getpass_never_falls_back_to_echoing_mfa(self):
         def fallback(*args, **kwargs):
             warnings.warn("Cannot control echo", getpass.GetPassWarning)
@@ -309,14 +380,17 @@ class EntrypointTests(unittest.TestCase):
             self.assertEqual(json.loads(errors.getvalue()), {"error": "AWS rejected the MFA code."})
 
     def test_worker_limits_input_and_rejects_extra_fields(self):
-        for payload in (b'{"profile":"dev","mfaCode":"123456","url":"https://attacker.example"}', b'[]', b'PRIVATE_BAD_JSON', b'x' * (aws_session.MAX_WORKER_BYTES + 1)):
-            output, errors = io.StringIO(), io.StringIO()
-            with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "console_session") as console, redirect_stdout(output), redirect_stderr(errors):
-                self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 1)
-            console.assert_not_called()
-            self.assertEqual(output.getvalue(), "")
-            self.assertEqual(set(json.loads(errors.getvalue())), {"error"})
-            self.assertNotIn("PRIVATE", errors.getvalue())
+        for mode in ("--console-worker", "--cli-worker"):
+            for payload in (b'{"profile":"dev","mfaCode":"123456","url":"https://attacker.example"}', b'[]', b'PRIVATE_BAD_JSON', b'x' * (aws_session.MAX_WORKER_BYTES + 1), b'{"profile":"dev","mfaCode":123456}'):
+                with self.subTest(mode=mode, payload_length=len(payload)):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "console_session") as console, patch.object(aws_session, "cli_session") as cli, redirect_stdout(output), redirect_stderr(errors):
+                        self.assertEqual(aws_session.main(["--file", CONFIG, mode]), 1)
+                    console.assert_not_called()
+                    cli.assert_not_called()
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(set(json.loads(errors.getvalue())), {"error"})
+                    self.assertNotIn("PRIVATE", errors.getvalue())
 
     def test_worker_does_not_print_credentials_or_raw_exception_on_failure(self):
         output, errors = io.StringIO(), io.StringIO()

@@ -2,13 +2,62 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { profiles: [], selected: null, active: null, commands: null, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
+const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, consoleTab: null, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
 
 function busy() { return state.loading || state.switching || state.authenticating; }
 function clearMfa() { $("mfa-code").value = ""; }
 
+function forgetCredentials() {
+  state.commands = null;
+  state.active = null;
+  state.expiration = 0;
+  state.sessionVersion++;
+  clearTimeout(state.expiryTimer);
+  clearTimeout(state.copyTimer);
+  state.expiryTimer = null;
+}
+
+function hasCredentials() {
+  if (state.commands && state.expiration <= Date.now()) forgetCredentials();
+  return Boolean(state.commands);
+}
+
+function clearCredentials() {
+  forgetCredentials();
+  renderProfiles();
+  renderDetails();
+  renderActive();
+}
+
+function scheduleExpiry() {
+  clearTimeout(state.expiryTimer);
+  if (!hasCredentials()) {
+    clearCredentials();
+    announce("CLI credentials expired and were cleared here. Enter a fresh MFA code to get new credentials.");
+    return;
+  }
+  renderActive();
+  state.expiryTimer = setTimeout(scheduleExpiry, Math.min(state.expiration - Date.now(), 60_000));
+}
+
+function validCliResponse(result, selected) {
+  const expiration = Date.parse(result?.expiration);
+  const keys = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION"];
+  if (result?.profile?.profile !== selected.profile || result.roleArn !== selected.role_arn || typeof result.expiration !== "string" || !Number.isFinite(expiration) || expiration <= Date.now() || expiration > Date.now() + 3_900_000) return false;
+  return ["posix", "powershell"].every((shell) => {
+    const value = result.commands?.[shell];
+    if (typeof value !== "string" || value.length > 200_000) return false;
+    const lines = value.split("\n");
+    return lines.length === keys.length && lines.every((line, index) => {
+      const prefix = shell === "posix" ? `export ${keys[index]}=` : `$Env:${keys[index]} = `;
+      const quoted = shell === "posix" ? /^'(?:[\x20-\x26\x28-\x7e]|'\\'')*'$/ : /^'(?:[\x20-\x26\x28-\x7e]|'')*'$/;
+      return line.startsWith(prefix) && quoted.test(line.slice(prefix.length));
+    });
+  });
+}
+
 function announce(message, error = false) {
-  if (error) clearMfa();
+  if (error) { clearMfa(); clearCredentials(); }
   const notice = $("notice");
   notice.textContent = message;
   notice.classList.toggle("is-error", error);
@@ -100,7 +149,7 @@ function renderProfiles() {
     button.disabled = busy();
     button.classList.toggle("is-selected", profile.profile === state.selected);
     button.setAttribute("aria-pressed", String(profile.profile === state.selected));
-    button.setAttribute("aria-label", `${profile.profile}, ${profile.region || "region not set"}${profile.profile === state.active?.profile ? ", saved CLI profile" : ""}`);
+    button.setAttribute("aria-label", `${profile.profile}, ${profile.region || "region not set"}${profile.profile === state.active?.profile ? ", temporary CLI credentials available" : ""}`);
     const avatar = makeElement("span", "profile-avatar", initials(profile.profile));
     avatar.setAttribute("aria-hidden", "true");
     const text = makeElement("span", "profile-item-text");
@@ -117,6 +166,7 @@ function renderProfiles() {
       if (busy()) return;
       clearMfa();
       clearNotice();
+      forgetCredentials();
       state.selected = profile.profile;
       for (const item of $("profile-list").children) {
         const selected = item === button;
@@ -124,6 +174,8 @@ function renderProfiles() {
         item.setAttribute("aria-pressed", String(selected));
       }
       renderDetails();
+      renderActive();
+      renderProfiles();
     });
     fragment.append(button);
   }
@@ -140,16 +192,16 @@ function renderDetails() {
   $("detail-name").textContent = selected.profile;
   $("detail-avatar").textContent = initials(selected.profile);
   $("detail-description").textContent = "Review the role before choosing your workflow.";
-  $("selection-badge").textContent = isActive ? "Selected for CLI" : "Preview";
+  $("selection-badge").textContent = isActive ? "CLI credentials ready" : "Preview";
   $("selection-badge").classList.toggle("is-active", isActive);
   for (const [id, value] of [["detail-profile", selected.profile], ["detail-region", selected.region], ["detail-role", selected.role_arn], ["detail-source", selected.source_profile]]) {
     $(id).textContent = value || "Not set";
     $(id).classList.toggle("not-set", !value);
   }
   const enabled = selected.auth?.enabled === true;
-  $("switch-label").textContent = state.switching ? "Saving…" : isActive ? "Refresh CLI command" : "Use for CLI";
+  $("switch-label").textContent = state.switching ? "Authenticating…" : "Get CLI credentials";
   $("switch-button").disabled = busy() || !enabled;
-  $("switch-help").textContent = "CLI: copy and run the command below. Enter a fresh MFA code in your terminal each time.";
+  $("switch-help").textContent = "Use a fresh MFA code for either action. CLI credentials appear below after AWS authenticates the role.";
   $("console-label").textContent = state.authenticating ? "Signing in…" : "Open AWS Console";
   $("console-button").disabled = busy() || !enabled;
   $("mfa-code").disabled = busy() || !enabled;
@@ -168,20 +220,28 @@ function renderDetails() {
 }
 
 function renderActive() {
-  $("active-name").textContent = state.active?.profile || "No CLI profile selected";
-  $("active-meta").textContent = state.active ? `${state.active.region || "Region not set"}${state.active.source_profile ? ` · from ${state.active.source_profile}` : ""}` : "Choose a profile and select “Use for CLI”.";
-  $("active-status").textContent = state.active ? "Selection only" : "CLI selection";
+  const available = hasCredentials();
+  $("active-name").textContent = available ? state.active.profile : "No CLI credentials loaded";
+  $("active-meta").textContent = available ? `${state.active.region || "Region not set"} · Temporary credentials in this page only` : "Choose a profile, enter MFA, then select “Get CLI credentials”.";
+  $("active-status").textContent = available ? "Temporary session" : "MFA required";
   renderCommand();
 }
 
 function renderCommand() {
+  if (state.commands && state.expiration <= Date.now()) {
+    clearCredentials();
+    return;
+  }
+  const available = hasCredentials();
   const command = state.commands?.[state.shell];
-  $("terminal-command").textContent = command || "# Your CLI profile command will appear here";
+  $("terminal-command").textContent = command || "# Temporary export commands appear after MFA authentication";
   $("terminal-command").classList.toggle("is-placeholder", !command);
-  $("terminal-description").textContent = command ? `Run for “${state.active.profile}”, then enter MFA in your terminal.` : state.active ? "The saved profile cannot authenticate. Check its configuration and select it again." : "Choose “Use for CLI” to generate your shell command.";
+  $("terminal-description").textContent = command ? `Copy these five lines for “${state.active.profile}” into a fresh terminal. No second MFA prompt.` : "Enter MFA above and choose “Get CLI credentials” to reveal the export commands.";
+  $("session-expiry").textContent = available ? `Expires at ${new Date(state.expiration).toLocaleTimeString()} · ${Math.ceil((state.expiration - Date.now()) / 60_000)} min remaining` : "Credentials are cleared here on expiry, refresh, or profile change.";
+  $("clear-credentials").disabled = !available;
   document.querySelector(".terminal-prompt").textContent = state.shell === "powershell" ? ">" : "$";
   $("copy-button").disabled = !command || busy();
-  $("copy-label").textContent = "Copy command";
+  $("copy-label").textContent = "Copy commands";
   clearTimeout(state.copyTimer);
   document.querySelectorAll("[data-shell]").forEach((tab) => {
     const selected = tab.dataset.shell === state.shell;
@@ -212,6 +272,7 @@ async function loadProfiles(isRefresh = false) {
   const previousSelection = state.selected;
   clearMfa();
   clearNotice();
+  forgetCredentials();
   state.profiles = [];
   state.selected = null;
   state.active = null;
@@ -232,15 +293,6 @@ async function loadProfiles(isRefresh = false) {
     $("source-file").title = data.file || "";
     state.selected = state.profiles.some((profile) => profile.profile === previousSelection) ? previousSelection : state.profiles.find((profile) => profile.auth?.enabled === true)?.profile || state.profiles.find((profile) => approvedConsoleUrl(profile.console?.url))?.profile || state.profiles[0]?.profile || null;
     state.loaded = true;
-    if (data.activeProfile) {
-      try {
-        const active = await request("/api/active");
-        state.active = active.profile;
-        state.commands = active.commands;
-      } catch (error) {
-        announce(`Profiles loaded, but the saved CLI selection could not be read. ${error.message}`, true);
-      }
-    }
     renderProfiles();
     renderDetails();
     renderActive();
@@ -265,24 +317,42 @@ async function loadProfiles(isRefresh = false) {
 
 async function switchProfile() {
   if (busy() || state.profiles.find((profile) => profile.profile === state.selected)?.auth?.enabled !== true) return;
-  const profileName = state.selected;
+  const selected = state.profiles.find((profile) => profile.profile === state.selected);
+  let mfaCode = $("mfa-code").value;
   clearMfa();
+  clearCredentials();
+  if (!/^[0-9]{6}$/.test(mfaCode)) {
+    mfaCode = "";
+    announce("Enter a fresh six-digit MFA code to get CLI credentials.", true);
+    $("mfa-code").focus();
+    return;
+  }
+  const authVersion = ++state.authVersion;
   state.switching = true;
   clearNotice();
   renderBusy();
   try {
-    const result = await request("/api/active", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: profileName }) });
+    const pending = request("/api/cli", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode }) });
+    mfaCode = "";
+    const result = await pending;
+    if (authVersion !== state.authVersion) return;
+    if (!validCliResponse(result, selected)) throw new Error("AWS returned invalid or expired CLI credentials. Enter a fresh MFA code and try again.");
     state.active = result.profile;
-    state.profiles = state.profiles.map((profile) => profile.profile === result.profile.profile ? result.profile : profile);
     state.commands = result.commands;
-    announce(`“${result.profile.profile}” is selected for CLI use. Run the command below and enter a fresh MFA code in your terminal to authenticate.`);
+    state.expiration = Date.parse(result.expiration);
+    scheduleExpiry();
+    announce(`Temporary CLI credentials for “${result.profile.profile}” are ready. Copy the export commands into a fresh terminal.`);
     renderProfiles();
     renderActive();
   } catch (error) {
-    announce(error.message, true);
+    if (authVersion === state.authVersion) announce(`${error.message} Your terminal was not changed.`, true);
   } finally {
-    state.switching = false;
-    renderBusy();
+    mfaCode = "";
+    if (authVersion === state.authVersion) {
+      clearMfa();
+      state.switching = false;
+      renderBusy();
+    }
   }
 }
 
@@ -292,6 +362,7 @@ async function openConsole(event) {
   const selected = state.profiles.find((profile) => profile.profile === state.selected);
   let mfaCode = $("mfa-code").value;
   clearMfa();
+  clearCredentials();
   if (selected?.auth?.enabled !== true) return;
   if (!/^[0-9]{6}$/.test(mfaCode)) {
     mfaCode = "";
@@ -312,12 +383,15 @@ async function openConsole(event) {
     return;
   }
   state.authenticating = true;
+  state.consoleTab = consoleTab;
+  const authVersion = ++state.authVersion;
   clearNotice();
   renderBusy();
   try {
     const pending = request("/api/console", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode }) });
     mfaCode = "";
     const result = await pending;
+    if (authVersion !== state.authVersion) { consoleTab.close(); return; }
     const url = approvedFederationUrl(result.url);
     if (!url) throw new Error("AWS Console returned an invalid sign-in link. Enter a fresh MFA code and try again.");
     if (consoleTab.closed) throw new Error("The new tab was closed. Enter a fresh MFA code and try again.");
@@ -326,12 +400,15 @@ async function openConsole(event) {
     announce(`Opened AWS Console for “${selected.profile}” in a new tab. The temporary session expires; sign in again with MFA when needed.`);
   } catch (error) {
     consoleTab.close();
-    announce(error.message, true);
+    if (authVersion === state.authVersion) announce(error.message, true);
   } finally {
     mfaCode = "";
-    clearMfa();
-    state.authenticating = false;
-    renderBusy();
+    if (authVersion === state.authVersion) {
+      clearMfa();
+      state.consoleTab = null;
+      state.authenticating = false;
+      renderBusy();
+    }
   }
 }
 
@@ -343,45 +420,65 @@ function fallbackCopy(text) {
   textarea.style.position = "fixed";
   textarea.style.left = "-9999px";
   document.body.append(textarea);
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  previousFocus?.focus();
-  return copied;
+  try {
+    textarea.select();
+    return document.execCommand("copy");
+  } finally {
+    textarea.value = "";
+    textarea.remove();
+    previousFocus?.focus();
+  }
 }
 
 async function copyCommand() {
   if (busy()) return;
-  const command = state.commands?.[state.shell];
+  if (!hasCredentials()) {
+    clearCredentials();
+    announce("No unexpired credentials are available. Enter a fresh MFA code to get CLI credentials.");
+    return;
+  }
+  let command = state.commands?.[state.shell];
+  const version = state.sessionVersion;
   if (!command) return;
   try {
     try {
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
       await navigator.clipboard.writeText(command);
     } catch {
+      if (version !== state.sessionVersion) return;
+      if (!hasCredentials()) { clearCredentials(); return; }
       if (!fallbackCopy(command)) throw new Error("Clipboard unavailable");
     }
+    if (version !== state.sessionVersion) return;
+    if (!hasCredentials()) { clearCredentials(); return; }
     $("copy-label").textContent = "Copied!";
-    announce("Command copied. Run it in your terminal and enter a fresh MFA code to authenticate.");
+    announce("Temporary credentials copied. Paste into a fresh terminal. Your clipboard and shell history may retain them.");
     clearTimeout(state.copyTimer);
-    state.copyTimer = setTimeout(() => { $("copy-label").textContent = "Copy command"; }, 2200);
+    state.copyTimer = setTimeout(() => { $("copy-label").textContent = "Copy commands"; }, 2200);
   } catch {
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents($("terminal-command"));
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    announce("Your browser could not copy automatically. The command is selected; press Ctrl+C or ⌘C to copy it.", true);
-  }
+    announce("Your browser could not copy the credentials. They were cleared here; enter a fresh MFA code to try again.", true);
+  } finally { command = ""; }
+}
+
+function clearPageSecrets() {
+  state.authVersion++;
+  state.consoleTab?.close();
+  state.consoleTab = null;
+  state.switching = false;
+  state.authenticating = false;
+  clearMfa();
+  clearCredentials();
+  renderBusy();
 }
 
 $("refresh-button").addEventListener("click", () => loadProfiles(true));
 $("profile-search").addEventListener("input", renderProfiles);
 $("switch-button").addEventListener("click", switchProfile);
 $("console-form").addEventListener("submit", openConsole);
-$("console-link").addEventListener("click", clearMfa);
-$("console-link").addEventListener("auxclick", clearMfa);
+$("console-link").addEventListener("click", () => { clearMfa(); clearCredentials(); });
+$("console-link").addEventListener("auxclick", () => { clearMfa(); clearCredentials(); });
 $("copy-button").addEventListener("click", copyCommand);
+$("clear-credentials").addEventListener("click", () => { clearMfa(); clearCredentials(); announce("Credentials cleared from this page. Your clipboard and terminal were not changed."); });
 document.querySelectorAll("[data-shell]").forEach((button) => button.addEventListener("click", () => { state.shell = button.dataset.shell; renderCommand(); }));
 document.addEventListener("keydown", (event) => {
   if (event.key === "/" && !event.metaKey && !event.ctrlKey && !event.altKey && !["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName) && !document.activeElement?.isContentEditable) {
@@ -390,4 +487,5 @@ document.addEventListener("keydown", (event) => {
   }
 });
 loadProfiles();
-window.addEventListener("pagehide", clearMfa);
+window.addEventListener("pagehide", clearPageSecrets);
+window.addEventListener("pageshow", (event) => { if (event.persisted) clearPageSecrets(); });

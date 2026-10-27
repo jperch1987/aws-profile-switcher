@@ -6,7 +6,7 @@ A local web app built with **Node.js and Python**. Choose a role from a local AW
 
 Clients need a browser, Node.js, Python, and the Python packages in `requirements.txt`, including the AWS SDK **boto3**. **Codex and browser extensions are not required.** Node.js uses only its standard library; no `npm install` is needed. AWS CLI is optional for the app itself; install it separately to run `aws` commands.
 
-This version requires a fresh six-digit MFA code for each CLI authentication or direct Console launch. It supports a role whose `source_profile` supplies an IAM user's long-term access keys. SSO, `credential_process`, web-identity credentials, and role chaining are not supported by this authentication flow. The manual AWS Switch Role page remains available as a separate fallback.
+This version requires a fresh six-digit MFA code in the web app for each CLI credential request or direct Console launch. CLI credentials appear as five ready-to-copy environment assignments, similar to an access portal. Authentication uses a role whose `source_profile` supplies an IAM user's long-term access keys; this is not IAM Identity Center or SSO integration. SSO, `credential_process`, web-identity credentials, and role chaining are not supported by this authentication flow. The manual AWS Switch Role page remains available as a separate fallback.
 
 ## Install Python and Node.js
 
@@ -103,6 +103,23 @@ This installs Node.js 24 and npm for your user. Run `nvm use 24` in a new termin
 
 Virtual environment activation is optional: the commands below call its Python executable directly.
 
+### Debian on WSL
+
+Run the server with Linux Node.js and Python inside Debian. From the project folder, create a separate Linux virtual environment in your WSL home directory:
+
+```sh
+sudo apt update
+sudo apt install python3 python3-venv python3-pip
+python3 -m venv "$HOME/.venvs/aws-profile-switcher-wsl"
+"$HOME/.venvs/aws-profile-switcher-wsl/bin/python" -m pip install -r requirements.txt
+export PYTHON="$HOME/.venvs/aws-profile-switcher-wsl/bin/python"
+npm start
+```
+
+Use Python 3.11 or newer and install Node.js using the Linux instructions above. Do not reuse a Windows `.venv` inside WSL. Set `PYTHON` to this same Linux interpreter each time you start the app; it takes precedence over any `.venv` in the checkout.
+
+The source keys must exist in **WSL's** `~/.aws/credentials`, not only in your Windows home. Match the credentials section to `source_profile` exactly. For example, `source_profile = work-user` requires a `[work-user]` section containing that source user's keys; putting them only under `[default]` will not satisfy that configuration. Keep the MFA device identifier in `mfa_serial` in the profile config as described below.
+
 ## Install and run the app
 
 Install Git if you want to use the clone commands below. Alternatively, select **Code → Download ZIP** on the [GitHub repository](https://github.com/jperch1987/aws-profile-switcher), extract it, and open a terminal in the extracted folder; skip the `git clone` and `cd` lines. Create the virtual environment, install the Python dependencies, and configure your roles and source credentials before authenticating.
@@ -149,7 +166,7 @@ npm.cmd start
 | `PROFILES_FILE` | `profiles.txt` beside the server | Local config file; relative paths resolve from the working directory |
 | `PORT` | `3000` | Loopback web server port |
 | `PYTHON` | Project `.venv` Python when present; otherwise `python3` or Windows `python` | Override the Python executable; its environment must contain `requirements.txt` packages |
-| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for the app's saved CLI profile selection |
+| `PROFILE_SWITCHER_STATE_DIR` | `.state` beside the server | Directory for saved selection metadata; never stores or restores credentials |
 
 For example, `PORT=8080 npm start` changes the port on macOS/Linux. To choose a specific Python installation, replace the example path below with the full path to your installed Python 3.11+ executable:
 
@@ -206,21 +223,49 @@ Prefer a metadata-only profile file. The parser reads its bytes before filtering
 ## Use a profile in a terminal
 
 1. Select a role profile and review its account, role, source, and MFA device.
-2. Choose **Use for CLI** to save the selection and generate a helper command.
-3. Choose Bash/Zsh or PowerShell, copy the command, and paste it into the terminal you want to configure.
-4. Enter a fresh six-digit MFA code at the terminal prompt. The code is hidden while you type.
+2. Enter a fresh six-digit MFA code **in the web app**, then choose **Get CLI credentials**.
+3. Choose Bash/Zsh or PowerShell. Review the role and expiration shown with the five environment assignments, then copy them.
+4. Paste the assignments into a fresh terminal without prior AWS environment overrides, especially `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, or the legacy `AWS_SECURITY_TOKEN`. Run AWS commands without `--profile`.
 
-The command runs `aws_session.py`, calls AWS STS to assume the selected role, and applies the returned temporary access key, secret key, session token, and region to **that terminal**. Every invocation requests MFA and creates a new session; the helper does not reuse an AWS CLI credential cache. Bash/Zsh commands are not for Fish or Windows Command Prompt.
+The local server calls AWS STS with your source credentials and MFA. It returns temporary credentials as simple shell assignments for `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, and `AWS_DEFAULT_REGION`. For example, the Bash/Zsh format is:
 
-The generated command clears previous exported AWS credentials and profile overrides before switching. If authentication fails, those previous exports stay cleared; the helper does not silently keep the last authenticated role. AWS tools can still use their normal default credentials when no temporary credentials are exported, so check the error and do not continue assuming the switch succeeded.
+```sh
+export AWS_ACCESS_KEY_ID='TEMPORARY_ACCESS_KEY_ID'
+export AWS_SECRET_ACCESS_KEY='TEMPORARY_SECRET_ACCESS_KEY'
+export AWS_SESSION_TOKEN='TEMPORARY_SESSION_TOKEN'
+export AWS_REGION='ap-southeast-1'
+export AWS_DEFAULT_REGION='ap-southeast-1'
+```
 
-After a successful switch, run AWS commands **without `--profile`** so they use the temporary credentials in your environment. Supplying `--profile` selects a separate AWS CLI profile workflow and can trigger another authentication path. With AWS CLI installed, verify the identity before doing work:
+The actual values come from the app; the example above contains placeholders. PowerShell uses `$Env:NAME = 'value'` for the same five variables. Bash/Zsh exports are not for Fish or Windows Command Prompt. Pasting them requires no Python installation, local helper invocation, or second MFA prompt in the target terminal. Python and boto3 are still required on the computer running the local server.
+
+If you reuse a terminal, clear these older profile/token/provider overrides **before** pasting the new five assignments. For Bash/Zsh:
+
+```sh
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SECURITY_TOKEN AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_SESSION_NAME
+```
+
+For PowerShell:
+
+```powershell
+'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_SECURITY_TOKEN', 'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE', 'AWS_ROLE_SESSION_NAME' | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+```
+
+Every **Get CLI credentials** request needs a fresh MFA code and creates a new one-hour STS session. The exported credentials can be reused until they expire; pasting the same valid exports does not request MFA again. The app does not reuse a cached session for a new request or refresh credentials in the background. Request a new set whenever you switch roles or the session expires. Console access is a separate request with its own fresh MFA entry; requesting CLI credentials does not sign in your browser.
+
+Use the temporary exports without `--profile`, which can select a separate AWS CLI profile workflow. With AWS CLI installed, verify the identity before doing work:
 
 ```sh
 aws sts get-caller-identity
 ```
 
-The saved app selection in `.state/active-profile.json` contains the profile name and config path, not credentials or a live terminal session. A browser cannot change an existing terminal's environment. The helper requests a one-hour role session. Run the command again whenever you switch or the temporary session expires; there is no background refresh. CLI MFA is entered in the terminal, separately from the Console MFA field.
+These assignments contain **live secrets**. Turn off shell tracing and avoid terminal recording or shell history that saves the pasted credentials. Copying is explicit, but clipboard history or synchronization tools may retain what you copy. Do not share the commands or include them in screenshots, logs, or support messages.
+
+Use **Clear credentials** to remove the displayed values. The app also removes them when you change profiles, begin another authentication request, refresh, encounter an authentication failure, reach the session's expiration, or leave the page. This only clears the app's display and references: it does not clear the clipboard, shell environment, terminal history, or revoke an AWS session. A failed request does not change credentials already pasted into a terminal. The browser cannot change an existing terminal's environment.
+
+Temporary credentials are returned over the loopback HTTP connection and held in the browser's memory and page content. They are not saved to browser storage or server state. The new CLI flow does not save the selection. Any legacy selection in `.state/active-profile.json` contains only profile/config metadata; restoring a selection never restores credentials.
+
+For advanced terminal-only use, `aws_session.py` remains available as an optional helper that prompts for MFA in the terminal. It is separate from the web app's copy-and-paste workflow.
 
 ## Open a role in AWS Console
 
@@ -240,11 +285,11 @@ AWS's manual form cannot supply an `ExternalId`, and its role path/name limit is
 
 This release supports commercial AWS (`arn:aws:iam::...:role/...`), not AWS China or GovCloud. For SSO and other unsupported identity providers, use your organization's access portal or approved tools. The app does not discover SSO permission sets or change IAM policies.
 
-**The two actions are independent:** saving a CLI selection does not change your browser's AWS session, and opening a console role does not configure any terminal.
+**The two actions are independent:** getting CLI credentials does not change your browser's AWS session, and opening a console role does not configure any terminal. Each authentication request requires fresh MFA entry.
 
 ## Local operation and security
 
-The Node server serves local assets, invokes Python, and saves the chosen CLI profile name and config path. During authentication the Python helper reads source keys, holds MFA codes and temporary credentials in memory, and contacts AWS STS and, for Console access, the AWS federation endpoint over HTTPS. The CLI helper exports temporary credentials into your terminal environment. The app has no telemetry or external UI assets.
+The Node server serves local assets, invokes Python, and can save profile-selection metadata. During authentication the Python helper reads source keys, holds MFA codes and temporary credentials in memory, and contacts AWS STS and, for Console access, the AWS federation endpoint over HTTPS. The CLI response intentionally contains temporary credentials in the shell assignments shown in the browser. Source keys are never returned to the browser. The app has no telemetry or external UI assets.
 
 The authentication helper uses fixed AWS destinations and does not honor custom endpoint or proxy overrides. Networks that require an outbound proxy may need an approved network configuration before authentication can work.
 
