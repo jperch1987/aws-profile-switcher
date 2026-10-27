@@ -1,13 +1,15 @@
 {
   "name": "local-aws-profile-switcher",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "author": "jperch1987",
   "private": true,
   "type": "module",
-  "description": "Local AWS CLI and direct Console role sessions with fresh MFA, Node.js, and Python.",
+  "description": "Local AWS CLI credentials with MFA and automatic Console role switching in a separate browser.",
   "engines": { "node": ">=22" },
+  "dependencies": { "playwright": "1.64.1" },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node scripts/test.mjs"
+    "test": "node scripts/test.mjs",
+    "test:browser": "node --test tests/browser-smoke.mjs"
   }
 }

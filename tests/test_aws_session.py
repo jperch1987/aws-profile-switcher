@@ -26,6 +26,19 @@ import aws_session
 ROLE = "arn:aws:iam::111111111111:role/team/Developer"
 MFA = "arn:aws:iam::222222222222:mfa/test-user"
 CONFIG = "/local/example-config"
+ASSUME_STAGES = ["configuration", "python-sdk", "source-credentials", "python-sdk", "assume-role"]
+
+
+def assumed_result(result=None, failure=None):
+    """Simulate an already covered AssumeRole flow in downstream worker tests."""
+    def assume(*args, progress=None):
+        if progress:
+            for stage in ASSUME_STAGES:
+                progress(stage)
+        if failure:
+            raise failure
+        return result
+    return assume
 
 
 def metadata(**changes):
@@ -97,7 +110,9 @@ class AuthenticationTests(unittest.TestCase):
                 payload = json.dumps({"profile": "dev", "mfaCode": code}).encode("utf-8")
                 with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), redirect_stdout(output), redirect_stderr(errors):
                     self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
-                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [{"stage": stage} for stage in ASSUME_STAGES])
+                self.assertNotIn("TEST_SOURCE", errors.getvalue())
+                self.assertNotIn(code, errors.getvalue())
                 result = json.loads(output.getvalue())
                 self.assertEqual(set(result), {"credentials", "region", "expiration", "roleArn"})
                 self.assertEqual(set(result["credentials"]), {"AccessKeyId", "SecretAccessKey", "SessionToken"})
@@ -112,6 +127,39 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(outputs[0]["region"], "ap-southeast-1")
         self.assertEqual(outputs[0]["roleArn"], ROLE)
         self.assertGreater(datetime.fromisoformat(outputs[0]["expiration"]), datetime.now(timezone.utc))
+
+    def test_worker_progress_identifies_local_loading_and_network_failures_before_they_start(self):
+        cases = (
+            (aws_session, "_selected_profile", ASSUME_STAGES[:1]),
+            (aws_session, "_sdk", ASSUME_STAGES[:2]),
+            (self.session, "get_credentials", ASSUME_STAGES[:3]),
+            (self.session, "client", ASSUME_STAGES[:4]),
+            (self.client, "assume_role", ASSUME_STAGES),
+        )
+        for mode in ("--cli-worker", "--console-worker"):
+            for target, method, expected in cases:
+                with self.subTest(mode=mode, method=method):
+                    output, errors = io.StringIO(), io.StringIO()
+                    payload = b'{"profile":"dev","mfaCode":"012345"}'
+                    with patch.object(target, method, side_effect=RuntimeError("PRIVATE_SDK_SOURCE_SECRET_012345")), patch.object(aws_session, "_signin_token") as federation, patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), redirect_stdout(output), redirect_stderr(errors):
+                        self.assertEqual(aws_session.main(["--file", CONFIG, mode]), 1)
+                    federation.assert_not_called()
+                    self.assertEqual(output.getvalue(), "")
+                    lines = [json.loads(line) for line in errors.getvalue().splitlines()]
+                    self.assertEqual(lines[:-1], [{"stage": stage} for stage in expected])
+                    self.assertEqual(set(lines[-1]), {"error"})
+                    for secret in ("PRIVATE", "012345", "TEST_SOURCE", CONFIG, "dev", "base"):
+                        self.assertNotIn(secret, errors.getvalue())
+
+    def test_console_worker_adds_federation_only_after_successful_role_authentication(self):
+        output, errors = io.StringIO(), io.StringIO()
+        payload = b'{"profile":"dev","mfaCode":"012345"}'
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "_signin_token", return_value="TEST_SIGNIN_TOKEN"), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 0)
+        self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [{"stage": stage} for stage in ASSUME_STAGES + ["federation"]])
+        self.assertEqual(set(json.loads(output.getvalue())), {"url", "expiration", "roleArn"})
+        self.assertNotIn("TEST_SOURCE", output.getvalue())
+        self.assertNotIn("TEST_SIGNIN_TOKEN", errors.getvalue())
 
     def test_invalid_otp_is_rejected_before_reading_config_or_using_sdk(self):
         for code in ("", "12345", "1234567", " 123456", "123456\n", "１２３４５６", "abcdef", 123456, None):
@@ -263,7 +311,7 @@ class FederationTests(unittest.TestCase):
         opener.open.return_value = self.response()
         with patch.object(aws_session, "assume_profile", return_value=self.result) as assume, patch.object(aws_session, "build_opener", return_value=opener):
             output = aws_session.console_session(CONFIG, "dev", "123456")
-        assume.assert_called_once_with(CONFIG, "dev", "123456")
+        assume.assert_called_once_with(CONFIG, "dev", "123456", progress=None)
         request = opener.open.call_args.args[0]
         self.assertEqual(request.full_url, aws_session.FEDERATION_URL)
         self.assertEqual(request.method, "POST")
@@ -285,7 +333,8 @@ class FederationTests(unittest.TestCase):
     def test_console_progress_identifies_each_network_stage_in_order(self):
         events = []
 
-        def assume(*args):
+        def assume(*args, progress=None):
+            progress("assume-role")
             events.append("assume-called")
             return self.result
 
@@ -301,9 +350,9 @@ class FederationTests(unittest.TestCase):
 
     def test_console_progress_does_not_enter_federation_after_role_failure(self):
         stages = []
-        with patch.object(aws_session, "assume_profile", side_effect=aws_session.SessionError("Role switch failed")), patch.object(aws_session, "_signin_token") as sign_in, self.assertRaises(aws_session.SessionError):
+        with patch.object(aws_session, "assume_profile", side_effect=assumed_result(failure=aws_session.SessionError("Role switch failed"))), patch.object(aws_session, "_signin_token") as sign_in, self.assertRaises(aws_session.SessionError):
             aws_session.console_session(CONFIG, "dev", "012345", progress=stages.append)
-        self.assertEqual(stages, ["assume-role"])
+        self.assertEqual(stages, ASSUME_STAGES)
         sign_in.assert_not_called()
 
     def test_federation_refuses_redirects_even_to_another_https_host(self):
@@ -397,11 +446,9 @@ class EntrypointTests(unittest.TestCase):
         result = {"credentials": credentials(), "region": "us-east-1", "roleArn": ROLE}
         output, errors = io.StringIO(), io.StringIO()
         payload = b'{"profile":"dev","mfaCode":"012345"}'
-        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result), patch.object(aws_session, "_signin_token", return_value="TEST_SIGNIN_TOKEN"), redirect_stdout(output), redirect_stderr(errors):
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=assumed_result(result)), patch.object(aws_session, "_signin_token", return_value="TEST_SIGNIN_TOKEN"), redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 0)
-        self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [
-            {"stage": "assume-role"}, {"stage": "federation"},
-        ])
+        self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [{"stage": stage} for stage in ASSUME_STAGES + ["federation"]])
         self.assertEqual(set(json.loads(output.getvalue())), {"url", "expiration", "roleArn"})
         with patch("builtins.print") as emit:
             aws_session._worker_stage("federation")
@@ -410,13 +457,13 @@ class EntrypointTests(unittest.TestCase):
     def test_console_worker_reports_stage_before_assume_failure_without_sensitive_details(self):
         output, errors = io.StringIO(), io.StringIO()
         payload = b'{"profile":"dev","mfaCode":"012345"}'
-        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=RuntimeError("PRIVATE_SOURCE_KEY_MFA_012345")), redirect_stdout(output), redirect_stderr(errors):
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=assumed_result(failure=RuntimeError("PRIVATE_SOURCE_KEY_MFA_012345"))), redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 1)
         self.assertEqual(output.getvalue(), "")
         lines = [json.loads(line) for line in errors.getvalue().splitlines()]
-        self.assertEqual(lines[0], {"stage": "assume-role"})
-        self.assertEqual(set(lines[1]), {"error"})
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[:-1], [{"stage": stage} for stage in ASSUME_STAGES])
+        self.assertEqual(set(lines[-1]), {"error"})
+        self.assertEqual(len(lines), len(ASSUME_STAGES) + 1)
         self.assertNotIn("PRIVATE", errors.getvalue())
         self.assertNotIn("012345", errors.getvalue())
 
@@ -441,11 +488,11 @@ class EntrypointTests(unittest.TestCase):
                 opener.open.side_effect = failure
                 output, errors = io.StringIO(), io.StringIO()
                 payload = b'{"profile":"dev","mfaCode":"012345"}'
-                with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result), patch.object(aws_session, "build_opener", return_value=opener), redirect_stdout(output), redirect_stderr(errors):
+                with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=assumed_result(result)), patch.object(aws_session, "build_opener", return_value=opener), redirect_stdout(output), redirect_stderr(errors):
                     self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 1)
                 self.assertEqual(output.getvalue(), "")
                 lines = [json.loads(line) for line in errors.getvalue().splitlines()]
-                self.assertEqual(lines[:-1], [{"stage": "assume-role"}, {"stage": "federation"}])
+                self.assertEqual(lines[:-1], [{"stage": stage} for stage in ASSUME_STAGES + ["federation"]])
                 diagnostic = lines[-1]
                 self.assertEqual(set(diagnostic), {"error"})
                 self.assertIn(expected, diagnostic["error"])
@@ -461,11 +508,11 @@ class EntrypointTests(unittest.TestCase):
         }
         output, errors = io.StringIO(), io.StringIO()
         payload = b'{"profile":"dev","mfaCode":"012345"}'
-        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result) as assume, patch.object(aws_session, "_signin_token") as federation, redirect_stdout(output), redirect_stderr(errors):
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=assumed_result(result)) as assume, patch.object(aws_session, "_signin_token") as federation, redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
-        assume.assert_called_once_with(CONFIG, "dev", "012345")
+        assume.assert_called_once_with(CONFIG, "dev", "012345", progress=aws_session._worker_stage)
         federation.assert_not_called()
-        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [{"stage": stage} for stage in ASSUME_STAGES])
         self.assertNotIn("PRIVATE", output.getvalue())
         self.assertEqual(json.loads(output.getvalue()), {
             "credentials": {key: temporary[key] for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")},

@@ -20,9 +20,9 @@
       <div class="sidebar-guide">
         <p class="eyebrow">A little less context switching.</p>
         <p>Your AWS profiles, in one place. Open a role in the console or take a profile to your terminal.</p>
-        <ol><li><span>01</span>Choose your profile</li><li><span>02</span>Enter a fresh MFA code</li><li><span>03</span>Continue in Console or CLI</li></ol>
+        <ol><li><span>01</span>Choose your profile</li><li><span>02</span>Choose Console or CLI</li><li><span>03</span>Complete sign-in and continue</li></ol>
       </div>
-      <div class="sidebar-footer"><span class="local-dot" aria-hidden="true"></span><strong>Local app, AWS sign-in</strong><p>Uses local source credentials.<br />Contacts AWS with fresh MFA.</p><div class="runtime-label">NODE.JS <span>+</span> PYTHON</div></div>
+      <div class="sidebar-footer"><span class="local-dot" aria-hidden="true"></span><strong>Local app, AWS sign-in</strong><p>Console sign-in stays in AWS.<br />CLI uses local keys and MFA.</p><div class="runtime-label">NODE.JS <span>+</span> PYTHON</div></div>
     </aside>
 
     <main class="main">
@@ -61,13 +61,18 @@
             <div class="detail-profile-heading"><span class="profile-avatar detail-avatar" id="detail-avatar" aria-hidden="true">P</span><div><h2 id="detail-name"></h2><p id="detail-description">Review the role before opening AWS.</p></div></div>
             <dl class="detail-fields"><div><dt>Profile name</dt><dd id="detail-profile"></dd></div><div><dt>Region</dt><dd id="detail-region"></dd></div><div class="field-full"><dt>Role ARN</dt><dd id="detail-role"></dd></div><div class="field-full"><dt>Source profile</dt><dd id="detail-source"></dd></div><div class="field-full"><dt>MFA device</dt><dd id="detail-mfa"></dd></div></dl>
             <form class="console-form" id="console-form" autocomplete="off" novalidate>
-              <label class="mfa-label" for="mfa-code">MFA code</label>
-              <div class="mfa-action"><input id="mfa-code" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" spellcheck="false" placeholder="6-digit code" aria-describedby="mfa-help console-reason" disabled /><button class="button button-primary" id="console-button" type="submit" disabled><span id="console-label">Open AWS Console</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M11 4h5v5M16 4l-8 8M8 4H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
-              <p class="action-help" id="mfa-help">Enter a fresh authenticator code for either action. Console opens the role directly in a new tab.</p>
+              <div class="console-actions"><button class="button button-primary" id="console-button" type="submit" disabled><span id="console-label">Open AWS Console</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M11 4h5v5M16 4l-8 8M8 4H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="button button-quiet" id="cancel-console" type="button" hidden>Cancel switch</button></div>
+              <p class="browser-status" id="browser-status" role="status" aria-live="polite">A separate browser opens AWS. Sign in and complete MFA there when asked; the app then clicks Switch Role.</p>
               <p class="console-reason" id="console-reason" hidden></p>
+              <a class="manual-console-link" id="console-link" target="_blank" rel="noopener noreferrer" hidden>Open switch page manually in this browser</a>
             </form>
-            <div class="detail-action"><button class="button button-quiet" id="switch-button" type="button"><span id="switch-label">Get CLI credentials</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="m4 5 5 5-5 5m8 0h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><a class="button button-quiet" id="console-link" target="_blank" rel="noopener noreferrer" hidden>Open AWS switch page</a></div>
-            <p class="action-help" id="switch-help">Use a fresh MFA code for either action. CLI credentials appear below after AWS authenticates the role.</p>
+            <div class="cli-action">
+              <label class="mfa-label" for="mfa-code">CLI MFA code</label>
+              <div class="mfa-action"><input id="mfa-code" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" spellcheck="false" placeholder="6-digit code" aria-describedby="mfa-help cli-reason" disabled /><button class="button button-quiet" id="switch-button" type="button"><span id="switch-label">Get CLI credentials</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="m4 5 5 5-5 5m8 0h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+              <p class="action-help" id="mfa-help">Wait for a newly displayed authenticator code, then submit it before the code changes.</p>
+              <p class="console-reason" id="cli-reason" hidden></p>
+              <p class="action-help" id="switch-help">Enter a fresh MFA code here for CLI credentials. Console sign-in happens inside the separate AWS browser.</p>
+            </div>
           </div>
         </div>
       </section>
@@ -81,10 +86,10 @@
 
       <section class="console-guide" aria-labelledby="guide-heading">
         <div class="section-heading"><h2 id="guide-heading">A simple route to the console</h2><span class="step-pill">IN YOUR BROWSER</span></div>
-        <ol class="console-steps"><li><span class="guide-number">01</span><div><h3>Choose your role</h3><p>Review its source profile, region, and MFA device.</p></div></li><li><span class="guide-number">02</span><div><h3>Enter fresh MFA</h3><p>Use your authenticator code for each new Console session.</p></div></li><li><span class="guide-number">03</span><div><h3>Continue in AWS</h3><p>Open AWS Console in a new tab, directly in the selected role.</p></div></li></ol>
-        <div class="console-note"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M10 9v4M10 6.5v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><p>Direct sign-in uses your local <code>source_profile</code> credentials and fresh MFA; the local server contacts AWS to create a temporary session. MFA codes are not saved. Review the account and role shown in AWS after sign-in. The optional switch page uses your existing browser identity and asks you to confirm there.</p></div>
+        <ol class="console-steps"><li><span class="guide-number">01</span><div><h3>Choose your role</h3><p>Review the account and role you want to open.</p></div></li><li><span class="guide-number">02</span><div><h3>Sign in inside AWS</h3><p>Use the separate browser and complete MFA there when AWS asks.</p></div></li><li><span class="guide-number">03</span><div><h3>Switch automatically</h3><p>The app clicks Switch Role. Check the account and role shown in AWS before working.</p></div></li></ol>
+        <div class="console-note"><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M10 9v4M10 6.5v.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><p>Console switching uses the AWS identity you sign in with inside the separate app-controlled browser. Your password and Console MFA stay on AWS pages. The app sends the selected account and role to the Switch Role page and clicks its button; it does not verify your final identity. The manual link uses your existing browser and needs your click on Switch Role.</p></div>
       </section>
-      <footer class="page-footer"><span>No browser extension needed.</span><span>Local credentials <span class="footer-dot">·</span> Fresh MFA <span class="footer-dot">·</span> Temporary sessions</span></footer>
+      <footer class="page-footer"><span>No browser extension needed.</span><span>Local app <span class="footer-dot">·</span> Separate AWS browser <span class="footer-dot">·</span> Temporary CLI credentials</span></footer>
     </main>
   </body>
 </html>

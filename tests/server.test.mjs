@@ -9,6 +9,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult, workerFailureMessage } from '../server.mjs';
 import { buildConsoleTarget } from '../console-target.mjs';
+import { ManagedConsoleError } from '../managed-console.mjs';
 
 const execFileAsync = promisify(execFile);
 test('worker failures identify the last known Console stage without exposing raw diagnostics', () => {
@@ -24,7 +25,14 @@ test('worker failures identify the last known Console stage without exposing raw
   for (const stderr of [trace, '{"error":"PRIVATE\\nTRACE"}', '{"error":"PRIVATE","url":"SECRET"}']) {
     assert.doesNotMatch(workerFailureMessage({}, stderr, 'console'), /PRIVATE|SECRET|123456/);
   }
-  assert.match(workerFailureMessage(killed, '', 'cli'), /^The AWS request timed out/);
+  assert.match(workerFailureMessage(killed, '', 'cli'), /Python CLI helper timed out before reporting progress/);
+  for (const kind of ['cli', 'console']) {
+    for (const [stage, expected] of [['configuration', /Reading the local AWS configuration/], ['python-sdk', /Loading the Python AWS SDK.*WSL/], ['source-credentials', /Loading the source credentials/], ['assume-role', /waiting for AWS STS/]]) {
+      const message = workerFailureMessage(killed, JSON.stringify({ stage }), kind);
+      assert.match(message, expected);
+      assert.doesNotMatch(message, /PRIVATE|123456/);
+    }
+  }
   assert.doesNotMatch(workerFailureMessage({ ...killed, code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }, '', 'console'), /timed out/);
 });
 
@@ -112,6 +120,51 @@ function assertConsoleUrl(target, accountId, roleName) {
   assert.equal(url.searchParams.get('account'), accountId);
   assert.equal(url.searchParams.get('roleName'), roleName);
 }
+
+test('managed Console endpoints use metadata only, require CSRF for actions, and never authenticate the CLI', async (t) => {
+  const calls = [];
+  let browserState = { state: 'idle', profile: null, message: 'Ready.' };
+  let closed = 0;
+  const browserConsole = {
+    status: () => ({ ...browserState, cookie: 'PRIVATE_BROWSER_COOKIE' }),
+    start: (profile) => {
+      if (browserState.state === 'starting') throw new ManagedConsoleError('A Console switch is already in progress.', 409);
+      calls.push(profile);
+      browserState = { state: 'starting', profile: profile.profile, message: 'Opening the app browser.' };
+      return { ...browserState, token: 'PRIVATE_BROWSER_TOKEN' };
+    },
+    cancel: () => (browserState = { state: 'cancelled', profile: browserState.profile, message: 'Cancelled.' }),
+    close: async () => { closed++; },
+  };
+  const config = '[profile browser-only]\nrole_arn = arn:aws:iam::123456789012:role/team/Developer\n\n[profile external]\nrole_arn = arn:aws:iam::123456789012:role/Developer\nexternal_id = test-external-id\n';
+  const app = await fixture(t, config, { browserConsole, cliSession: () => assert.fail('Browser switching must not request CLI credentials'), consoleSession: () => assert.fail('Browser switching must not use federation') });
+  const { token } = (await app.request('/api/profiles')).json();
+  assert.deepEqual((await app.request('/api/browser-console')).json(), { state: 'idle', profile: null, message: 'Ready.' });
+  assert.equal(calls.length, 0);
+  const post = (url, body, csrf = token, extra = {}) => app.request(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': csrf, ...extra }, body: JSON.stringify(body) });
+  assert.equal((await post('/api/browser-console', { profile: 'browser-only' }, 'bad')).status, 403);
+  assert.equal((await post('/api/browser-console', { profile: 'browser-only' }, token, { origin: 'https://foreign.invalid' })).status, 403);
+  assert.equal((await post('/api/browser-console', { profile: 'browser-only', mfaCode: '123456' })).status, 400);
+  assert.equal((await post('/api/browser-console', { profile: 'browser-only', url: 'https://attacker.invalid' })).status, 400);
+  assert.equal((await post('/api/browser-console', { profile: 'missing' })).status, 404);
+  assert.equal((await post('/api/browser-console', { profile: 'external' })).status, 422);
+  assert.equal(calls.length, 0);
+  const started = await post('/api/browser-console', { profile: 'browser-only' });
+  assert.equal(started.status, 202);
+  assert.deepEqual(started.json(), browserState);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].role_arn, 'arn:aws:iam::123456789012:role/team/Developer');
+  assert.equal((await post('/api/browser-console', { profile: 'browser-only' })).status, 409);
+  const status = await app.request('/api/browser-console');
+  assert.doesNotMatch(status.text, /PRIVATE/);
+  assert.equal(status.headers['cache-control'], 'no-store');
+  assert.equal((await post('/api/browser-console/cancel', {}, 'bad')).status, 403);
+  assert.equal((await post('/api/browser-console/cancel', { mfaCode: '123456' })).status, 400);
+  assert.equal((await post('/api/browser-console/cancel', {})).json().state, 'cancelled');
+  await assert.rejects(readFile(path.join(app.stateDirectory, 'active-profile.json')), { code: 'ENOENT' });
+  await app.restart();
+  assert.ok(closed > 0, 'Server shutdown closes its browser controller');
+});
 
 test('lists metadata and console links, persists selection, and leaves config untouched', async (t) => {
   const app = await fixture(t);

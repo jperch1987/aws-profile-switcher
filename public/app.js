@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, consoleTab: null, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
+const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, browserStatus: null, browserVersion: 0, browserTimer: null, browserMutation: false, token: "", shell: "posix", loading: false, switching: false, authenticating: false, loaded: false, copyTimer: null };
 
 function busy() { return state.loading || state.switching || state.authenticating; }
 function clearMfa() { $("mfa-code").value = ""; }
@@ -97,23 +97,6 @@ function approvedConsoleUrl(value) {
   } catch { return null; }
 }
 
-function approvedFederationUrl(value) {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.hostname !== "signin.aws.amazon.com" || url.pathname !== "/federation" || url.username || url.password || url.port || url.hash) return null;
-    const allowed = new Set(["Action", "Destination", "SigninToken"]);
-    for (const key of url.searchParams.keys()) {
-      if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) return null;
-    }
-    if (url.searchParams.get("Action") !== "login" || !url.searchParams.get("SigninToken")) return null;
-    const destination = new URL(url.searchParams.get("Destination"));
-    if (destination.protocol !== "https:" || destination.hostname !== "console.aws.amazon.com" || destination.pathname !== "/console/home" || destination.username || destination.password || destination.port || destination.hash) return null;
-    if (destination.searchParams.getAll("region").length !== 1 || !destination.searchParams.get("region") || [...destination.searchParams.keys()].some((key) => key !== "region")) return null;
-    return url.href;
-  } catch { return null; }
-}
-
 function clearConsoleAction() {
   $("console-link").hidden = true;
   $("console-link").removeAttribute("href");
@@ -121,6 +104,8 @@ function clearConsoleAction() {
   $("mfa-code").disabled = true;
   $("console-reason").hidden = true;
   $("console-reason").textContent = "";
+  $("cli-reason").hidden = true;
+  $("cli-reason").textContent = "";
 }
 
 function showEmptyList(title, description) {
@@ -201,18 +186,23 @@ function renderDetails() {
   const enabled = selected.auth?.enabled === true;
   $("switch-label").textContent = state.switching ? "Authenticating…" : "Get CLI credentials";
   $("switch-button").disabled = busy() || !enabled;
-  $("switch-help").textContent = "Use a fresh MFA code for either action. CLI credentials appear below after AWS authenticates the role.";
-  $("console-label").textContent = state.authenticating ? "Signing in…" : "Open AWS Console";
-  $("console-button").disabled = busy() || !enabled;
+  $("switch-help").textContent = "Enter a fresh MFA code here for CLI credentials. Console sign-in happens inside the separate AWS browser.";
+  $("console-label").textContent = state.authenticating ? "Switching in AWS…" : "Open AWS Console";
+  const url = approvedConsoleUrl(selected.console?.url);
+  $("console-button").disabled = busy() || !url;
   $("mfa-code").disabled = busy() || !enabled;
   $("detail-mfa").textContent = selected.auth?.mfaSerial || "Not set";
   $("detail-mfa").classList.toggle("not-set", !selected.auth?.mfaSerial);
   if (!enabled) {
-    $("console-reason").textContent = typeof selected.auth?.reason === "string" && selected.auth.reason ? selected.auth.reason : "Direct Console sign-in and MFA CLI commands require a supported role, source profile, MFA device, and region.";
+    $("cli-reason").textContent = typeof selected.auth?.reason === "string" && selected.auth.reason ? selected.auth.reason : "CLI credentials require a supported role, source profile, MFA device, and region.";
+    $("cli-reason").hidden = false;
+  }
+  if (!url) {
+    $("console-reason").textContent = typeof selected.console?.reason === "string" && selected.console.reason ? selected.console.reason : "This profile does not have a supported AWS Console role.";
     $("console-reason").hidden = false;
   }
+  renderBrowserStatus();
   if (busy()) return;
-  const url = approvedConsoleUrl(selected.console?.url);
   if (url) {
     $("console-link").href = url;
     $("console-link").hidden = false;
@@ -251,7 +241,7 @@ function renderCommand() {
 }
 
 function renderBusy() {
-  $("refresh-button").disabled = busy();
+  $("refresh-button").disabled = state.loading || state.switching || state.browserMutation;
   $("profile-search").disabled = busy();
   $("refresh-button").classList.toggle("is-loading", state.loading);
   $("refresh-button").querySelector("span").textContent = state.loading ? "Reading…" : "Refresh";
@@ -268,7 +258,9 @@ function setLoading(loading) {
 }
 
 async function loadProfiles(isRefresh = false) {
-  if (busy()) return;
+  if (state.loading || state.switching || state.browserMutation) return;
+  const browserVersion = stopBrowserPolling();
+  state.authenticating = false;
   const previousSelection = state.selected;
   clearMfa();
   clearNotice();
@@ -284,6 +276,7 @@ async function loadProfiles(isRefresh = false) {
   showEmptyList("Reading profiles…", "Refreshing the local configuration file.");
   try {
     const data = await request("/api/profiles");
+    if (browserVersion !== state.browserVersion) return;
     if (!Array.isArray(data.profiles) || !data.profiles.every((profile) => profile && typeof profile.profile === "string" && [profile.role_arn, profile.source_profile, profile.region].every((value) => value == null || typeof value === "string"))) throw new Error("The local server returned invalid profile data.");
     state.profiles = data.profiles;
     state.token = data.token;
@@ -296,8 +289,11 @@ async function loadProfiles(isRefresh = false) {
     renderProfiles();
     renderDetails();
     renderActive();
+    await pollBrowserStatus(browserVersion);
+    if (browserVersion !== state.browserVersion) return;
     if (isRefresh && $("notice").hidden) announce(`Configuration refreshed. ${state.profiles.length} ${state.profiles.length === 1 ? "profile is" : "profiles are"} available.`);
   } catch (error) {
+    if (browserVersion !== state.browserVersion) return;
     announce(error.message, true);
     state.profiles = [];
     state.selected = null;
@@ -311,7 +307,7 @@ async function loadProfiles(isRefresh = false) {
     $("browser-footer").textContent = "Waiting for a readable configuration file";
     renderActive();
   } finally {
-    setLoading(false);
+    if (browserVersion === state.browserVersion) setLoading(false);
   }
 }
 
@@ -356,89 +352,109 @@ async function switchProfile() {
   }
 }
 
-function showConsoleStatus(tab, message, failed = false) {
+const browserPendingStates = new Set(["starting", "waiting-for-login", "switching"]);
+const browserStates = new Set(["idle", ...browserPendingStates, "opened", "error", "cancelled"]);
+
+function stopBrowserPolling() {
+  clearTimeout(state.browserTimer);
+  state.browserTimer = null;
+  return ++state.browserVersion;
+}
+
+function renderBrowserStatus() {
+  const status = state.browserStatus;
+  const target = status?.profile ? `“${status.profile}”: ` : "";
+  $("browser-status").textContent = status && status.state !== "idle" ? `${target}${status.message}` : "A separate browser opens AWS. Sign in and complete MFA there when asked; the app then clicks Switch Role.";
+  $("browser-status").classList.toggle("is-error", status?.state === "error");
+  $("browser-status").setAttribute("role", status?.state === "error" ? "alert" : "status");
+  $("cancel-console").hidden = !state.authenticating;
+  $("cancel-console").disabled = !state.authenticating || state.browserMutation;
+}
+
+function applyBrowserStatus(result) {
+  if (!result || !browserStates.has(result.state) || !(result.profile === null || typeof result.profile === "string") || typeof result.message !== "string" || result.message.length > 2000 || (browserPendingStates.has(result.state) && !result.profile)) throw new Error("The local server returned invalid browser status. Refresh to check the AWS browser.");
+  state.browserStatus = { state: result.state, profile: result.profile, message: result.message };
+  state.authenticating = browserPendingStates.has(result.state);
+  renderBusy();
+  renderBrowserStatus();
+  if (result.state === "error") {
+    announce(result.message, true);
+    $("notice").scrollIntoView?.({ block: "nearest" });
+  }
+}
+
+function failBrowserStatus(message) {
+  state.browserStatus = { state: "error", profile: state.browserStatus?.profile || state.selected, message };
+  state.authenticating = false;
+  announce(message, true);
+  renderBusy();
+  renderBrowserStatus();
+}
+
+function scheduleBrowserPoll(version) {
+  clearTimeout(state.browserTimer);
+  state.browserTimer = null;
+  if (version === state.browserVersion && state.authenticating) state.browserTimer = setTimeout(() => pollBrowserStatus(version), 1500);
+}
+
+async function pollBrowserStatus(version) {
   try {
-    if (!tab || tab.closed) return;
-    const page = tab.document;
-    page.title = failed ? "AWS Console sign-in failed" : "Opening AWS Console";
-    page.body.className = "console-status-page";
-    if (!page.getElementById("console-status-style")) {
-      const style = page.createElement("link");
-      style.id = "console-status-style";
-      style.rel = "stylesheet";
-      style.href = new URL("/styles.css", window.location.href).href;
-      page.head.append(style);
-    }
-    const card = page.createElement("main");
-    card.className = "console-status-card";
-    const heading = page.createElement("h1");
-    heading.textContent = failed ? "AWS Console sign-in failed" : "Opening AWS Console…";
-    const detail = page.createElement("p");
-    detail.textContent = message;
-    const help = page.createElement("p");
-    help.textContent = failed ? "Return to the profile-switcher tab to retry with a fresh MFA code. You can close this tab." : "Keep this tab open while the local app authenticates your role and requests an AWS Console sign-in token.";
-    card.append(heading, detail, help);
-    page.body.replaceChildren(card);
-  } catch { /* The original app also shows the error if this tab is inaccessible. */ }
+    const result = await request("/api/browser-console");
+    if (version !== state.browserVersion) return;
+    applyBrowserStatus(result);
+    scheduleBrowserPoll(version);
+  } catch (error) {
+    if (version === state.browserVersion) failBrowserStatus(error.message);
+  }
 }
 
 async function openConsole(event) {
   event.preventDefault();
   if (busy()) return;
   const selected = state.profiles.find((profile) => profile.profile === state.selected);
-  let mfaCode = $("mfa-code").value;
   clearMfa();
   clearCredentials();
-  if (selected?.auth?.enabled !== true) return;
-  if (!/^[0-9]{6}$/.test(mfaCode)) {
-    mfaCode = "";
-    announce("Enter a fresh six-digit code from your authenticator to open AWS Console.", true);
-    $("mfa-code").focus();
-    return;
-  }
-  // Open during the user gesture; a later async open would be blocked by browsers.
-  let consoleTab;
-  try {
-    consoleTab = window.open("about:blank", "_blank");
-    if (!consoleTab) throw new Error("Popup blocked");
-    consoleTab.opener = null;
-    showConsoleStatus(consoleTab, "Contacting AWS. This can take a moment.");
-  } catch {
-    mfaCode = "";
-    consoleTab?.close();
-    announce("Allow pop-ups for this local app, then enter a fresh MFA code and try again.", true);
-    return;
-  }
+  if (!approvedConsoleUrl(selected?.console?.url)) return;
+  const version = stopBrowserPolling();
   state.authenticating = true;
-  state.consoleTab = consoleTab;
-  const authVersion = ++state.authVersion;
+  state.browserMutation = true;
+  state.browserStatus = { state: "starting", profile: selected.profile, message: "Opening the separate AWS browser…" };
   clearNotice();
   renderBusy();
   try {
-    const pending = request("/api/console", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode }) });
-    mfaCode = "";
-    const result = await pending;
-    if (authVersion !== state.authVersion) { consoleTab.close(); return; }
-    const url = approvedFederationUrl(result.url);
-    if (!url) throw new Error("AWS Console returned an invalid sign-in link. Enter a fresh MFA code and try again.");
-    if (consoleTab.closed) throw new Error("The new tab was closed. Enter a fresh MFA code and try again.");
-    // The short-lived sign-in URL is never saved in state, storage, or a page link.
-    try { consoleTab.location.replace(url); }
-    catch { throw new Error("The browser could not navigate the new tab to AWS Console. Check browser restrictions and try again with a fresh MFA code."); }
-    announce(`Opened AWS Console for “${selected.profile}” in a new tab. The temporary session expires; sign in again with MFA when needed.`);
+    const result = await request("/api/browser-console", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile }) });
+    if (version !== state.browserVersion) return;
+    applyBrowserStatus(result);
+    scheduleBrowserPoll(version);
   } catch (error) {
-    if (authVersion === state.authVersion) {
-      showConsoleStatus(consoleTab, error.message, true);
-      announce(error.message, true);
-      $("notice").scrollIntoView?.({ block: "nearest" });
-    }
+    if (version === state.browserVersion) failBrowserStatus(error.message);
   } finally {
-    mfaCode = "";
-    if (authVersion === state.authVersion) {
-      clearMfa();
-      state.consoleTab = null;
-      state.authenticating = false;
+    if (version === state.browserVersion) {
+      state.browserMutation = false;
       renderBusy();
+      renderBrowserStatus();
+    }
+  }
+}
+
+async function cancelConsole() {
+  if (!state.authenticating || state.browserMutation) return;
+  const version = stopBrowserPolling();
+  state.browserMutation = true;
+  renderBrowserStatus();
+  renderBusy();
+  try {
+    const result = await request("/api/browser-console/cancel", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: "{}" });
+    if (version !== state.browserVersion) return;
+    applyBrowserStatus(result);
+    scheduleBrowserPoll(version);
+  } catch (error) {
+    if (version === state.browserVersion) failBrowserStatus(error.message);
+  } finally {
+    if (version === state.browserVersion) {
+      state.browserMutation = false;
+      renderBusy();
+      renderBrowserStatus();
     }
   }
 }
@@ -493,8 +509,9 @@ async function copyCommand() {
 
 function clearPageSecrets() {
   state.authVersion++;
-  state.consoleTab?.close();
-  state.consoleTab = null;
+  stopBrowserPolling();
+  state.browserMutation = false;
+  state.loading = false;
   state.switching = false;
   state.authenticating = false;
   clearMfa();
@@ -506,6 +523,8 @@ $("refresh-button").addEventListener("click", () => loadProfiles(true));
 $("profile-search").addEventListener("input", renderProfiles);
 $("switch-button").addEventListener("click", switchProfile);
 $("console-form").addEventListener("submit", openConsole);
+$("cancel-console").addEventListener("click", cancelConsole);
+$("mfa-code").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); switchProfile(); } });
 $("console-link").addEventListener("click", () => { clearMfa(); clearCredentials(); });
 $("console-link").addEventListener("auxclick", () => { clearMfa(); clearCredentials(); });
 $("copy-button").addEventListener("click", copyCommand);
@@ -519,4 +538,4 @@ document.addEventListener("keydown", (event) => {
 });
 loadProfiles();
 window.addEventListener("pagehide", clearPageSecrets);
-window.addEventListener("pageshow", (event) => { if (event.persisted) clearPageSecrets(); });
+window.addEventListener("pageshow", (event) => { if (event.persisted) { clearPageSecrets(); loadProfiles(); } });

@@ -158,14 +158,20 @@ def _credentials(response: dict, now: datetime | None = None) -> dict:
     return {key: value[key] for key in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")}
 
 
-def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str) -> dict:
+def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict:
     """Make one fresh AssumeRole call; no MFA or credential cache is used."""
     if not isinstance(mfa_code, str) or not re.fullmatch(r"[0-9]{6}", mfa_code):
         raise SessionError("Enter the six-digit code from your MFA device.")
+    if progress:
+        progress("configuration")
     selected = _selected_profile(config_file, profile_name)
+    if progress:
+        progress("python-sdk")
     boto3, config_class = _sdk()
     try:
         with _isolated_aws_environment(selected["file"]):
+            if progress:
+                progress("source-credentials")
             session = boto3.Session(profile_name=selected["source_profile"], region_name=selected["region"])
             # Inspect the merged local profile before credential providers can run.
             # This also supports a source profile defined only in credentials.
@@ -177,6 +183,10 @@ def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str) ->
             frozen = source_credentials.get_frozen_credentials()
             if frozen.token:
                 raise SessionError("Use long-term IAM-user keys for source_profile; temporary source sessions are not supported by this MFA-code flow.")
+            # Creating the client loads SDK service models from disk. Report it
+            # separately from the AWS request, especially for mounted WSL files.
+            if progress:
+                progress("python-sdk")
             client = session.client(
                 "sts", region_name=selected["region"],
                 endpoint_url=f"https://sts.{selected['region']}.amazonaws.com",
@@ -200,6 +210,8 @@ def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str) ->
             if selected["external_id"]:
                 parameters["ExternalId"] = selected["external_id"]
             try:
+                if progress:
+                    progress("assume-role")
                 response = client.assume_role(**parameters)
             finally:
                 client.close()
@@ -281,9 +293,7 @@ def _signin_token(credentials: dict) -> str:
 
 
 def console_session(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict[str, str]:
-    if progress:
-        progress("assume-role")
-    result = assume_profile(config_file, profile_name, mfa_code)
+    result = assume_profile(config_file, profile_name, mfa_code, progress=progress)
     if progress:
         progress("federation")
     token = _signin_token(result["credentials"])
@@ -297,9 +307,9 @@ def console_session(config_file: str | Path, profile_name: str, mfa_code: str, *
     }
 
 
-def cli_session(config_file: str | Path, profile_name: str, mfa_code: str) -> dict:
+def cli_session(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict:
     """Return only newly assumed role credentials to the local CLI session UI."""
-    result = assume_profile(config_file, profile_name, mfa_code)
+    result = assume_profile(config_file, profile_name, mfa_code, progress=progress)
     credentials = result["credentials"]
     return {
         "credentials": {
@@ -359,8 +369,8 @@ def _worker_request() -> tuple[str, str]:
 
 def _worker_stage(stage: str) -> None:
     # Never include profile names, MFA, credentials, URLs, or AWS responses here.
-    if stage not in {"assume-role", "federation"}:
-        raise SessionError("Invalid console sign-in progress.")
+    if stage not in {"configuration", "python-sdk", "source-credentials", "assume-role", "federation"}:
+        raise SessionError("Invalid AWS sign-in progress.")
     print(json.dumps({"stage": stage}), file=sys.stderr, flush=True)
 
 
@@ -379,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.console_worker:
                 result = console_session(args.file, profile_name, mfa_code, progress=_worker_stage)
             else:
-                result = cli_session(args.file, profile_name, mfa_code)
+                result = cli_session(args.file, profile_name, mfa_code, progress=_worker_stage)
             output = json.dumps(result, ensure_ascii=True)
         else:
             if not args.profile:

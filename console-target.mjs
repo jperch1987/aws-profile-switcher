@@ -3,6 +3,7 @@
 // encoded query parameters, never a URL scheme, hostname, or redirect target.
 export function buildConsoleTarget(profile) {
   const unavailable = (reason) => ({ url: null, accountId: null, roleName: null, reason });
+  if (profile?.external_id) return unavailable('AWS Console Switch Role cannot supply external_id. Use CLI credentials for this profile.');
   const arn = profile?.role_arn;
   if (typeof arn !== 'string' || !arn) {
     return unavailable('This profile has no role_arn. Sign in through your AWS access portal, or choose a profile with an IAM role.');
