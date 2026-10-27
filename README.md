@@ -277,6 +277,25 @@ The local Python helper authenticates with the configured source IAM user's cred
 
 The sign-in URL is a temporary bearer credential: do not copy, log, share, or screenshot it. The app does not save MFA codes or temporary credentials to disk. Browser history, developer tools, extensions, local processes, and terminal recording tools remain part of your device's trust boundary. Review the account and role shown inside AWS after navigation. The app cannot inspect the final AWS page to confirm which identity is active, and browser session behavior remains controlled by AWS.
 
+### If direct Console sign-in times out
+
+The new tab shows progress while the app contacts AWS. If sign-in fails, it stays open with the same error shown in the original app. Return to the original app to retry with a fresh MFA code; you can close the failed tab.
+
+CLI authentication calls AWS STS. Direct Console sign-in also contacts `signin.aws.amazon.com` to exchange the role credentials for a sign-in token. A working CLI request does not establish connectivity to that second endpoint. Console requests have a 75-second overall limit to accommodate both sequential requests; CLI requests retain their 45-second limit. Individual network timeouts still apply.
+
+- **Creating the AWS role session timed out:** check the server computer's network access to AWS STS.
+- **The role was authenticated, but AWS Console sign-in timed out:** check network and DNS access to `signin.aws.amazon.com` from the environment running the server. For WSL, this means Debian's connection, which can differ from the Windows browser's connection.
+- **Certificate verification failed:** fix the Python environment's trusted CA certificates using your organization's approved certificate setup. Do not disable certificate verification.
+- **AWS Console sign-in failed (HTTP …):** report the status number and safe error text. Never share a sign-in URL, MFA code, or credentials.
+
+For a basic connection check in the same WSL terminal, run:
+
+```sh
+curl -I --max-time 15 https://signin.aws.amazon.com/federation
+```
+
+An HTTP response, including an error status, means this check reached an HTTP endpoint; it does not prove federation authentication will succeed. A connection, DNS, or certificate error identifies a network setup issue to investigate. The helper does not use proxy environment overrides, so a successful curl request through a configured proxy does not establish that the helper can connect directly.
+
 ### Manual Switch Role fallback
 
 The separate manual switch-page link still opens AWS's standard form in a new tab. Sign in to AWS first in that browser, then review and confirm the role on AWS. This fallback uses the original browser sign-in identity; it does not use local source keys or the app's MFA field, and you choose the Console region on AWS. The link is restricted to the fixed `https://signin.aws.amazon.com/switchrole` destination and commercial AWS role ARNs.

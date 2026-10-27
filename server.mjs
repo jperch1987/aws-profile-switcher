@@ -38,6 +38,26 @@ export function pythonExecutable() {
   return existsSync(local) ? local : (process.platform === 'win32' ? 'python' : 'python3');
 }
 
+export function workerFailureMessage(error, stderr, kind) {
+  let stage = null;
+  let message = 'Could not create the AWS session. Check your Python dependencies and AWS configuration.';
+  for (const line of stderr.split('\n')) {
+    try {
+      const diagnostic = JSON.parse(line);
+      if (!diagnostic || typeof diagnostic !== 'object' || Object.keys(diagnostic).length !== 1) continue;
+      if (['assume-role', 'federation'].includes(diagnostic.stage)) stage = diagnostic.stage;
+      else if (typeof diagnostic.error === 'string' && diagnostic.error.length < 500 && !/[\r\n]/.test(diagnostic.error)) message = diagnostic.error;
+    } catch { /* Never expose raw worker output, traces, or request details. */ }
+  }
+  if (error.killed && error.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+    if (kind === 'console' && stage === 'federation') return 'The role was authenticated, but AWS Console sign-in timed out while contacting signin.aws.amazon.com. Check network and DNS access to that host from the computer running the app, then retry with a fresh MFA code.';
+    if (kind === 'console' && stage === 'assume-role') return 'Creating the AWS role session timed out. Check network access to AWS STS, then retry with a fresh MFA code.';
+    if (kind === 'console') return 'AWS Console sign-in timed out before the helper reported progress. Check the app\'s Python environment, then retry with a fresh MFA code.';
+    return 'The AWS request timed out. Enter a fresh MFA code and try again.';
+  }
+  return message;
+}
+
 export function buildCredentialCommands(result) {
   const values = {
     AWS_ACCESS_KEY_ID: result.credentials.AccessKeyId,
@@ -130,18 +150,11 @@ export function createProfileServer(options = {}) {
     if (handler) return handler(profile, mfaCode);
     return new Promise((resolve, reject) => {
       const child = execFile(python, [path.join(APP_DIR, 'aws_session.py'), `--${kind}-worker`, '--file', configFile], {
-        timeout: 45_000, maxBuffer: 64 * 1024, windowsHide: true,
+        // Console sign-in performs STS and federation requests sequentially.
+        timeout: kind === 'console' ? 75_000 : 45_000, maxBuffer: 64 * 1024, windowsHide: true,
       }, (error, stdout, stderr) => {
         if (error) {
-          let message = 'Could not create the AWS session. Check your Python dependencies and AWS configuration.';
-          if (error.killed) message = 'The AWS request timed out. Enter a fresh MFA code and try again.';
-          else {
-            try {
-              const safe = JSON.parse(stderr).error;
-              if (typeof safe === 'string' && safe.length < 500 && !/[\r\n]/.test(safe)) message = safe;
-            } catch { /* Never expose worker traces or credential-bearing output. */ }
-          }
-          reject(new AppError(message, 502));
+          reject(new AppError(workerFailureMessage(error, stderr, kind), 502));
         } else {
           try { resolve(JSON.parse(stdout)); }
           catch { reject(new AppError('The AWS session helper returned an invalid response.', 502)); }

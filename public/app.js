@@ -356,6 +356,32 @@ async function switchProfile() {
   }
 }
 
+function showConsoleStatus(tab, message, failed = false) {
+  try {
+    if (!tab || tab.closed) return;
+    const page = tab.document;
+    page.title = failed ? "AWS Console sign-in failed" : "Opening AWS Console";
+    page.body.className = "console-status-page";
+    if (!page.getElementById("console-status-style")) {
+      const style = page.createElement("link");
+      style.id = "console-status-style";
+      style.rel = "stylesheet";
+      style.href = new URL("/styles.css", window.location.href).href;
+      page.head.append(style);
+    }
+    const card = page.createElement("main");
+    card.className = "console-status-card";
+    const heading = page.createElement("h1");
+    heading.textContent = failed ? "AWS Console sign-in failed" : "Opening AWS Console…";
+    const detail = page.createElement("p");
+    detail.textContent = message;
+    const help = page.createElement("p");
+    help.textContent = failed ? "Return to the profile-switcher tab to retry with a fresh MFA code. You can close this tab." : "Keep this tab open while the local app authenticates your role and requests an AWS Console sign-in token.";
+    card.append(heading, detail, help);
+    page.body.replaceChildren(card);
+  } catch { /* The original app also shows the error if this tab is inaccessible. */ }
+}
+
 async function openConsole(event) {
   event.preventDefault();
   if (busy()) return;
@@ -376,6 +402,7 @@ async function openConsole(event) {
     consoleTab = window.open("about:blank", "_blank");
     if (!consoleTab) throw new Error("Popup blocked");
     consoleTab.opener = null;
+    showConsoleStatus(consoleTab, "Contacting AWS. This can take a moment.");
   } catch {
     mfaCode = "";
     consoleTab?.close();
@@ -396,11 +423,15 @@ async function openConsole(event) {
     if (!url) throw new Error("AWS Console returned an invalid sign-in link. Enter a fresh MFA code and try again.");
     if (consoleTab.closed) throw new Error("The new tab was closed. Enter a fresh MFA code and try again.");
     // The short-lived sign-in URL is never saved in state, storage, or a page link.
-    consoleTab.location.replace(url);
+    try { consoleTab.location.replace(url); }
+    catch { throw new Error("The browser could not navigate the new tab to AWS Console. Check browser restrictions and try again with a fresh MFA code."); }
     announce(`Opened AWS Console for “${selected.profile}” in a new tab. The temporary session expires; sign in again with MFA when needed.`);
   } catch (error) {
-    consoleTab.close();
-    if (authVersion === state.authVersion) announce(error.message, true);
+    if (authVersion === state.authVersion) {
+      showConsoleStatus(consoleTab, error.message, true);
+      announce(error.message, true);
+      $("notice").scrollIntoView?.({ block: "nearest" });
+    }
   } finally {
     mfaCode = "";
     if (authVersion === state.authVersion) {

@@ -52,8 +52,22 @@ class Element {
   dispatch(name, fields = {}) { return this.events.get(name)?.({ preventDefault() {}, ...fields }); }
   querySelector() { return this.label ||= new Element('span'); }
   focus() { this.focused = true; }
+  scrollIntoView() { this.scrolledIntoView = true; }
   select() {}
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); }
+}
+
+function consoleTab() {
+  const head = new Element('head');
+  return {
+    opener: {}, closed: false, close() { this.closed = true; },
+    location: { replace(url) { this.destination = url; } },
+    document: {
+      title: '', head, body: new Element('body'),
+      createElement: (tag) => new Element(tag),
+      getElementById: (id) => head.children.find((element) => element.id === id),
+    },
+  };
 }
 
 async function app({ list = profiles, open, consoleResponse, cli, savedActive, writeClipboard } = {}) {
@@ -76,7 +90,7 @@ async function app({ list = profiles, open, consoleResponse, cli, savedActive, w
     setTimeout: (callback, delay) => { const id = nextTimer++; timers.set(id, { callback, due: clockTime + delay }); return id; },
     clearTimeout: (id) => timers.delete(id),
     navigator: { clipboard: { writeText: writeClipboard || (async (text) => { clipboard.push(text); }) } },
-    window: { open: open || (() => { throw new Error('Unexpected popup'); }), addEventListener: (name, callback) => windowEvents.set(name, callback) },
+    window: { location: { href: 'http://127.0.0.1:3000/' }, open: open || (() => { throw new Error('Unexpected popup'); }), addEventListener: (name, callback) => windowEvents.set(name, callback) },
     document: {
       getElementById: (id) => { assert.ok(elements.has(id), `UI references missing element: ${id}`); return elements.get(id); },
       createElement: (tag) => new Element(tag), createDocumentFragment: () => new Element('fragment'),
@@ -140,11 +154,14 @@ test('console request preserves leading zero, locks selection and rejects duplic
   let resolveResponse;
   let opened = 0;
   let destination;
-  const tab = { opener: {}, closed: false, close() { this.closed = true; }, location: { replace(url) { destination = url; } } };
+  const tab = consoleTab();
+  tab.location.replace = (url) => { destination = url; };
   const ui = await app({ open: () => { opened++; return tab; }, consoleResponse: () => new Promise((resolve) => { resolveResponse = resolve; }) });
   ui.get('mfa-code').value = '000123';
   const submission = ui.submit();
   assert.equal(opened, 1);
+  assert.equal(tab.document.title, 'Opening AWS Console');
+  assert.match(tab.document.body.children[0].children[1].textContent, /Contacting AWS/);
   assert.equal(tab.opener, null);
   assert.equal(ui.get('mfa-code').value, '');
   assert.equal(ui.get('mfa-code').disabled, true);
@@ -172,28 +189,68 @@ test('console request preserves leading zero, locks selection and rejects duplic
   assert.equal(opened, 1);
   assert.equal(ui.requests.length, 2);
   assert.match(ui.get('notice').textContent, /fresh six-digit/);
+  ui.windowEvents.get('pagehide')();
+  assert.equal(tab.closed, false, 'Leaving the switcher must not close a successfully opened AWS tab');
 });
 
-test('failed Console sign-in closes the tab, clears MFA, and permits a fresh retry', async () => {
-  const tab = { opener: {}, closed: false, close() { this.closed = true; } };
+test('failed Console sign-in keeps an error visible in the new tab and app, clears MFA, and permits a fresh retry', async () => {
+  const tab = consoleTab();
   const ui = await app({ open: () => tab, consoleResponse: async () => ({ ok: false, json: async () => ({ error: 'AWS rejected this code. Enter a fresh MFA code.' }) }) });
   ui.get('mfa-code').value = '123456';
   await ui.submit();
-  assert.equal(tab.closed, true);
+  assert.equal(tab.closed, false);
+  assert.equal(tab.document.title, 'AWS Console sign-in failed');
+  assert.match(tab.document.body.children[0].children[1].textContent, /AWS rejected/);
+  assert.equal(tab.document.head.children.length, 1);
+  assert.equal(ui.get('notice').scrolledIntoView, true);
   assert.equal(ui.get('mfa-code').value, '');
   assert.equal(ui.get('console-button').disabled, false);
   assert.equal(ui.get('refresh-button').disabled, false);
   assert.match(ui.get('notice').textContent, /AWS rejected/);
 });
 
-test('a malformed federation response closes the new tab without navigating', async () => {
-  const tab = { opener: {}, closed: false, close() { this.closed = true; }, location: { replace() { assert.fail('Must not navigate'); } } };
+test('a malformed federation response stays visible without navigating or revealing the URL', async () => {
+  const tab = consoleTab();
+  tab.location.replace = () => { assert.fail('Must not navigate'); };
   const ui = await app({ open: () => tab, consoleResponse: async () => ({ ok: true, json: async () => ({ url: 'https://example.invalid/?SigninToken=EXAMPLE_TEST_TOKEN' }) }) });
   ui.get('mfa-code').value = '123456';
   await ui.submit();
-  assert.equal(tab.closed, true);
+  assert.equal(tab.closed, false);
+  assert.match(tab.document.body.children[0].children[1].textContent, /invalid sign-in link/);
+  assert.doesNotMatch(tab.document.body.children[0].children[1].textContent, /EXAMPLE_TEST_TOKEN/);
   assert.match(ui.get('notice').textContent, /invalid sign-in link/);
   assert.doesNotMatch(ui.get('notice').textContent, /EXAMPLE_TEST_TOKEN/);
+});
+
+test('Console timeout stays visible and browser navigation failures never echo a sign-in URL', async () => {
+  for (const navigationFails of [false, true]) {
+    const tab = consoleTab();
+    if (navigationFails) tab.location.replace = () => { throw new Error(`Blocked ${federationUrl()}`); };
+    const ui = await app({ open: () => tab, consoleResponse: async () => navigationFails
+      ? { ok: true, json: async () => ({ url: federationUrl() }) }
+      : { ok: false, json: async () => ({ error: 'AWS Console sign-in timed out while contacting signin.aws.amazon.com.' }) },
+    });
+    ui.get('mfa-code').value = '123456';
+    await ui.submit();
+    assert.equal(tab.closed, false);
+    assert.match(tab.document.body.children[0].children[1].textContent, navigationFails ? /browser could not navigate/ : /timed out/);
+    assert.doesNotMatch(ui.get('notice').textContent, /EXAMPLE_TEST_TOKEN|https:\/\//);
+    assert.doesNotMatch(tab.document.body.children[0].children[1].textContent, /EXAMPLE_TEST_TOKEN|https:\/\//);
+    assert.equal(ui.get('console-button').disabled, false);
+  }
+});
+
+test('leaving during Console authentication closes only the pending tab and ignores a late response', async () => {
+  const tab = consoleTab();
+  let resolveResponse;
+  const ui = await app({ open: () => tab, consoleResponse: () => new Promise((resolve) => { resolveResponse = resolve; }) });
+  ui.get('mfa-code').value = '123456';
+  const pending = ui.submit();
+  ui.windowEvents.get('pagehide')();
+  assert.equal(tab.closed, true);
+  resolveResponse({ ok: true, json: async () => ({ url: federationUrl() }) });
+  await pending;
+  assert.equal(tab.location.destination, undefined);
 });
 
 test('profile changes and leaving the page clear MFA; unsupported profiles retain only manual fallback', async () => {

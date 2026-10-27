@@ -1,6 +1,6 @@
 {
   "name": "local-aws-profile-switcher",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "jperch1987",
   "private": true,
   "type": "module",

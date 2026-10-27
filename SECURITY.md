@@ -20,6 +20,8 @@ For direct Console access, the helper sends temporary credentials to AWS's HTTPS
 
 Authentication requires outbound HTTPS to AWS STS and, for direct Console access, the AWS federation endpoint. The browser then contacts AWS. Local UI assets use no external fonts, scripts, or telemetry services. Installing or updating Python dependencies separately contacts your configured package source.
 
+The Console worker reports only fixed stage names (`assume-role` and `federation`) and safe error messages to the local server. These diagnostics identify a stalled request without printing raw AWS responses, request bodies, sign-in URLs, credentials, or MFA codes. Failed Console tabs remain open with the error; no credentials are included in that status page. Certificate verification and redirect restrictions remain enforced.
+
 ## Network boundary
 
 The server listens on `127.0.0.1` over HTTP. Host/origin checks, browser request checks, a restrictive Content Security Policy, anti-framing headers, no-store responses, and fixed AWS destinations reduce browser-origin attacks. A per-process CSRF token protects state-changing and authentication endpoints against unrelated web pages. These controls are not user authentication: a local process or another local user able to connect to the port can read metadata, obtain the token, and submit requests. A valid MFA code is still needed for this app's authentication flow, but this is not sufficient isolation for a shared machine.

@@ -10,10 +10,12 @@ import logging
 import os
 from pathlib import Path
 import shlex
+import ssl
 import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 import warnings
 
@@ -280,6 +282,30 @@ class FederationTests(unittest.TestCase):
         self.assertEqual(query["Destination"], ["https://console.aws.amazon.com/console/home?region=us-east-1"])
         self.assertEqual(query["SigninToken"], ["TEST_SIGNIN+/="])
 
+    def test_console_progress_identifies_each_network_stage_in_order(self):
+        events = []
+
+        def assume(*args):
+            events.append("assume-called")
+            return self.result
+
+        def sign_in(*args):
+            events.append("federation-called")
+            return "TEST_SIGNIN_TOKEN"
+
+        output = io.StringIO()
+        with patch.object(aws_session, "assume_profile", side_effect=assume), patch.object(aws_session, "_signin_token", side_effect=sign_in), redirect_stderr(output):
+            aws_session.console_session(CONFIG, "dev", "012345", progress=events.append)
+        self.assertEqual(events, ["assume-role", "assume-called", "federation", "federation-called"])
+        self.assertEqual(output.getvalue(), "", "A callback does not enable worker logging")
+
+    def test_console_progress_does_not_enter_federation_after_role_failure(self):
+        stages = []
+        with patch.object(aws_session, "assume_profile", side_effect=aws_session.SessionError("Role switch failed")), patch.object(aws_session, "_signin_token") as sign_in, self.assertRaises(aws_session.SessionError):
+            aws_session.console_session(CONFIG, "dev", "012345", progress=stages.append)
+        self.assertEqual(stages, ["assume-role"])
+        sign_in.assert_not_called()
+
     def test_federation_refuses_redirects_even_to_another_https_host(self):
         with self.assertRaisesRegex(aws_session.SessionError, "redirect"):
             aws_session._NoRedirects().redirect_request(None, None, 302, "Found", {}, "https://attacker.example/")
@@ -287,6 +313,7 @@ class FederationTests(unittest.TestCase):
     def test_federation_rejects_bad_response_without_leaking_credentials(self):
         for response in (
             self.response(body=b"PRIVATE_SESSION_TOKEN"), self.response(body=b'{}'),
+            self.response(body=b'["PRIVATE_SESSION_TOKEN"]'), self.response(body=b'\xffPRIVATE_SESSION_TOKEN'),
             self.response(body=b'{"SigninToken":"bad\\nvalue"}'),
             self.response(body=b"x" * (aws_session.MAX_FEDERATION_BYTES + 1)),
             self.response(status=302), self.response(url="https://attacker.example"),
@@ -304,8 +331,127 @@ class FederationTests(unittest.TestCase):
             aws_session._signin_token(self.result["credentials"])
         self.assertNotIn("PRIVATE", str(caught.exception))
 
+    def test_federation_http_errors_report_only_the_status(self):
+        for status in (400, 403, 429, 500, "PRIVATE_STATUS", 999, True):
+            with self.subTest(status_type=type(status).__name__):
+                opener = Mock()
+                body = io.BytesIO(b"PRIVATE_RESPONSE_BODY_TEST_SECRET")
+                opener.open.side_effect = HTTPError(
+                    "https://example.invalid/PRIVATE_REQUEST_TOKEN", status,
+                    "PRIVATE_HTTP_REASON", {"PRIVATE_HEADER": "PRIVATE_HEADER_VALUE"}, body,
+                )
+                with patch.object(aws_session, "build_opener", return_value=opener), self.assertRaises(aws_session.SessionError) as caught:
+                    aws_session._signin_token(self.result["credentials"])
+                message = str(caught.exception)
+                self.assertIn("AWS Console sign-in failed", message)
+                if type(status) is int and 100 <= status <= 599:
+                    self.assertIn(f"HTTP {status}", message)
+                else:
+                    self.assertNotIn("HTTP", message)
+                self.assertNotIn("PRIVATE", message)
+                self.assertNotIn("TEST_SECRET", message)
+                self.assertEqual(body.tell(), 0, "Error response bodies must not be read")
+
+    def test_federation_connection_errors_are_actionable_without_raw_details(self):
+        failures = (
+            (ssl.SSLCertVerificationError(1, "PRIVATE_CERTIFICATE_DETAILS"), "CA certificates"),
+            (URLError(ssl.SSLCertVerificationError(1, "PRIVATE_WRAPPED_CERTIFICATE")), "ca-certificates in Debian/WSL"),
+            (TimeoutError("PRIVATE_TIMEOUT_DETAILS"), "timed out"),
+            (URLError(TimeoutError("PRIVATE_WRAPPED_TIMEOUT")), "timed out"),
+            (URLError(URLError(TimeoutError("PRIVATE_NESTED_TIMEOUT"))), "timed out"),
+            (ssl.SSLError(1, "PRIVATE_TLS_DETAILS"), "TLS settings"),
+            (URLError(ssl.SSLError(1, "PRIVATE_WRAPPED_TLS")), "TLS settings"),
+            (ConnectionRefusedError("PRIVATE_CONNECTION_DETAILS"), "Could not connect"),
+            (URLError("PRIVATE_CONNECTION_URL_OR_TOKEN"), "Could not connect"),
+        )
+        for failure, expected in failures:
+            with self.subTest(error=type(failure).__name__, expected=expected):
+                opener = Mock()
+                opener.open.side_effect = failure
+                with patch.object(aws_session, "build_opener", return_value=opener), self.assertRaises(aws_session.SessionError) as caught:
+                    aws_session._signin_token(self.result["credentials"])
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+
+    def test_federation_response_errors_identify_the_failed_stage_safely(self):
+        cases = (
+            (self.response(status=503, body=b"PRIVATE_RESPONSE_BODY"), "HTTP 503"),
+            (self.response(body=b"PRIVATE_MALFORMED_JSON"), "invalid response"),
+            (self.response(body=b'{"unexpected":"PRIVATE_RESPONSE_VALUE"}'), "invalid sign-in token"),
+            (self.response(body=b'{"SigninToken":"PRIVATE_TOKEN\\n"}'), "invalid sign-in token"),
+            (self.response(body=b"PRIVATE" * aws_session.MAX_FEDERATION_BYTES), "oversized response"),
+        )
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                opener = Mock()
+                opener.open.return_value = response
+                with patch.object(aws_session, "build_opener", return_value=opener), self.assertRaises(aws_session.SessionError) as caught:
+                    aws_session._signin_token(self.result["credentials"])
+                self.assertIn(expected, str(caught.exception))
+                self.assertNotIn("PRIVATE", str(caught.exception))
+
 
 class EntrypointTests(unittest.TestCase):
+    def test_console_worker_emits_only_flushed_safe_progress_and_result(self):
+        result = {"credentials": credentials(), "region": "us-east-1", "roleArn": ROLE}
+        output, errors = io.StringIO(), io.StringIO()
+        payload = b'{"profile":"dev","mfaCode":"012345"}'
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result), patch.object(aws_session, "_signin_token", return_value="TEST_SIGNIN_TOKEN"), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 0)
+        self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [
+            {"stage": "assume-role"}, {"stage": "federation"},
+        ])
+        self.assertEqual(set(json.loads(output.getvalue())), {"url", "expiration", "roleArn"})
+        with patch("builtins.print") as emit:
+            aws_session._worker_stage("federation")
+        emit.assert_called_once_with('{"stage": "federation"}', file=sys.stderr, flush=True)
+
+    def test_console_worker_reports_stage_before_assume_failure_without_sensitive_details(self):
+        output, errors = io.StringIO(), io.StringIO()
+        payload = b'{"profile":"dev","mfaCode":"012345"}'
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=RuntimeError("PRIVATE_SOURCE_KEY_MFA_012345")), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 1)
+        self.assertEqual(output.getvalue(), "")
+        lines = [json.loads(line) for line in errors.getvalue().splitlines()]
+        self.assertEqual(lines[0], {"stage": "assume-role"})
+        self.assertEqual(set(lines[1]), {"error"})
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("PRIVATE", errors.getvalue())
+        self.assertNotIn("012345", errors.getvalue())
+
+    def test_worker_stage_rejects_unknown_values_without_printing_them(self):
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(aws_session.SessionError) as caught:
+            aws_session._worker_stage("PRIVATE_UNEXPECTED_STAGE")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertNotIn("PRIVATE", str(caught.exception))
+
+    def test_console_worker_reports_safe_federation_diagnostics_without_secrets(self):
+        failures = (
+            (HTTPError("https://example.invalid/PRIVATE_REQUEST_TOKEN", 403, "PRIVATE_HTTP_REASON", {}, io.BytesIO(b"PRIVATE_RESPONSE_BODY")), "HTTP 403"),
+            (URLError(ssl.SSLCertVerificationError(1, "PRIVATE_CERTIFICATE_DETAILS")), "CA certificates"),
+            (URLError(TimeoutError("PRIVATE_TIMEOUT_DETAILS")), "timed out"),
+            (URLError("PRIVATE_CONNECTION_URL_OR_TOKEN"), "Could not connect"),
+        )
+        for failure, expected in failures:
+            with self.subTest(expected=expected):
+                result = {"credentials": credentials(), "region": "us-east-1", "roleArn": ROLE}
+                opener = Mock()
+                opener.open.side_effect = failure
+                output, errors = io.StringIO(), io.StringIO()
+                payload = b'{"profile":"dev","mfaCode":"012345"}'
+                with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", return_value=result), patch.object(aws_session, "build_opener", return_value=opener), redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(aws_session.main(["--file", CONFIG, "--console-worker"]), 1)
+                self.assertEqual(output.getvalue(), "")
+                lines = [json.loads(line) for line in errors.getvalue().splitlines()]
+                self.assertEqual(lines[:-1], [{"stage": "assume-role"}, {"stage": "federation"}])
+                diagnostic = lines[-1]
+                self.assertEqual(set(diagnostic), {"error"})
+                self.assertIn(expected, diagnostic["error"])
+                for secret in ("PRIVATE", "012345", "TEST_TEMPORARY_KEY", "TEST_SECRET", "TEST_TOKEN", "Traceback", "https://"):
+                    self.assertNotIn(secret, errors.getvalue())
+
     def test_cli_worker_emits_only_allowlisted_temporary_credentials_and_metadata(self):
         temporary = credentials()
         temporary["unexpected"] = "PRIVATE_EXTRA_FIELD"

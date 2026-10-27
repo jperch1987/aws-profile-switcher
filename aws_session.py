@@ -15,7 +15,9 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import ssl
 import sys
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import warnings
@@ -216,6 +218,28 @@ class _NoRedirects(HTTPRedirectHandler):
         raise SessionError("AWS sign-in returned an unexpected redirect. No console session was opened.")
 
 
+def _signin_http_failure(status) -> SessionError:
+    # Only a bounded status number is safe to display; responses can echo secrets.
+    detail = f" (HTTP {status})" if type(status) is int and 100 <= status <= 599 else ""
+    return SessionError(f"AWS Console sign-in failed{detail}. Try again with a fresh MFA code; check federation access if it continues.")
+
+
+def _signin_connection_failure(error: Exception) -> SessionError:
+    reason = error
+    # urllib wraps TLS, timeout, and connection failures in URLError.reason.
+    for _ in range(3):
+        if not isinstance(reason, URLError):
+            break
+        reason = reason.reason
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return SessionError("Python could not verify the AWS sign-in certificate. Install or update your operating system's CA certificates (ca-certificates in Debian/WSL), then restart the app.")
+    if isinstance(reason, TimeoutError):
+        return SessionError("The AWS Console sign-in request timed out. Check network access and try again with a fresh MFA code.")
+    if isinstance(reason, ssl.SSLError):
+        return SessionError("The secure connection to AWS Console sign-in failed. Check this machine's TLS settings and CA certificates, then try again with a fresh MFA code.")
+    return SessionError("Could not connect to AWS Console sign-in. Check this machine's network access to AWS sign-in, then try again with a fresh MFA code.")
+
+
 def _signin_token(credentials: dict) -> str:
     payload = urlencode({
         "Action": "getSigninToken",
@@ -231,23 +255,37 @@ def _signin_token(credentials: dict) -> str:
     )
     try:
         with build_opener(ProxyHandler({}), _NoRedirects()).open(request, timeout=20) as response:
-            if response.status != 200 or response.geturl() != FEDERATION_URL:
+            if response.status != 200:
+                raise _signin_http_failure(response.status)
+            if response.geturl() != FEDERATION_URL:
                 raise SessionError("AWS sign-in returned an unexpected response. Try again with a fresh MFA code.")
             raw = response.read(MAX_FEDERATION_BYTES + 1)
-        if len(raw) > MAX_FEDERATION_BYTES:
-            raise ValueError("response too large")
-        token = json.loads(raw).get("SigninToken")
-        if not isinstance(token, str) or not 1 <= len(token) <= 16384 or any(ord(char) < 33 or ord(char) > 126 for char in token):
-            raise ValueError("invalid token")
-        return token
     except SessionError:
         raise
+    except HTTPError as error:
+        raise _signin_http_failure(error.code) from None
+    except (URLError, OSError) as error:
+        raise _signin_connection_failure(error) from None
     except Exception:
         raise SessionError("Unable to obtain the AWS Console sign-in token. Check network access and try again with a fresh MFA code.") from None
+    if len(raw) > MAX_FEDERATION_BYTES:
+        raise SessionError("AWS Console sign-in returned an oversized response. Try again with a fresh MFA code.")
+    try:
+        document = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise SessionError("AWS Console sign-in returned an invalid response. Try again with a fresh MFA code.") from None
+    token = document.get("SigninToken") if isinstance(document, dict) else None
+    if not isinstance(token, str) or not 1 <= len(token) <= 16384 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+        raise SessionError("AWS Console sign-in returned an invalid sign-in token. Try again with a fresh MFA code.")
+    return token
 
 
-def console_session(config_file: str | Path, profile_name: str, mfa_code: str) -> dict[str, str]:
+def console_session(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict[str, str]:
+    if progress:
+        progress("assume-role")
     result = assume_profile(config_file, profile_name, mfa_code)
+    if progress:
+        progress("federation")
     token = _signin_token(result["credentials"])
     return {
         "url": FEDERATION_URL + "?" + urlencode({
@@ -319,6 +357,13 @@ def _worker_request() -> tuple[str, str]:
     return profile_name, mfa_code
 
 
+def _worker_stage(stage: str) -> None:
+    # Never include profile names, MFA, credentials, URLs, or AWS responses here.
+    if stage not in {"assume-role", "federation"}:
+        raise SessionError("Invalid console sign-in progress.")
+    print(json.dumps({"stage": stage}), file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", required=True, help="Local AWS config file")
@@ -331,8 +376,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.console_worker or args.cli_worker:
             profile_name, mfa_code = _worker_request()
-            create_session = console_session if args.console_worker else cli_session
-            output = json.dumps(create_session(args.file, profile_name, mfa_code), ensure_ascii=True)
+            if args.console_worker:
+                result = console_session(args.file, profile_name, mfa_code, progress=_worker_stage)
+            else:
+                result = cli_session(args.file, profile_name, mfa_code)
+            output = json.dumps(result, ensure_ascii=True)
         else:
             if not args.profile:
                 raise SessionError("Choose a profile with --profile.")

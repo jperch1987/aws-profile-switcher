@@ -7,10 +7,27 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult } from '../server.mjs';
+import { buildCredentialCommands, validateCliResult, createProfileServer, authenticationTarget, validateFederationResult, workerFailureMessage } from '../server.mjs';
 import { buildConsoleTarget } from '../console-target.mjs';
 
 const execFileAsync = promisify(execFile);
+test('worker failures identify the last known Console stage without exposing raw diagnostics', () => {
+  const trace = 'PRIVATE_KEY_TOKEN_123456\nnot json\n';
+  const killed = { killed: true };
+  assert.match(workerFailureMessage(killed, trace + '{"stage":"assume-role"}\n', 'console'), /role session timed out/);
+  const federation = workerFailureMessage(killed, trace + '{"stage":"assume-role"}\n{"stage":"federation"}\n', 'console');
+  assert.match(federation, /role was authenticated.*signin\.aws\.amazon\.com/);
+  assert.doesNotMatch(federation, /PRIVATE|123456/);
+  assert.match(workerFailureMessage(killed, '{"stage":"federation","secret":"PRIVATE"}\n', 'console'), /before the helper reported progress/);
+  assert.match(workerFailureMessage(killed, '{"stage":"PRIVATE_STAGE"}\n', 'console'), /before the helper reported progress/);
+  assert.equal(workerFailureMessage({}, '{"stage":"assume-role"}\n{"stage":"federation"}\n{"error":"Safe network diagnostic."}\n', 'console'), 'Safe network diagnostic.');
+  for (const stderr of [trace, '{"error":"PRIVATE\\nTRACE"}', '{"error":"PRIVATE","url":"SECRET"}']) {
+    assert.doesNotMatch(workerFailureMessage({}, stderr, 'console'), /PRIVATE|SECRET|123456/);
+  }
+  assert.match(workerFailureMessage(killed, '', 'cli'), /^The AWS request timed out/);
+  assert.doesNotMatch(workerFailureMessage({ ...killed, code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }, '', 'console'), /timed out/);
+});
+
 const exampleConfig = `[default]
 region = us-east-1
 mfa_serial = arn:aws:iam::123456789012:mfa/test-user
