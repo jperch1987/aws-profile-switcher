@@ -36,7 +36,10 @@ READ_ACTIONS = {
     "eks": ["eks:DescribeCluster"],
     "elasticache": ["elasticache:DescribeCacheClusters", "elasticache:DescribeReplicationGroups", "elasticache:DescribeServerlessCaches"],
     "route53": ["route53:GetHostedZone", "route53:ListHostedZonesByName"],
+    "load-balancer": ["elasticloadbalancing:DescribeLoadBalancers"],
 }
+LOAD_BALANCER_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?"
+LOAD_BALANCER_TYPES = {"app": "application", "net": "network", "gwy": "gateway"}
 ELASTICACHE_TYPES = {
     "cluster": ("describe_cache_clusters", "CacheClusterId", "CacheClusters", "MaxRecords", "Marker"),
     "replicationgroup": ("describe_replication_groups", "ReplicationGroupId", "ReplicationGroups", "MaxRecords", "Marker"),
@@ -138,6 +141,15 @@ def parse_query(resource_type, query):
                 if service != "elasticache" or not match:
                     raise LookupError("Use an ElastiCache cache cluster, replication group, or serverless cache ARN.")
                 result.update(kind=match.group(1), value=match.group(2))
+            elif resource_type == "load-balancer":
+                modern = re.fullmatch(rf"loadbalancer/(app|net|gwy)/({LOAD_BALANCER_NAME})/([0-9a-f]{{16}})", resource)
+                classic = re.fullmatch(rf"loadbalancer/({LOAD_BALANCER_NAME})", resource)
+                if service != "elasticloadbalancing" or not (modern or classic):
+                    raise LookupError("Use an Application, Network, Gateway, or Classic Load Balancer ARN, without a listener or target group path.")
+                if modern:
+                    result.update(kind="elbv2", value=modern.group(2), loadBalancerType=modern.group(1))
+                else:
+                    result.update(kind="elb", value=classic.group(1))
             else:
                 prefix = {"rds": "db:", "lambda": "function:", "eks": "cluster/"}[resource_type]
                 if service != resource_type or not resource.startswith(prefix):
@@ -154,6 +166,11 @@ def parse_query(resource_type, query):
         raise LookupError("Enter an RDS DB instance identifier or DB instance ARN.")
     if resource_type == "eks" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", value):
         raise LookupError("Enter an EKS cluster name or cluster ARN.")
+    if resource_type == "load-balancer":
+        if not re.fullmatch(LOAD_BALANCER_NAME, value):
+            raise LookupError("Enter an exact load balancer name of at most 32 letters, numbers, or hyphens, or its ARN.")
+        if result.get("kind") == "elbv2" and value.startswith("internal-"):
+            raise LookupError("Application, Network, and Gateway Load Balancer names cannot begin with internal-.")
     if resource_type == "elasticache":
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,49}", value) or value.endswith("-") or "--" in value:
             raise LookupError("Enter an ElastiCache cache cluster, replication group, or serverless cache name or ARN.")
@@ -209,7 +226,7 @@ def _scan_failure(error, *, authenticating=False):
         return ScanError("access_denied")
     if code in {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException", "SignatureDoesNotMatch"}:
         return ScanError("auth_failed")
-    if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault", "ResourceNotFoundException", "NoSuchBucket", "InvalidInstanceID.NotFound", "InvalidVolume.NotFound", "InvalidGroup.NotFound", "InvalidVpcID.NotFound", "CacheClusterNotFound", "CacheClusterNotFoundFault", "ReplicationGroupNotFound", "ReplicationGroupNotFoundFault", "ServerlessCacheNotFoundFault", "NoSuchHostedZone"}:
+    if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault", "ResourceNotFoundException", "NoSuchBucket", "InvalidInstanceID.NotFound", "InvalidVolume.NotFound", "InvalidGroup.NotFound", "InvalidVpcID.NotFound", "CacheClusterNotFound", "CacheClusterNotFoundFault", "ReplicationGroupNotFound", "ReplicationGroupNotFoundFault", "ServerlessCacheNotFoundFault", "NoSuchHostedZone", "LoadBalancerNotFound", "LoadBalancerNotFoundException"}:
         return ScanError("not_found")
     return ScanError("error")
 
@@ -234,6 +251,8 @@ def _client(session, config_class, service, region, credentials):
     endpoint = f"https://{service}.{region}.amazonaws.com"
     if service == "route53":
         region, endpoint = "us-east-1", "https://route53.amazonaws.com"
+    elif service in {"elb", "elbv2"}:
+        endpoint = f"https://elasticloadbalancing.{region}.amazonaws.com"
     return session.client(service, region_name=region, endpoint_url=endpoint, verify=True,
                           aws_access_key_id=credentials["AccessKeyId"], aws_secret_access_key=credentials["SecretAccessKey"],
                           aws_session_token=credentials.get("SessionToken"), config=config_class(**options))
@@ -274,10 +293,17 @@ def _list(response, key):
     return value
 
 
-def _pages(client, operation, parameters, deadline, token_key="NextToken"):
+def _pages(client, operation, parameters, deadline, token_key="NextToken", request_token_key=None):
     seen = set()
-    for _ in range(MAX_PAGES):
-        response = _call(client, operation, parameters, deadline)
+    for page_number in range(MAX_PAGES):
+        try:
+            response = _call(client, operation, parameters, deadline)
+        except Exception as error:
+            # A later-page disappearance cannot establish that the complete
+            # targeted result set was checked, even if an earlier page was empty.
+            if page_number and _scan_failure(error).status == "not_found":
+                raise ScanError("error") from None
+            raise
         if not isinstance(response, dict):
             raise ScanError("error", MESSAGES["invalid_response"])
         yield response
@@ -287,7 +313,7 @@ def _pages(client, operation, parameters, deadline, token_key="NextToken"):
         if not isinstance(token, str) or len(token) > 16384 or token in seen:
             raise ScanError("error", MESSAGES["limit"])
         seen.add(token)
-        parameters = {**parameters, token_key: token}
+        parameters = {**parameters, request_token_key or token_key: token}
     raise ScanError("error", MESSAGES["limit"])
 
 
@@ -477,6 +503,65 @@ def _elasticache(client, selected, query, rows, deadline):
         raise failure
 
 
+def _load_balancer_family(client, family, selected, query, rows, deadline):
+    if family == "elbv2":
+        parameters = {"LoadBalancerArns": [query["arn"]]} if query["arn"] else {"Names": [query["value"]]}
+        response_key = "LoadBalancers"
+    else:
+        parameters = {"LoadBalancerNames": [query["value"]]}
+        response_key = "LoadBalancerDescriptions"
+    parameters["PageSize"] = PAGE_SIZE
+    account = selected["role_arn"].split(":")[4]
+    for page in _pages(client, "describe_load_balancers", parameters, deadline, "NextMarker", "Marker"):
+        balancers = _list(page, response_key)
+        if len(balancers) > MAX_PAGE_ITEMS:
+            raise ScanError("error", MESSAGES["limit"])
+        for balancer in balancers:
+            name = balancer.get("LoadBalancerName")
+            if name != query["value"]:
+                raise ScanError("error", MESSAGES["invalid_response"])
+            if family == "elbv2":
+                arn = balancer.get("LoadBalancerArn")
+                try:
+                    found = parse_query("load-balancer", arn)
+                except LookupError:
+                    raise ScanError("error", MESSAGES["invalid_response"]) from None
+                if (found.get("kind") != "elbv2" or found["value"] != name
+                        or found["account"] != account or found["region"] != selected["region"]
+                        or balancer.get("Type") != LOAD_BALANCER_TYPES[found["loadBalancerType"]]
+                        or (query["arn"] and arn != query["arn"])):
+                    raise ScanError("error", MESSAGES["invalid_response"])
+            else:
+                # Classic DescribeLoadBalancers returns only this role account's
+                # resources, without an ARN. Construct the documented ARN only
+                # after the exact name is confirmed by that authenticated call.
+                arn = f"arn:aws:elasticloadbalancing:{selected['region']}:{account}:loadbalancer/{name}"
+            _add(rows, _row(selected, "load-balancer", name, name, arn))
+
+
+def _load_balancers(session, config_class, selected, query, rows, deadline, credentials):
+    failure = None
+    families = [query["kind"]] if query.get("kind") else ["elbv2", "elb"]
+    for family in families:
+        if family == "elbv2" and query["value"].startswith("internal-"):
+            continue  # Reserved by ELBv2, but valid for Classic Load Balancers.
+        try:
+            with closing(_client(session, config_class, family, selected["region"], credentials)) as client:
+                _load_balancer_family(client, family, selected, query, rows, deadline)
+        except Exception as error:
+            current = _scan_failure(error)
+            if current.status == "not_found":
+                continue
+            if current.status in {"auth_failed", "skipped"}:
+                raise current
+            # Plain names can exist in both APIs. Continue to preserve matches,
+            # while keeping any denial or failed family explicitly incomplete.
+            if failure is None:
+                failure = current
+    if failure is not None:
+        raise failure
+
+
 def _route53(client, selected, query, rows, deadline):
     target_id = query["value"] if query["kind"] == "id" else None
     if target_id:
@@ -587,22 +672,25 @@ def scan(config_file, payload, emit):
                     _emit_check(emit, selected, failure.status, rows, failure.safe_message)
                     continue
                 try:
-                    service = "ec2" if resource_type in EC2_TYPES else resource_type
-                    with closing(_client(session, config_class, service, selected["region"], credentials)) as client:
-                        if resource_type in EC2_TYPES:
-                            _ec2(client, selected, resource_type, query, rows, deadline)
-                        elif resource_type == "s3":
-                            _s3(client, selected, query, rows, deadline)
-                        elif resource_type == "rds":
-                            _rds(client, selected, query, rows, deadline)
-                        elif resource_type == "lambda":
-                            _lambda(client, selected, query, rows, deadline)
-                        elif resource_type == "eks":
-                            _eks(client, selected, query, rows, deadline)
-                        elif resource_type == "elasticache":
-                            _elasticache(client, selected, query, rows, deadline)
-                        else:
-                            _route53(client, selected, query, rows, deadline)
+                    if resource_type == "load-balancer":
+                        _load_balancers(session, config_class, selected, query, rows, deadline, credentials)
+                    else:
+                        service = "ec2" if resource_type in EC2_TYPES else resource_type
+                        with closing(_client(session, config_class, service, selected["region"], credentials)) as client:
+                            if resource_type in EC2_TYPES:
+                                _ec2(client, selected, resource_type, query, rows, deadline)
+                            elif resource_type == "s3":
+                                _s3(client, selected, query, rows, deadline)
+                            elif resource_type == "rds":
+                                _rds(client, selected, query, rows, deadline)
+                            elif resource_type == "lambda":
+                                _lambda(client, selected, query, rows, deadline)
+                            elif resource_type == "eks":
+                                _eks(client, selected, query, rows, deadline)
+                            elif resource_type == "elasticache":
+                                _elasticache(client, selected, query, rows, deadline)
+                            else:
+                                _route53(client, selected, query, rows, deadline)
                     _emit_check(emit, selected, "found" if rows else "not_found", rows)
                 except Exception as error:
                     failure = _scan_failure(error)

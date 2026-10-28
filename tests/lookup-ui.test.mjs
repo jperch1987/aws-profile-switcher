@@ -304,6 +304,30 @@ test('EKS and ElastiCache options send exact queries and display account and con
   }
 });
 
+test('Load balancer lookup sends its exact name or ARN and displays matches in the selected account and region', async () => {
+  assert.ok(html.includes('<option value="load-balancer">Load balancer</option>'));
+  const arn = 'arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/production-web/0123456789abcdef';
+  for (const query of ['production-web', arn]) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query,
+      results: [result(0, { resourceType: 'load-balancer', resourceId: 'production-web', name: 'production-web', arn })],
+      checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    ui.get('lookup-type').value = 'load-balancer';
+    ui.get('lookup-type').dispatch('change');
+    assert.match(ui.get('lookup-query').placeholder, /production-web.*load balancer ARN/);
+    assert.match(ui.get('lookup-region-help').textContent, /Application, Network, Gateway, and Classic.*configured region/);
+    await ui.search({ type: 'load-balancer', query });
+    assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'load-balancer', query, mfaCode: '000123' });
+    const row = ui.get('lookup-results-body').children[0];
+    assert.equal(row.children[0].textContent, '111111111111');
+    assert.equal(row.children[1].textContent, 'dev');
+    assert.equal(row.children[2].textContent, 'us-east-1');
+    assert.equal(row.children[3].children[0].textContent, 'production-web');
+    assert.equal(row.children[3].children[1].textContent, arn);
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.match(ui.get('lookup-checks').children[1].children[1].textContent, /eu-west-1/);
+  }
+});
+
 test('Route 53 searches hosted zones globally and keeps configured regions out of absence claims', async () => {
   assert.ok(html.includes('<option value="route53">Route 53 hosted zone</option>'));
   for (const found of [true, false]) {
@@ -321,7 +345,7 @@ test('Route 53 searches hosted zones globally and keeps configured regions out o
 });
 
 test('resource rows cannot claim another region except for explicitly global lookup types', async () => {
-  for (const [resourceType, region] of [['eks', 'eu-west-1'], ['elasticache', 'global'], ['route53', 'us-east-1'], ['s3', 'unexpected-region']]) {
+  for (const [resourceType, region] of [['eks', 'eu-west-1'], ['elasticache', 'global'], ['load-balancer', 'eu-west-1'], ['load-balancer', 'global'], ['route53', 'us-east-1'], ['s3', 'unexpected-region']]) {
     const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType, query: 'example', results: [result(0, { resourceType, region })], checks: [check(0, 'found'), check(1, 'not_found')] })) });
     await ui.search({ type: resourceType, query: 'example' });
     assert.equal(ui.get('lookup-results-body').children.length, 0);

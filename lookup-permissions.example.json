@@ -18,7 +18,8 @@
         "elasticache:DescribeReplicationGroups",
         "elasticache:DescribeServerlessCaches",
         "route53:GetHostedZone",
-        "route53:ListHostedZonesByName"
+        "route53:ListHostedZonesByName",
+        "elasticloadbalancing:DescribeLoadBalancers"
       ],
       "Resource": "*"
     }

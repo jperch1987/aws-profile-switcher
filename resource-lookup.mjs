@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53']);
+export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53', 'load-balancer']);
 const CHECK_STATES = new Set(['found', 'not_found', 'access_denied', 'auth_failed', 'error', 'skipped']);
 const REGION = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
 const MAX_OUTPUT = 32 * 1024 * 1024;

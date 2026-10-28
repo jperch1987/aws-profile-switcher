@@ -117,6 +117,31 @@ test('malformed, mismatched, duplicate and false no-match events stop the worker
   assert.equal(manager.get(start.id).state, 'error'); assert.equal(manager.get(start.id).results.length, 1);
 });
 
+test('load balancer lookup retains confirmed matches on partial denial and enforces account and region', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ profiles: ['dev'], resourceType: 'load-balancer', query: 'web-ingress' });
+  const row = event();
+  row.check.status = 'access_denied';
+  row.check.message = 'One load balancer API could not be checked.';
+  row.results = [{ profile: 'dev', accountId: '111111111111', region: 'us-east-1', resourceType: 'load-balancer',
+    resourceId: 'app/web-ingress/0123456789abcdef', name: 'web-ingress',
+    arn: 'arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/web-ingress/0123456789abcdef' }];
+  const start = manager.start(body, profiles);
+  assert.equal(JSON.parse(children.at(-1).input).resourceType, 'load-balancer');
+  children.at(-1).event(row); children.at(-1).event({ event: 'complete' }); children.at(-1).end();
+  assert.equal(manager.get(start.id).state, 'complete');
+  assert.equal(manager.get(start.id).results[0].name, 'web-ingress');
+  assert.equal(manager.get(start.id).checks[0].status, 'access_denied');
+  for (const invalidFields of [{ region: 'eu-west-1' }, { accountId: '222222222222' }]) {
+    const started = manager.start(body, profiles);
+    const invalid = structuredClone(row);
+    Object.assign(invalid.results[0], invalidFields);
+    children.at(-1).event(invalid);
+    assert.equal(manager.get(started.id).state, 'error');
+    assert.equal(manager.get(started.id).results.length, 0);
+  }
+});
+
 test('S3 results use verified bucket region while checks keep the configured scope', (t) => {
   const { manager, children } = fixture(t);
   const start = manager.start(request({ profiles: ['dev'], resourceType: 's3', query: 'example-bucket' }), profiles);

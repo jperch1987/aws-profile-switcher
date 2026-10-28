@@ -66,6 +66,10 @@ class LookupTests(unittest.TestCase):
         self.resource.describe_volumes.return_value = {"Volumes": []}
         self.resource.describe_security_groups.return_value = {"SecurityGroups": []}
         self.resource.describe_vpcs.return_value = {"Vpcs": []}
+        self.elbv2 = Mock()
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": []}
+        self.elb = Mock()
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": []}
         self.session = Mock()
         self.source = {"aws_access_key_id": "TEST_USER_KEY", "aws_secret_access_key": "TEST_USER_SECRET"}
         self.session._session.get_scoped_config.return_value = self.source
@@ -75,6 +79,10 @@ class LookupTests(unittest.TestCase):
             self.clients.append((service, kwargs))
             if service == "sts":
                 return self.source_client if kwargs["aws_session_token"] is None else self.sts
+            if service == "elbv2":
+                return self.elbv2
+            if service == "elb":
+                return self.elb
             return self.resource
         self.session.client.side_effect = client
         self.boto3 = SimpleNamespace(Session=Mock(return_value=self.session))
@@ -555,6 +563,189 @@ class LookupTests(unittest.TestCase):
     def test_example_policy_matches_all_supported_resource_read_actions(self):
         policy = json.loads((Path(__file__).resolve().parents[1] / "lookup-permissions.example.json").read_text())
         self.assertEqual(set(policy["Statement"][0]["Action"]), {action for actions in lookup.READ_ACTIONS.values() for action in actions})
+
+    def modern_balancer(self, kind="app", name="example-lb", **changes):
+        result = {"LoadBalancerName": name,
+            "LoadBalancerArn": f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/{kind}/{name}/0123456789abcdef",
+            "Type": lookup.LOAD_BALANCER_TYPES[kind], "DNSName": "PRIVATE", "SecurityGroups": ["PRIVATE"]}
+        result.update(changes)
+        return result
+
+    def classic_balancer(self, name="example-lb"):
+        return {"LoadBalancerName": name, "DNSName": "PRIVATE", "ListenerDescriptions": [{"PRIVATE": "PRIVATE"}],
+            "SourceSecurityGroup": {"OwnerAlias": "amazon-elb", "GroupName": "PRIVATE"}}
+
+    def test_load_balancer_modern_types_confirm_exact_arn_and_only_query_v2(self):
+        for kind in ["app", "net", "gwy"]:
+            with self.subTest(kind=kind):
+                self.elbv2.reset_mock()
+                item = self.modern_balancer(kind)
+                self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [item]}
+                event = self.scan(request("load-balancer", item["LoadBalancerArn"]))[0]
+                self.assertEqual(event["check"]["status"], "found")
+                self.assertEqual(event["results"][0]["arn"], item["LoadBalancerArn"])
+                self.assertNotIn("PRIVATE", json.dumps(event))
+                self.elbv2.describe_load_balancers.assert_called_once_with(LoadBalancerArns=[item["LoadBalancerArn"]], PageSize=100)
+                self.elbv2.close.assert_called_once()
+        self.elb.describe_load_balancers.assert_not_called()
+        for service, options in self.clients:
+            if service == "elbv2":
+                self.assertEqual(options["endpoint_url"], f"https://elasticloadbalancing.{REGION}.amazonaws.com")
+                self.assertEqual(options["region_name"], REGION)
+                self.assertEqual(options["aws_access_key_id"], "TEST_ROLE_KEY")
+                self.assertEqual(options["aws_session_token"], "TEST_ROLE_TOKEN")
+                self.assertTrue(options["verify"])
+                self.assertEqual(options["config"]["signature_version"], "v4")
+                self.assertEqual(options["config"]["retries"], {"total_max_attempts": 1})
+                self.assertEqual(options["config"]["proxies"], {})
+
+    def test_load_balancer_classic_arn_is_confirmed_then_constructed_from_role_account(self):
+        arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/example-lb"
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer()]}
+        event = self.scan(request("load-balancer", arn))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["results"][0], {"profile": "dev", "accountId": ACCOUNT, "region": REGION,
+            "resourceType": "load-balancer", "resourceId": "example-lb", "name": "example-lb", "arn": arn})
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.elb.describe_load_balancers.assert_called_once_with(LoadBalancerNames=["example-lb"], PageSize=100)
+        self.elbv2.describe_load_balancers.assert_not_called()
+        self.elb.close.assert_called_once()
+        options = next(options for service, options in self.clients if service == "elb")
+        self.assertEqual(options["endpoint_url"], f"https://elasticloadbalancing.{REGION}.amazonaws.com")
+        self.assertEqual(options["aws_access_key_id"], "TEST_ROLE_KEY")
+        self.assertTrue(options["verify"])
+
+    def test_load_balancer_plain_name_keeps_matches_from_both_api_families(self):
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer()]}
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer()]}
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 2)
+        self.assertEqual(len({row["arn"] for row in event["results"]}), 2)
+        self.elbv2.describe_load_balancers.assert_called_once_with(Names=["example-lb"], PageSize=100)
+        self.elb.describe_load_balancers.assert_called_once_with(LoadBalancerNames=["example-lb"], PageSize=100)
+        self.source_client.get_session_token.assert_called_once()
+        self.sts.assume_role.assert_called_once()
+        policy = json.loads(self.sts.assume_role.call_args.kwargs["Policy"])
+        self.assertEqual(policy["Statement"][0]["Action"], ["elasticloadbalancing:DescribeLoadBalancers"])
+
+    def test_load_balancer_classic_internal_prefix_does_not_query_impossible_v2_name(self):
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer("internal-example")]}
+        self.assertEqual(self.scan(request("load-balancer", "internal-example"))[0]["check"]["status"], "found")
+        self.elbv2.describe_load_balancers.assert_not_called()
+
+    def test_load_balancer_missing_family_does_not_hide_other_family_match(self):
+        self.elbv2.describe_load_balancers.side_effect = aws_error("LoadBalancerNotFound")
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer()]}
+        self.assertEqual(self.scan(request("load-balancer", "example-lb"))[0]["check"]["status"], "found")
+        self.elb.describe_load_balancers.side_effect = aws_error("LoadBalancerNotFound")
+        self.assertEqual(self.scan(request("load-balancer", "example-lb"))[0]["check"]["status"], "not_found")
+        self.elbv2.describe_load_balancers.side_effect = None
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer()]}
+        self.assertEqual(self.scan(request("load-balancer", "example-lb"))[0]["check"]["status"], "found")
+
+    def test_load_balancer_partial_denial_preserves_other_family_matches_in_either_order(self):
+        for denied, found, response in [(self.elbv2, self.elb, {"LoadBalancerDescriptions": [self.classic_balancer()]}),
+            (self.elb, self.elbv2, {"LoadBalancers": [self.modern_balancer()]})]:
+            self.elbv2.describe_load_balancers.side_effect = None
+            self.elb.describe_load_balancers.side_effect = None
+            denied.describe_load_balancers.side_effect = aws_error("AccessDenied")
+            found.describe_load_balancers.return_value = response
+            event = self.scan(request("load-balancer", "example-lb"))[0]
+            self.assertEqual(event["check"]["status"], "access_denied")
+            self.assertEqual(len(event["results"]), 1)
+            self.assertNotIn("PRIVATE", json.dumps(event))
+
+    def test_load_balancer_v2_metadata_requires_matching_owner_region_name_type_and_exact_arn(self):
+        item = self.modern_balancer()
+        arn = item["LoadBalancerArn"]
+        invalid = [{"LoadBalancerName": "different"}, {"LoadBalancerArn": arn.replace(ACCOUNT, "999999999999")},
+            {"LoadBalancerArn": arn.replace(REGION, "eu-west-1")}, {"LoadBalancerArn": arn.replace("example-lb", "other-lb")},
+            {"Type": "network"}, {"Type": None}, {"LoadBalancerArn": None},
+            {"LoadBalancerArn": arn.replace("0123456789abcdef", "fedcba9876543210")},
+            {"LoadBalancerArn": arn.replace("loadbalancer/app/", "targetgroup/")},
+            {"LoadBalancerArn": f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/example-lb"}]
+        for changed in invalid:
+            with self.subTest(changed=changed):
+                self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [{**item, **changed}]}
+                event = self.scan(request("load-balancer", arn))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(event["results"], [])
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer("different")]}
+        classic_arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/example-lb"
+        self.assertEqual(self.scan(request("load-balancer", classic_arn))[0]["check"]["status"], "error")
+
+    def test_load_balancer_invalid_names_and_non_balancer_arns_fail_before_mfa(self):
+        prefix = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:"
+        invalid = ["a" * 33, "-example", "example-", "example_lb", "example.example.com", "app/example/0123456789abcdef",
+            prefix + "listener/app/example/0123456789abcdef/0123456789abcdef", prefix + "targetgroup/example/0123456789abcdef",
+            prefix + "loadbalancer/app/example", prefix + "loadbalancer/unknown/example/0123456789abcdef",
+            prefix + "loadbalancer/app/example/not-a-valid-id", prefix + "loadbalancer/app/internal-example/0123456789abcdef",
+            prefix.replace("arn:aws:", "arn:aws-cn:") + "loadbalancer/example",
+            prefix.replace("elasticloadbalancing:", "elbv2:") + "loadbalancer/app/example/0123456789abcdef"]
+        for query in invalid:
+            with self.subTest(query=query), self.assertRaises(lookup.LookupError):
+                self.scan(request("load-balancer", query))
+        self.sdk.assert_not_called()
+        self.source_client.get_session_token.assert_not_called()
+
+    def test_load_balancer_arn_scope_mismatches_skip_before_authentication(self):
+        for suffix in ["example-lb", "app/example-lb/0123456789abcdef"]:
+            for region, account in [(REGION, "999999999999"), ("eu-west-1", ACCOUNT)]:
+                arn = f"arn:aws:elasticloadbalancing:{region}:{account}:loadbalancer/{suffix}"
+                event = self.scan(request("load-balancer", arn))[0]
+                self.assertEqual(event["check"]["status"], "skipped")
+                self.assertEqual(event["results"], [])
+        self.sdk.assert_not_called()
+
+    def test_load_balancer_pagination_maps_next_marker_to_marker_for_both_apis(self):
+        modern = self.modern_balancer()
+        cases = [(self.elbv2, "LoadBalancers", modern, modern["LoadBalancerArn"]),
+            (self.elb, "LoadBalancerDescriptions", self.classic_balancer(), f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/example-lb")]
+        for client, key, item, arn in cases:
+            with self.subTest(key=key):
+                client.describe_load_balancers.side_effect = [{key: [], "NextMarker": "NEXT"}, {key: [item], "NextMarker": ""}]
+                event = self.scan(request("load-balancer", arn))[0]
+                self.assertEqual(event["check"]["status"], "found")
+                self.assertEqual(client.describe_load_balancers.call_args.kwargs["Marker"], "NEXT")
+                self.assertNotIn("NextMarker", client.describe_load_balancers.call_args.kwargs)
+                client.describe_load_balancers.side_effect = None
+                client.describe_load_balancers.return_value = {key: [item], "NextMarker": "REPEATED"}
+                event = self.scan(request("load-balancer", arn))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(len(event["results"]), 1)
+                client.describe_load_balancers.reset_mock()
+                client.describe_load_balancers.side_effect = lambda c=client, k=key, **_: {k: [], "NextMarker": str(c.describe_load_balancers.call_count)}
+                with patch.object(lookup, "MAX_PAGES", 2):
+                    event = self.scan(request("load-balancer", arn))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(client.describe_load_balancers.call_count, 2)
+
+    def test_load_balancer_deadline_between_families_preserves_confirmed_matches(self):
+        current = [0]
+        def first_family(**_):
+            current[0] = 600
+            return {"LoadBalancers": [self.modern_balancer()]}
+        self.elbv2.describe_load_balancers.side_effect = first_family
+        with patch.object(lookup.time, "monotonic", side_effect=lambda: current[0]):
+            event = self.scan(request("load-balancer", "example-lb"))[0]
+        self.assertEqual(event["check"]["status"], "skipped")
+        self.assertEqual(len(event["results"]), 1)
+        self.elb.describe_load_balancers.assert_not_called()
+
+    def test_load_balancer_notfound_after_pagination_progress_is_incomplete(self):
+        modern = self.modern_balancer()
+        cases = [(self.elbv2, "LoadBalancers", modern, modern["LoadBalancerArn"]),
+            (self.elb, "LoadBalancerDescriptions", self.classic_balancer(), f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/example-lb")]
+        for client, key, item, arn in cases:
+            for first_page_rows in [[], [item]]:
+                with self.subTest(key=key, has_match=bool(first_page_rows)):
+                    client.describe_load_balancers.side_effect = [
+                        {key: first_page_rows, "NextMarker": "NEXT"}, aws_error("LoadBalancerNotFound")]
+                    event = self.scan(request("load-balancer", arn))[0]
+                    self.assertEqual(event["check"]["status"], "error")
+                    self.assertEqual(len(event["results"]), len(first_page_rows))
+                    self.assertNotIn("PRIVATE", json.dumps(event))
 
     def test_large_selected_scope_survives_worker_stdin_without_truncation(self):
         names = [f"profile-{n}-" + "\u90e8" * 256 for n in range(250)]
