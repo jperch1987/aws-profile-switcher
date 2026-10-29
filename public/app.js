@@ -517,6 +517,20 @@ function renderLookupSnapshot() {
   $("lookup-progress").hidden = !snapshot && !lookup.running;
   $("lookup-results-panel").hidden = !snapshot;
   $("lookup-results-heading").textContent = snapshot ? `Results for “${snapshot.query}”` : "Search results";
+  const failedChecks = snapshot && snapshot.state !== "running" ? snapshot.checks.filter((check) => !["found", "not_found"].includes(check.status)) : [];
+  const reasons = new Map();
+  for (const check of failedChecks) {
+    const reason = check.message || labels[check.status];
+    reasons.set(reason, (reasons.get(reason) || 0) + 1);
+  }
+  $("lookup-diagnostics").hidden = failedChecks.length === 0;
+  $("lookup-diagnostics-summary").textContent = failedChecks.length ? `${failedChecks.length} of ${snapshot.total} profiles could not be fully checked.${snapshot.results.length ? " Confirmed matches are shown below." : " No matches were returned, but this search cannot confirm the resource is absent."}` : "";
+  $("lookup-diagnostics-reasons").replaceChildren(...[...reasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([reason, count]) => {
+    const row = makeElement("li");
+    row.append(makeElement("strong", "", `${count} ${count === 1 ? "profile" : "profiles"}: `), makeElement("span", "", reason.length > 500 ? `${reason.slice(0, 500)}…` : reason));
+    return row;
+  }));
+  $("lookup-diagnostics-detail").textContent = failedChecks.length ? `${reasons.size > 3 ? `${reasons.size - 3} more ${reasons.size - 3 === 1 ? "reason is" : "reasons are"} listed below. ` : ""}See Checks by profile below for each account’s full message.` : "";
   const rows = [];
   for (const result of snapshot?.results || []) {
     const row = makeElement("tr");

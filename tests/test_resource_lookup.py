@@ -747,6 +747,118 @@ class LookupTests(unittest.TestCase):
                     self.assertEqual(len(event["results"]), len(first_page_rows))
                     self.assertNotIn("PRIVATE", json.dumps(event))
 
+    def test_load_balancer_diagnostics_classify_allowlisted_aws_codes_without_messages(self):
+        groups = [
+            (["AccessDenied", "AccessDeniedFault", "ForbiddenException"], "access_denied", "Read permission denied"),
+            (["ExpiredToken", "InvalidSignatureException"], "auth_failed", "temporary session"),
+            (["ValidationError", "InvalidParameter", "InvalidParameterValue", "InvalidParameterCombination", "InvalidConfigurationRequest"], "error", "lookup parameters"),
+            (["Throttling", "ThrottlingException", "RequestLimitExceeded", "DependencyThrottle"], "error", "limited the lookup"),
+            (["ServiceUnavailable", "InternalFailure", "InternalError"], "error", "could not complete"),
+        ]
+        for codes, status, reason in groups:
+            for code in codes:
+                with self.subTest(code=code):
+                    failure = lookup._load_balancer_failure(aws_error(code), "read")
+                    self.assertEqual(failure.status, status)
+                    self.assertIn(code, failure.safe_message)
+                    self.assertIn(reason, failure.safe_message)
+                    self.assertIn("Read request failed", failure.safe_message)
+                    self.assertNotIn("PRIVATE", failure.safe_message)
+                    self.assertNotIn("012345", failure.safe_message)
+
+    def test_load_balancer_diagnostics_classify_sdk_and_network_failures_safely(self):
+        examples = [
+            ("EndpointConnectionError", "regional AWS load balancing endpoint"),
+            ("ConnectTimeoutError", "timed out"), ("ReadTimeoutError", "read timeout"),
+            ("ConnectionClosedError", "connection closed"), ("SSLError", "TLS connection"),
+            ("ProxyConnectionError", "proxy connection"), ("ResponseParserError", "could not read"),
+            ("ParamValidationError", "rejected the lookup parameters"),
+            ("UnknownSignatureVersionError", "signing method"),
+            ("EndpointResolutionError", "endpoint settings"),
+            ("UnknownServiceError", "service data"), ("DataNotFoundError", "service data"),
+            ("TypeError", "Unexpected application or SDK error (TypeError)"),
+        ]
+        for exception_name, reason in examples:
+            with self.subTest(exception_name=exception_name):
+                error = type(exception_name, (Exception,), {})("PRIVATE_QUERY_ARN_PATH_TOKEN_REQUESTID")
+                for stage, step in [("client", "Client setup failed"), ("read", "Read request failed")]:
+                    failure = lookup._load_balancer_failure(error, stage)
+                    self.assertEqual(failure.status, "error")
+                    self.assertIn(step, failure.safe_message)
+                    self.assertIn(reason, failure.safe_message)
+                    self.assertNotIn("PRIVATE", failure.safe_message)
+
+    def test_load_balancer_diagnostics_hide_unknown_codes_classes_and_custom_messages(self):
+        errors = [aws_error("PRIVATE_AWS_CODE"), type("PRIVATE_CLASS_NAME", (Exception,), {})("PRIVATE_PATH"),
+            lookup.ScanError("error", "PRIVATE_CUSTOM_MESSAGE")]
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                failure = lookup._load_balancer_failure(error, "read")
+                self.assertEqual(failure.status, "error")
+                self.assertNotIn("PRIVATE", failure.safe_message)
+
+    def test_load_balancer_failed_families_keep_distinct_bounded_diagnostics(self):
+        self.elbv2.describe_load_balancers.side_effect = type("ReadTimeoutError", (Exception,), {})("PRIVATE_TIMEOUT_URL")
+        self.elb.describe_load_balancers.side_effect = aws_error("ValidationError")
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        message = event["check"]["message"]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertIn("Application/Network/Gateway: Read request failed", message)
+        self.assertIn("read timeout", message)
+        self.assertIn("Classic: Read request failed", message)
+        self.assertIn("ValidationError", message)
+        self.assertLessEqual(len(message), 500)
+        self.assertNotIn("PRIVATE", message)
+        self.assertNotIn("example-lb", message)
+        self.assertEqual(event["results"], [])
+
+    def test_load_balancer_client_setup_error_is_distinct_and_does_not_hide_classic_match(self):
+        original_client = self.session.client.side_effect
+        def client(service, **kwargs):
+            if service == "elbv2":
+                raise type("DataNotFoundError", (Exception,), {})("PRIVATE_SERVICE_PATH")
+            return original_client(service, **kwargs)
+        self.session.client.side_effect = client
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer()]}
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertIn("Application/Network/Gateway: Client setup failed", event["check"]["message"])
+        self.assertIn("service data", event["check"]["message"])
+        self.assertNotIn("PRIVATE", event["check"]["message"])
+        self.assertNotIn("Classic:", event["check"]["message"])
+
+    def test_load_balancer_invalid_metadata_and_page_limits_keep_specific_diagnostics(self):
+        item = self.modern_balancer()
+        arn = item["LoadBalancerArn"]
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [{**item, "Type": "incorrect"}]}
+        event = self.scan(request("load-balancer", arn))[0]
+        self.assertIn("unexpected resource metadata", event["check"]["message"])
+        self.assertIn("Application/Network/Gateway:", event["check"]["message"])
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [item], "NextMarker": "REPEAT"}
+        event = self.scan(request("load-balancer", arn))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertIn("page or result limit", event["check"]["message"])
+        self.assertEqual(len(event["results"]), 1)
+
+    def test_load_balancer_expired_session_stops_following_family_with_safe_diagnostic(self):
+        self.elbv2.describe_load_balancers.side_effect = aws_error("ExpiredToken")
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        self.assertEqual(event["check"]["status"], "auth_failed")
+        self.assertIn("Application/Network/Gateway:", event["check"]["message"])
+        self.assertIn("ExpiredToken", event["check"]["message"])
+        self.elb.describe_load_balancers.assert_not_called()
+
+    def test_load_balancer_diagnostics_remain_bounded_when_both_family_messages_are_long(self):
+        self.elbv2.describe_load_balancers.side_effect = aws_error("AccessDeniedException")
+        self.elb.describe_load_balancers.side_effect = aws_error("AccessDeniedException")
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        message = event["check"]["message"]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertIn("Application/Network/Gateway:", message)
+        self.assertIn("Classic:", message)
+        self.assertLessEqual(len(message), 500)
+
     def test_large_selected_scope_survives_worker_stdin_without_truncation(self):
         names = [f"profile-{n}-" + "\u90e8" * 256 for n in range(250)]
         payload = json.dumps(request(profiles=names), ensure_ascii=False).encode()

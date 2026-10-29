@@ -103,6 +103,12 @@
         <p class="lookup-progress" id="lookup-progress" aria-live="polite" hidden></p>
         <div class="lookup-results" id="lookup-results-panel" hidden>
           <h3 id="lookup-results-heading">Search results</h3>
+          <div class="lookup-diagnostics" id="lookup-diagnostics" role="status" aria-live="polite" aria-labelledby="lookup-diagnostics-heading" hidden>
+            <h3 id="lookup-diagnostics-heading">Why checks did not complete</h3>
+            <p id="lookup-diagnostics-summary"></p>
+            <ul id="lookup-diagnostics-reasons"></ul>
+            <p class="lookup-diagnostics-detail" id="lookup-diagnostics-detail"></p>
+          </div>
           <div class="lookup-table-scroll" id="lookup-results-table"><table><caption class="visually-hidden">Matching AWS resources by account, profile, and region</caption><thead><tr><th scope="col">Account</th><th scope="col">Profile</th><th scope="col">Region</th><th scope="col">Resource / Name</th></tr></thead><tbody id="lookup-results-body"></tbody></table></div>
           <p class="lookup-empty" id="lookup-no-results">No matches returned yet.</p>
           <div class="lookup-coverage-heading"><h3>Checks by profile</h3><span>Review coverage before concluding</span></div>

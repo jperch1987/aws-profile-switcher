@@ -256,6 +256,9 @@ test('polling does not overlap, renders text-only matches, and preserves every p
   assert.equal(row.children[3].children[1].textContent, unsafeName);
   assert.equal(ui.get('lookup-checks').children.length, 2);
   assert.equal(ui.get('lookup-checks').children[1].children[0].children[1].textContent, 'Access denied');
+  assert.equal(ui.get('lookup-diagnostics').hidden, false);
+  assert.match(ui.get('lookup-diagnostics-summary').textContent, /1 of 2 profiles.*Confirmed matches are shown below/);
+  assert.equal(ui.get('lookup-diagnostics-reasons').children[0].children[1].textContent, 'The role cannot describe EC2 instances.');
   assert.match(ui.get('lookup-coverage-note').textContent, /do not prove a resource is absent/);
   assert.equal(ui.get('switch-button').disabled, false);
   await ui.advance(30_000);
@@ -274,6 +277,68 @@ test('all failure and skipped statuses remain visible and no matches never impli
   const ui = await app({ start: () => response(snapshot({ state: 'complete', checks: [check(0, 'not_found'), check(1, 'not_found')] })) });
   await ui.search();
   assert.match(ui.get('lookup-no-results').textContent, /Other accounts and regions were not searched/);
+  assert.equal(ui.get('lookup-diagnostics').hidden, true);
+  assert.equal(ui.get('lookup-diagnostics-reasons').children.length, 0);
+});
+
+test('terminal failed checks prominently show grouped reasons for complete, error, and cancelled searches', async () => {
+  const reason = 'Load balancer lookup could not reach the AWS endpoint. Check the network connection.';
+  for (const state of ['complete', 'error', 'cancelled']) {
+    const ui = await app({ start: () => response(snapshot({ state, checks: [check(0, 'error', reason), check(1, 'error', reason)] })) });
+    await ui.search();
+    assert.equal(ui.get('lookup-diagnostics').hidden, false);
+    assert.match(ui.get('lookup-diagnostics-summary').textContent, /2 of 2 profiles could not be fully checked.*cannot confirm the resource is absent/);
+    const reasons = ui.get('lookup-diagnostics-reasons').children;
+    assert.equal(reasons.length, 1);
+    assert.equal(reasons[0].children[0].textContent, '2 profiles: ');
+    assert.equal(reasons[0].children[1].textContent, reason);
+    assert.match(ui.get('lookup-diagnostics-detail').textContent, /Checks by profile below/);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.equal(ui.get('lookup-checks').children[0].children[2].textContent, reason);
+  }
+});
+
+test('failure summary renders only three distinct text-only reasons with counts and retains full profile details', async () => {
+  const list = Array.from({ length: 6 }, (_, index) => ({ ...profiles[0], profile: `role-${index}` }));
+  const markup = '<img src=x onerror=alert(1)>';
+  const messages = [markup, markup, 'AWS rejected the request.', 'The SDK could not load the service.', 'The request timed out.', 'AWS temporarily limited requests.'];
+  const checks = list.map((profile, index) => ({ profile: profile.profile, accountId: '111111111111', region: 'us-east-1', status: 'error', message: messages[index] }));
+  const ui = await app({ list, start: () => response(snapshot({ state: 'complete', names: list.map(({ profile }) => profile), list, checks })) });
+  await ui.search();
+  const reasons = ui.get('lookup-diagnostics-reasons').children;
+  assert.equal(reasons.length, 3);
+  assert.equal(reasons[0].children[0].textContent, '2 profiles: ');
+  assert.equal(reasons[0].children[1].tagName, 'SPAN');
+  assert.equal(reasons[0].children[1].textContent, markup);
+  assert.equal(reasons[0].children[1].children.length, 0);
+  assert.equal(reasons[1].children[0].textContent, '1 profile: ');
+  assert.match(ui.get('lookup-diagnostics-detail').textContent, /2 more reasons are listed below/);
+  assert.equal(ui.get('lookup-checks').children.length, 6);
+  assert.equal(ui.get('lookup-checks').children[5].children[2].textContent, messages[5]);
+  assert.equal(ui.get('lookup-diagnostics-reasons').children.some((row) => row.children.some((child) => child.textContent.includes('role-'))), false);
+});
+
+test('running searches do not show a terminal failure summary or claim absence', async () => {
+  const ui = await app({ start: () => response(snapshot({ checks: [check(0, 'error', 'The SDK could not load the service.')] })) });
+  await ui.search();
+  assert.equal(ui.get('lookup-diagnostics').hidden, true);
+  assert.equal(ui.get('lookup-diagnostics-reasons').children.length, 0);
+  assert.equal(ui.get('lookup-diagnostics-summary').textContent, '');
+  assert.match(ui.get('lookup-no-results').textContent, /Checks are still running/);
+  assert.equal(ui.get('lookup-checks').children[0].children[2].textContent, 'The SDK could not load the service.');
+});
+
+test('clearing or refreshing failed results removes the diagnostic summary and its messages', async () => {
+  for (const action of ['lookup-clear', 'refresh-button']) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', checks: [check(0, 'error', 'The request timed out.'), check(1, 'not_found')] })) });
+    await ui.search();
+    assert.equal(ui.get('lookup-diagnostics').hidden, false);
+    await ui.get(action).dispatch('click');
+    assert.equal(ui.get('lookup-diagnostics').hidden, true);
+    assert.equal(ui.get('lookup-diagnostics-reasons').children.length, 0);
+    assert.equal(ui.get('lookup-diagnostics-summary').textContent, '');
+    assert.equal(ui.get('lookup-diagnostics-detail').textContent, '');
+  }
 });
 
 test('S3 uses global scope wording and displays its verified bucket region', async () => {

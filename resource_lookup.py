@@ -40,6 +40,7 @@ READ_ACTIONS = {
 }
 LOAD_BALANCER_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?"
 LOAD_BALANCER_TYPES = {"app": "application", "net": "network", "gwy": "gateway"}
+LOAD_BALANCER_FAMILIES = {"elbv2": "Application/Network/Gateway", "elb": "Classic"}
 ELASTICACHE_TYPES = {
     "cluster": ("describe_cache_clusters", "CacheClusterId", "CacheClusters", "MaxRecords", "Marker"),
     "replicationgroup": ("describe_replication_groups", "ReplicationGroupId", "ReplicationGroups", "MaxRecords", "Marker"),
@@ -539,27 +540,85 @@ def _load_balancer_family(client, family, selected, query, rows, deadline):
             _add(rows, _row(selected, "load-balancer", name, name, arn))
 
 
+def _load_balancer_failure(error, stage):
+    """Explain a failed step using fixed text, never exception or AWS messages."""
+    failure = _scan_failure(error)
+    step = "Client setup failed" if stage == "client" else "Read request failed"
+    if isinstance(error, ScanError):
+        # These diagnostics are produced by our metadata/pagination/deadline
+        # checks. Do not forward arbitrary custom exception messages.
+        message = error.safe_message if error.safe_message in MESSAGES.values() else MESSAGES["error"]
+        return ScanError(failure.status, message)
+    code = _error_code(error)
+    if code in {"AccessDenied", "AccessDeniedException", "AccessDeniedFault", "UnauthorizedOperation", "AuthorizationError", "Forbidden", "ForbiddenException", "403"}:
+        return ScanError("access_denied", f"{step}: Read permission denied ({code}). Allow elasticloadbalancing:DescribeLoadBalancers on the role.")
+    if code in {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException", "SignatureDoesNotMatch", "InvalidSignatureException"}:
+        return ScanError("auth_failed", f"{step}: AWS rejected the temporary session ({code}). Retry the lookup with a fresh MFA code.")
+    if code in {"ValidationError", "InvalidParameter", "InvalidParameterValue", "InvalidParameterCombination", "InvalidConfigurationRequest"}:
+        reason = f"AWS rejected the lookup parameters ({code}). Check the load balancer name or ARN and app version."
+    elif code in {"Throttling", "ThrottlingException", "RequestLimitExceeded", "DependencyThrottle"}:
+        reason = f"AWS limited the lookup requests ({code}). Wait briefly and retry."
+    elif code in {"ServiceUnavailable", "ServiceUnavailableException", "InternalFailure", "InternalError"}:
+        reason = f"AWS could not complete the lookup ({code}). Retry later."
+    else:
+        # Matching only known class names also supports SDK-free unit tests.
+        # Unknown names, paths, request IDs, signed URLs, and raw messages stay private.
+        exception_name = type(error).__name__
+        network_messages = {
+            "EndpointConnectionError": "Could not connect to the regional AWS load balancing endpoint.",
+            "ConnectTimeoutError": "Connection to the regional AWS load balancing endpoint timed out.",
+            "ReadTimeoutError": "AWS did not reply before the read timeout.",
+            "ConnectionClosedError": "The AWS connection closed before the response finished.",
+            "SSLError": "The TLS connection or certificate verification failed.",
+            "ProxyConnectionError": "A proxy connection failed.",
+            "ResponseParserError": "AWS returned a response that the Python SDK could not read.",
+            "ParamValidationError": "The Python SDK rejected the lookup parameters. Update the app and its Python dependencies.",
+            "UnknownSignatureVersionError": "The Python SDK could not use the required request signing method.",
+            "UnsupportedSignatureVersionError": "The Python SDK could not use the required request signing method.",
+            "EndpointResolutionError": "The Python SDK could not resolve the AWS endpoint settings.",
+            "InvalidEndpointConfigurationError": "The Python SDK could not resolve the AWS endpoint settings.",
+        }
+        if exception_name in network_messages:
+            reason = network_messages[exception_name]
+        elif exception_name in {"UnknownServiceError", "DataNotFoundError", "UnknownAPIVersionError", "UnknownEndpointError", "ImportError", "ModuleNotFoundError"}:
+            reason = "The Python AWS SDK service data is missing or unsupported. Reinstall requirements.txt."
+        elif exception_name in {"NoCredentialsError", "PartialCredentialsError", "CredentialRetrievalError"}:
+            return ScanError("auth_failed", f"{step}: The Python SDK could not use the temporary role credentials. Retry with a fresh MFA code.")
+        elif exception_name in {"TypeError", "AttributeError", "KeyError", "ValueError"}:
+            reason = f"Unexpected application or SDK error ({exception_name}). Update the app and its Python dependencies."
+        elif code is not None:
+            reason = "AWS returned an unrecognized service error. This check is incomplete."
+        else:
+            reason = "Unexpected application or SDK failure. This check is incomplete."
+    return ScanError(failure.status, f"{step}: {reason}")
+
+
 def _load_balancers(session, config_class, selected, query, rows, deadline, credentials):
     failure = None
+    explanations = []
     families = [query["kind"]] if query.get("kind") else ["elbv2", "elb"]
     for family in families:
         if family == "elbv2" and query["value"].startswith("internal-"):
             continue  # Reserved by ELBv2, but valid for Classic Load Balancers.
+        stage = "client"
         try:
             with closing(_client(session, config_class, family, selected["region"], credentials)) as client:
+                stage = "read"
                 _load_balancer_family(client, family, selected, query, rows, deadline)
         except Exception as error:
             current = _scan_failure(error)
             if current.status == "not_found":
                 continue
+            current = _load_balancer_failure(error, stage)
+            explanations.append(f"{LOAD_BALANCER_FAMILIES[family]}: {current.safe_message}")
             if current.status in {"auth_failed", "skipped"}:
-                raise current
+                raise ScanError(current.status, "; ".join(explanations)[:500]) from None
             # Plain names can exist in both APIs. Continue to preserve matches,
             # while keeping any denial or failed family explicitly incomplete.
             if failure is None:
                 failure = current
     if failure is not None:
-        raise failure
+        raise ScanError(failure.status, "; ".join(explanations)[:500])
 
 
 def _route53(client, selected, query, rows, deadline):

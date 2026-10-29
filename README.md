@@ -329,6 +329,21 @@ The source user still needs permission to assume the target roles, and their exi
 
 The browser displays only resource metadata and scan statuses. **Clear results**, page exit/reload, or **Refresh** clears the local display. The server keeps only the most recent lookup's metadata in memory, replaces it when a new lookup starts, and expires it 10 minutes after the lookup finishes. Clearing the display does not immediately delete that server snapshot; stopping the server clears its memory. The browser also expires displayed results. Neither cancelling nor clearing a search revokes temporary AWS credentials before their normal expiration. Treat account, resource, and naming information as private when sharing screenshots or support reports.
 
+### When load balancer lookup says Check failed
+
+**Check failed** means the profile could not be fully searched; it is different from **No match**. The **Why checks did not complete** panel above the profile checks shows the safe error reasons and how many profiles share them. Individual profile cards retain their own messages. Application/Network/Gateway and Classic failures are identified separately; a match from one API remains visible if the other API fails.
+
+Use the reason shown to choose the next step:
+
+- **Connection or timeout:** check that the app's machine can reach `https://elasticloadbalancing.<region>.amazonaws.com` for the profile's configured region. STS or EC2 connectivity alone does not establish load balancer API connectivity.
+- **TLS/certificate or proxy:** check the machine's certificate trust and approved network configuration. Certificate verification stays enabled; the app does not use proxy or custom endpoint overrides.
+- **SDK/model or parameter validation:** rerun the platform installer to install `requirements.txt` in the app's selected Python environment, restart the server, and retry. On WSL, keep that environment in Linux home.
+- **Access denied:** verify that the target role grants `elasticloadbalancing:DescribeLoadBalancers`; also check applicable permission boundaries and organization policies.
+- **Throttling or service failure:** retry a smaller set of profiles with a fresh MFA code.
+- **Unexpected response/helper error:** report the safe reason shown, whether you searched by name or ARN, and the configured region. Do not share credentials or MFA codes.
+
+The overall zero-match summary is not the cause of a failed search. A **No match** result applies only to the selected account and configured region. Names must be the actual load balancer name, not its DNS hostname, listener name, or target-group name. These diagnostics help identify the cause; they do not establish that a failed AWS request has been fixed.
+
 ## Open a role in AWS Console
 
 1. Select a role profile and review its target account and full role name.
