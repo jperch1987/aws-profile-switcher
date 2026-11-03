@@ -9,6 +9,7 @@
         "ec2:DescribeVolumes",
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeVpcs",
+        "ec2:DescribeNetworkInterfaces",
         "s3:ListAllMyBuckets",
         "s3:GetBucketLocation",
         "rds:DescribeDBInstances",

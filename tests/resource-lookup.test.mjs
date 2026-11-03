@@ -152,6 +152,93 @@ test('S3 results use verified bucket region while checks keep the configured sco
   assert.equal(manager.get(start.id).results[0].region, 'eu-west-1');
 });
 
+function privateIpEvent(profile = 'dev', overrides = {}) {
+  const row = event(profile);
+  const target = row.results[0];
+  Object.assign(target, { resourceType: 'private-ip', resourceId: 'eni-0123456789abcdef0', name: 'service-network',
+    arn: `arn:aws:ec2:${target.region}:${target.accountId}:network-interface/eni-0123456789abcdef0`,
+    network: { privateIpAddress: '10.0.1.25', vpcId: 'vpc-0123456789abcdef0', subnetId: 'subnet-0123456789abcdef0',
+      interfaceType: 'interface', description: 'Application network interface', instanceId: 'i-0123456789abcdef0',
+      instanceOwnerId: target.accountId, requesterId: '', requesterManaged: false, ...overrides } });
+  return row;
+}
+
+test('private IP validation accepts only exact IPv4 literals before spawning or consuming MFA', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ resourceType: 'private-ip' });
+  for (const query of ['10.0.1.0/24', 'example.com', '::1', '::ffff:10.0.1.25', '10.0.01.25', '256.0.1.25', '10.0.1', '0xa000119', '10.0.1.*']) {
+    assert.throws(() => manager.start({ ...body, query }, profiles), /exact private IPv4/);
+  }
+  assert.equal(children.length, 0);
+  for (const query of ['10.0.1.25', '172.16.0.1', '192.168.1.25', '100.64.0.25']) {
+    assert.equal(validateLookupRequest({ ...body, query }, profiles).query, query);
+  }
+  assert.equal(validateLookupRequest({ ...body, query: '  10.0.1.25  ' }, profiles).query, '10.0.1.25');
+});
+
+test('private IP metadata is allowlisted and overlapping addresses retain their account and VPC', (t) => {
+  const { manager, children } = fixture(t);
+  const started = manager.start(request({ resourceType: 'private-ip', query: '10.0.1.25' }), profiles);
+  assert.equal(JSON.parse(children[0].input).query, '10.0.1.25');
+  const first = privateIpEvent('dev', { credentials: 'DO_NOT_FORWARD' });
+  const second = privateIpEvent('production', { vpcId: 'vpc-22222222222222222', instanceId: '', instanceOwnerId: 'amazon-aws', requesterManaged: null });
+  children[0].event(first); children[0].event(second); children[0].event({ event: 'complete' }); children[0].end();
+  const result = manager.get(started.id);
+  assert.equal(result.state, 'complete'); assert.equal(result.results.length, 2);
+  assert.equal(result.results[0].network.instanceId, 'i-0123456789abcdef0');
+  assert.equal(result.results[1].accountId, '222222222222');
+  assert.equal(result.results[1].network.vpcId, 'vpc-22222222222222222');
+  assert.equal(result.results[1].network.requesterManaged, null);
+  assert.equal(result.results[1].network.instanceOwnerId, 'amazon-aws');
+  assert.equal(Object.keys(result.results[0].network).length, 9);
+  assert.doesNotMatch(JSON.stringify(result), /DO_NOT_FORWARD|credentials|mfaCode/);
+  result.results[0].network.description = 'changed';
+  assert.equal(manager.get(started.id).results[0].network.description, 'Application network interface');
+});
+
+test('private IP worker results reject mismatched identities and malformed network metadata', (t) => {
+  const { manager, children } = fixture(t);
+  const invalid = [
+    (row) => { delete row.network; },
+    (row) => { row.network = []; },
+    (row) => { row.network.privateIpAddress = '10.0.1.26'; },
+    (row) => { row.network.vpcId = 'vpc-bad'; },
+    (row) => { row.network.subnetId = ''; },
+    (row) => { row.network.instanceId = 'eni-0123456789abcdef0'; },
+    (row) => { row.network.instanceOwnerId = 111111111111; },
+    (row) => { row.network.requesterManaged = 'true'; },
+    (row) => { delete row.network.requesterManaged; },
+    (row) => { row.network.description = 'x'.repeat(1025); },
+    (row) => { row.network.interfaceType = 'x'.repeat(129); },
+    (row) => { row.network.requesterId = 'x'.repeat(257); },
+    (row) => { row.network.description = 'bad\nvalue'; },
+    (row) => { row.network.description = 'bad\u0085value'; },
+    (row) => { row.network.description = 'bad\ud800value'; },
+    (row) => { row.resourceId = 'i-0123456789abcdef0'; },
+    (row) => { row.arn = row.arn.replace('111111111111', '222222222222'); },
+    (row) => { row.region = 'eu-west-1'; },
+  ];
+  for (const mutate of invalid) {
+    const started = manager.start(request({ profiles: ['dev'], resourceType: 'private-ip', query: '10.0.1.25' }), profiles);
+    const row = privateIpEvent(); mutate(row.results[0]); children.at(-1).event(row);
+    assert.equal(manager.get(started.id).state, 'error');
+    assert.equal(manager.get(started.id).results.length, 0);
+  }
+});
+
+test('private IP matches remain visible if a later page or account is denied', (t) => {
+  const { manager, children } = fixture(t);
+  const started = manager.start(request({ resourceType: 'private-ip', query: '10.0.1.25' }), profiles);
+  const partial = privateIpEvent(); partial.check.status = 'access_denied';
+  partial.check.message = 'AWS denied a required read operation. This check is incomplete.';
+  children[0].event(partial);
+  children[0].event({ event: 'profile', check: { profile: 'production', accountId: '222222222222', region: 'us-east-1', status: 'access_denied', message: 'AWS denied the request.' }, results: [] });
+  children[0].event({ event: 'complete' }); children[0].end();
+  const result = manager.get(started.id);
+  assert.equal(result.state, 'complete'); assert.equal(result.results.length, 1);
+  assert.ok(result.checks.every((check) => check.status === 'access_denied'));
+});
+
 test('bounded Unicode profile names support a full worker result page with ASCII-escaped JSON', (t) => {
   const { manager, children } = fixture(t);
   const name = '界'.repeat(2048);

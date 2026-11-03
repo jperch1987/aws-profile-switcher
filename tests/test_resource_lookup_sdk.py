@@ -21,7 +21,7 @@ except ImportError:
 
 
 @unittest.skipIf(boto3 is None, "Install requirements.txt to run optional real-SDK smoke checks.")
-class LoadBalancerSdkTests(unittest.TestCase):
+class ResourceLookupSdkTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -96,6 +96,46 @@ class LoadBalancerSdkTests(unittest.TestCase):
                         lookup._load_balancer_family(client, family, self.selected,
                             lookup.parse_query("load-balancer", "test-lb"), [], float("inf"))
                     self.assertEqual(lookup._scan_failure(raised.exception).status, "not_found")
+
+    def test_real_sdk_private_ip_filter_secondary_address_pagination_and_service_metadata(self):
+        client = self.client("ec2")
+        self.assertEqual(client.meta.endpoint_url, "https://ec2.us-east-1.amazonaws.com")
+        self.assertEqual(client._request_signer.signing_name, "ec2")
+        parameters = {"Filters": [{"Name": "addresses.private-ip-address", "Values": ["10.0.1.25"]}], "MaxResults": 100}
+        operation = client.meta.service_model.operation_model("DescribeNetworkInterfaces")
+        serialized = client._serializer.serialize_to_request(parameters, operation)
+        self.assertEqual(serialized["body"], {"Action": "DescribeNetworkInterfaces", "Version": "2016-11-15",
+            "Filter.1.Name": "addresses.private-ip-address", "Filter.1.Value.1": "10.0.1.25", "MaxResults": 100})
+        interface = {"NetworkInterfaceId": "eni-0123456789abcdef0", "OwnerId": "111111111111",
+            "VpcId": "vpc-0123456789abcdef0", "SubnetId": "subnet-0123456789abcdef0", "PrivateIpAddress": "10.0.1.10",
+            "PrivateIpAddresses": [{"PrivateIpAddress": "10.0.1.10", "Primary": True},
+                                   {"PrivateIpAddress": "10.0.1.25", "Primary": False}],
+            "InterfaceType": "network_load_balancer", "Description": "ELB net/example/0123456789abcdef",
+            "Attachment": {"InstanceOwnerId": "amazon-aws"}, "RequesterId": "amazon-elb", "RequesterManaged": True,
+            "TagSet": [{"Key": "Name", "Value": "lb-interface"}]}
+        with Stubber(client) as stub:
+            stub.add_response("describe_network_interfaces", {"NetworkInterfaces": [], "NextToken": "PAGE_TWO"}, parameters)
+            stub.add_response("describe_network_interfaces", {"NetworkInterfaces": [interface]}, {**parameters, "NextToken": "PAGE_TWO"})
+            rows = []
+            lookup._private_ip(client, self.selected, lookup.parse_query("private-ip", "10.0.1.25"), rows, float("inf"))
+            stub.assert_no_pending_responses()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["name"], "lb-interface")
+            self.assertEqual(rows[0]["network"]["privateIpAddress"], "10.0.1.25")
+            self.assertEqual(rows[0]["network"]["instanceOwnerId"], "amazon-aws")
+            self.assertEqual(rows[0]["network"]["instanceId"], "")
+
+    def test_real_sdk_private_ip_permission_failure_has_safe_diagnostic(self):
+        client = self.client("ec2")
+        parameters = {"Filters": [{"Name": "addresses.private-ip-address", "Values": ["10.0.1.25"]}], "MaxResults": 100}
+        with Stubber(client) as stub:
+            stub.add_client_error("describe_network_interfaces", service_error_code="UnauthorizedOperation",
+                service_message="PRIVATE_CREDENTIAL_QUERY", expected_params=parameters)
+            with self.assertRaises(Exception) as raised:
+                lookup._private_ip(client, self.selected, lookup.parse_query("private-ip", "10.0.1.25"), [], float("inf"))
+            failure = lookup._scan_failure(raised.exception)
+            self.assertEqual(failure.status, "access_denied")
+            self.assertNotIn("PRIVATE", failure.safe_message)
 
 
 if __name__ == "__main__":

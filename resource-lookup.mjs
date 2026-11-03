@@ -1,14 +1,35 @@
 // Author: jperch1987
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { isIPv4 } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53', 'load-balancer']);
+export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53', 'load-balancer', 'private-ip']);
 const CHECK_STATES = new Set(['found', 'not_found', 'access_denied', 'auth_failed', 'error', 'skipped']);
 const REGION = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
 const MAX_OUTPUT = 32 * 1024 * 1024;
 const MAX_LINE = 2 * 1024 * 1024;
 const cleanString = (value, maximum = 1024) => typeof value === 'string' && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value);
+const cleanMetadata = (value, maximum) => cleanString(value, maximum) && !/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value);
+const ec2Id = (value, prefix) => typeof value === 'string' && new RegExp(`^${prefix}-(?:[0-9a-f]{8}|[0-9a-f]{17})$`).test(value);
+
+function networkMetadata(item, target, query) {
+  const info = item.network;
+  if (!info || typeof info !== 'object' || Array.isArray(info)
+    || !ec2Id(item.resourceId, 'eni')
+    || item.arn !== `arn:aws:ec2:${target.region}:${target.accountId}:network-interface/${item.resourceId}`
+    || info.privateIpAddress !== query || !isIPv4(info.privateIpAddress)
+    || !ec2Id(info.vpcId, 'vpc') || !ec2Id(info.subnetId, 'subnet')
+    || !cleanMetadata(info.interfaceType, 128) || !cleanMetadata(info.description, 1024)
+    || !cleanMetadata(info.requesterId, 256)
+    || !(info.instanceId === '' || ec2Id(info.instanceId, 'i'))
+    || !cleanMetadata(info.instanceOwnerId, 256)
+    || !(info.requesterManaged === null || typeof info.requesterManaged === 'boolean')) return null;
+  // Never retain extra SDK fields or an unexpected nested payload from a worker.
+  return { privateIpAddress: info.privateIpAddress, vpcId: info.vpcId, subnetId: info.subnetId,
+    interfaceType: info.interfaceType, description: info.description, instanceId: info.instanceId,
+    instanceOwnerId: info.instanceOwnerId, requesterId: info.requesterId, requesterManaged: info.requesterManaged };
+}
 
 export class LookupError extends Error {
   constructor(message, status = 400) { super(message); this.name = 'LookupError'; this.status = status; }
@@ -24,6 +45,7 @@ export function validateLookupRequest(body, profiles) {
   }
   if (!RESOURCE_TYPES.includes(body.resourceType)) throw new LookupError('Choose a supported resource type.');
   if (!cleanString(body.query, 256) || !body.query.trim()) throw new LookupError('Enter a resource ID, exact name, or ARN using at most 256 characters on one line.');
+  if (body.resourceType === 'private-ip' && !isIPv4(body.query.trim())) throw new LookupError('Enter one exact private IPv4 address, such as 10.0.1.25. CIDR ranges, hostnames, and IPv6 are not supported.');
   if (typeof body.mfaCode !== 'string' || !/^[0-9]{6}$/.test(body.mfaCode)) throw new LookupError('Enter a fresh six-digit MFA code for this lookup.');
   const targets = body.profiles.map((name) => {
     const profile = profiles.find((item) => item.profile === name);
@@ -100,8 +122,10 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         || (!['s3', 'route53'].includes(job.data.resourceType) && item.region !== target.region)
         || (job.data.resourceType === 'route53' && item.region !== 'global')
         || (job.data.resourceType === 's3' && !REGION.test(item.region) && !['unknown', 'global'].includes(item.region))) return badWorker(job);
+      const network = job.data.resourceType === 'private-ip' ? networkMetadata(item, target, job.data.query) : null;
+      if (job.data.resourceType === 'private-ip' && !network) return badWorker(job);
       rows.push({ profile: target.profile, accountId: target.accountId, region: item.region, resourceType: job.data.resourceType,
-        resourceId: item.resourceId, name: item.name, arn: item.arn });
+        resourceId: item.resourceId, name: item.name, arn: item.arn, ...(network ? { network } : {}) });
     }
     if ((check.status === 'not_found' && rows.length) || (check.status === 'found' && !rows.length)) return badWorker(job);
     job.data.checks.push({ ...target, status: check.status, message: check.message });

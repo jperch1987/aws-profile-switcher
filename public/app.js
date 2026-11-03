@@ -4,7 +4,7 @@
 const $ = (id) => document.getElementById(id);
 const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, loadVersion: 0, token: "", shell: "posix", loading: false, switching: false, loaded: false, copyTimer: null };
 
-const lookupTypes = new Map([["ec2", "EC2 instance"], ["ebs", "EBS volume"], ["security-group", "Security group"], ["vpc", "VPC"], ["s3", "S3 bucket"], ["rds", "RDS database"], ["lambda", "Lambda function"], ["eks", "EKS cluster"], ["elasticache", "ElastiCache cache"], ["route53", "Route 53 hosted zone"], ["load-balancer", "Load balancer"]]);
+const lookupTypes = new Map([["ec2", "EC2 instance"], ["ebs", "EBS volume"], ["security-group", "Security group"], ["vpc", "VPC"], ["s3", "S3 bucket"], ["rds", "RDS database"], ["lambda", "Lambda function"], ["eks", "EKS cluster"], ["elasticache", "ElastiCache cache"], ["route53", "Route 53 hosted zone"], ["load-balancer", "Load balancer"], ["private-ip", "Private IPv4 address"]]);
 const lookupProfileLimit = 250;
 const lookupRegion = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
 const lookup = { groups: [], group: null, selected: new Set(), snapshot: null, expected: null, version: 0, timer: null, expiryTimer: null, running: false, mutation: false, message: "", error: false };
@@ -460,12 +460,16 @@ function renderLookupControls() {
   const eligible = lookup.groups.reduce((count, item) => count + item.profiles.length, 0);
   const unavailable = Math.max(0, state.profiles.length - eligible);
   const total = group?.profiles.length || 0;
+  const privateIp = $("lookup-type").value === "private-ip";
   const limitMessage = selected > lookupProfileLimit ? `Select no more than ${lookupProfileLimit} profiles per search.` : total > lookupProfileLimit ? `This identity exceeds the ${lookupProfileLimit}-profile search limit. Select all is unavailable; choose up to ${lookupProfileLimit} profiles manually, then search the remaining profiles separately.${selected === 0 ? " None have been selected automatically." : ""}` : `Choose 1–${lookupProfileLimit} profiles sharing this source identity and MFA device.`;
   $("lookup-scope-summary").textContent = `${selected} of ${total} profiles selected. ${limitMessage}`;
   $("lookup-scope-summary").classList.toggle("is-error", selected > lookupProfileLimit);
   $("lookup-source-help").textContent = group ? `MFA device: ${group.mfa}${unavailable ? `. ${unavailable} ${unavailable === 1 ? "profile needs" : "profiles need"} role/source/MFA setup and cannot be searched.` : ""}` : "No profiles have the role, source credentials configuration, region, and MFA device required for lookup.";
   $("lookup-region-help").textContent = $("lookup-type").value === "s3" ? "S3 bucket lookup is global. A match shows the bucket’s verified region when available." : $("lookup-type").value === "route53" ? "Route 53 hosted zone lookup is global. Search by exact domain name, hosted zone ID, or ARN; individual DNS records are outside this search." : `${$("lookup-type").value === "load-balancer" ? "Includes Application, Network, Gateway, and Classic Load Balancers. " : ""}Searches only each selected profile’s configured region: role region, then source region, or us-east-1 by default. Other regions are outside this search.`;
-  $("lookup-query").placeholder = ({ ec2: "For example: i-0123456789abcdef0 or web-server", ebs: "For example: vol-0123456789abcdef0", "security-group": "For example: sg-0123456789abcdef0", vpc: "For example: vpc-0123456789abcdef0", s3: "For example: my-application-bucket", rds: "For example: production-database", lambda: "For example: process-orders", eks: "For example: production-cluster or cluster ARN", elasticache: "Cache cluster, replication group, or serverless cache ID / ARN", route53: "For example: example.com or Z0123456789ABC", "load-balancer": "For example: production-web or load balancer ARN" })[$("lookup-type").value] || "Exact resource name, ID, or ARN";
+  $("lookup-query").placeholder = ({ ec2: "For example: i-0123456789abcdef0 or web-server", ebs: "For example: vol-0123456789abcdef0", "security-group": "For example: sg-0123456789abcdef0", vpc: "For example: vpc-0123456789abcdef0", s3: "For example: my-application-bucket", rds: "For example: production-database", lambda: "For example: process-orders", eks: "For example: production-cluster or cluster ARN", elasticache: "Cache cluster, replication group, or serverless cache ID / ARN", route53: "For example: example.com or Z0123456789ABC", "load-balancer": "For example: production-web or load balancer ARN", "private-ip": "For example: 10.0.1.25" })[$("lookup-type").value] || "Exact resource name, ID, or ARN";
+  $("lookup-query-label").textContent = privateIp ? "Exact private IPv4 address" : "Exact ID, name, or ARN";
+  $("lookup-query-help").textContent = privateIp ? "One IPv4 address, without a subnet mask. IPv6, hostnames, and CIDR ranges are outside this search." : "Exact matches only. Up to 256 characters; no wildcard search.";
+  $("lookup-ip-help").hidden = !privateIp;
   for (const id of ["lookup-group", "lookup-type", "lookup-query", "lookup-mfa"]) $(id).disabled = locked || !group;
   for (const row of $("lookup-profiles").children) if (row.children[0]?.tagName === "INPUT") row.children[0].disabled = locked;
   $("lookup-select-all").disabled = locked || !group || total > lookupProfileLimit;
@@ -481,6 +485,25 @@ function renderLookupControls() {
 }
 
 function lookupText(value, limit = 1024) { return typeof value === "string" && value.length <= limit && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value); }
+
+function exactIpv4(value) {
+  return typeof value === "string" && /^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(value) && value.split(".").every((part) => Number(part) <= 255);
+}
+
+function validLookupNetwork(row, query) {
+  const network = row.network;
+  const fields = ["privateIpAddress", "vpcId", "subnetId", "interfaceType", "description", "instanceId", "instanceOwnerId", "requesterId", "requesterManaged"];
+  const clean = (value, maximum) => typeof value === "string" && value.length <= maximum && !/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value);
+  const id = (value, prefix) => typeof value === "string" && new RegExp(`^${prefix}-(?:[0-9a-f]{8}|[0-9a-f]{17})$`).test(value);
+  if (!network || typeof network !== "object" || Array.isArray(network) || Object.keys(network).length !== fields.length || !fields.every((field) => Object.hasOwn(network, field))) return false;
+  return exactIpv4(query) && network.privateIpAddress === query && id(row.resourceId, "eni")
+    && row.arn === `arn:aws:ec2:${row.region}:${row.accountId}:network-interface/${row.resourceId}`
+    && id(network.vpcId, "vpc") && id(network.subnetId, "subnet")
+    && clean(network.interfaceType, 128) && clean(network.description, 1024) && clean(network.requesterId, 256)
+    && (network.instanceId === "" || id(network.instanceId, "i"))
+    && clean(network.instanceOwnerId, 256)
+    && (network.requesterManaged === null || typeof network.requesterManaged === "boolean");
+}
 
 function validLookupSnapshot(snapshot, expected, id = null) {
   if (!snapshot || typeof snapshot.id !== "string" || !/^[a-f0-9]{32}$/.test(snapshot.id) || (id && snapshot.id !== id) || !["running", "complete", "error", "cancelled"].includes(snapshot.state) || snapshot.query !== expected.query || snapshot.resourceType !== expected.resourceType || !lookupText(snapshot.message, 2000)) return false;
@@ -501,6 +524,7 @@ function validLookupSnapshot(snapshot, expected, id = null) {
     const scope = scopes.get(row?.profile);
     if (!scope || row.accountId !== scope.accountId || row.resourceType !== expected.resourceType || ![row.region, row.resourceId, row.name, row.arn].every((value) => lookupText(value)) || !row.resourceId) return false;
     if (expected.resourceType === "route53" ? row.region !== "global" : expected.resourceType === "s3" ? !lookupRegion.test(row.region) && !["unknown", "global"].includes(row.region) : row.region !== scope.region) return false;
+    if (expected.resourceType === "private-ip" && !validLookupNetwork(row, expected.query)) return false;
   }
   if (snapshot.expiresAt != null && (typeof snapshot.expiresAt !== "string" || !Number.isFinite(Date.parse(snapshot.expiresAt)))) return false;
   return true;
@@ -510,7 +534,7 @@ function renderLookupSnapshot() {
   const snapshot = lookup.snapshot;
   const labels = { found: "Found", not_found: "No match", access_denied: "Access denied", auth_failed: "Authentication failed", error: "Check failed", skipped: "Not checked" };
   const status = $("lookup-status");
-  status.textContent = lookup.message || snapshot?.message || "Search AWS by an exact resource ID, name, or ARN. No lookup runs until you select Search resources.";
+  status.textContent = lookup.message || snapshot?.message || "Search AWS by an exact resource ID, name, ARN, or private IPv4 address. No lookup runs until you select Search resources.";
   status.classList.toggle("is-error", lookup.error || snapshot?.state === "error");
   status.setAttribute("role", lookup.error || snapshot?.state === "error" ? "alert" : "status");
   $("lookup-progress").textContent = snapshot ? `${snapshot.completed} of ${snapshot.total} profiles processed · ${snapshot.results.length} ${snapshot.results.length === 1 ? "match" : "matches"}${snapshot.state === "running" ? " · Searching" : ""}` : lookup.running ? "Starting read-only lookup…" : "";
@@ -536,9 +560,25 @@ function renderLookupSnapshot() {
     const row = makeElement("tr");
     row.append(makeElement("td", "lookup-mono", result.accountId), makeElement("td", "", result.profile), makeElement("td", "lookup-mono", result.region));
     const resource = makeElement("td");
+    if (result.resourceType === "private-ip") resource.append(makeElement("strong", "lookup-private-ip", `Private IPv4: ${result.network.privateIpAddress}`));
     resource.append(makeElement("code", "lookup-resource-id", result.resourceId));
     if (result.name && result.name !== result.resourceId) resource.append(makeElement("span", "lookup-resource-name", result.name));
     if (result.arn) resource.append(makeElement("code", "lookup-resource-arn", result.arn));
+    if (result.resourceType === "private-ip") {
+      const network = result.network;
+      const details = makeElement("dl", "lookup-network-details");
+      const addDetail = (label, value) => { details.append(makeElement("dt", "", label), makeElement("dd", "", value)); };
+      addDetail("VPC", network.vpcId);
+      addDetail("Subnet", network.subnetId);
+      if (network.instanceId) addDetail("Attached instance", network.instanceId);
+      if (network.instanceOwnerId) addDetail("Attachment owner", network.instanceOwnerId);
+      if (network.interfaceType) addDetail("Interface type", network.interfaceType);
+      if (network.description) addDetail("AWS description", network.description);
+      if (network.requesterId) addDetail("Requester", network.requesterId);
+      addDetail("Requester managed", network.requesterManaged === null ? "Unknown" : network.requesterManaged ? "Yes" : "No");
+      resource.append(details);
+      if (!network.instanceId) resource.append(makeElement("p", "lookup-network-note", "No attached instance is reported. A specific parent resource is not identified by this network-interface response; use the service details above as clues."));
+    }
     row.append(resource);
     rows.push(row);
   }
@@ -624,6 +664,13 @@ async function searchResources(event) {
   if (!profiles.length || profiles.length > lookupProfileLimit || !lookupTypes.has(resourceType) || !query || query.length > 256 || /[\x00-\x1f\x7f]/.test(query)) {
     mfaCode = "";
     lookup.message = `Select 1–${lookupProfileLimit} profiles and a resource type, then enter an exact ID, name, or ARN of up to 256 characters. Wildcard searches are not supported.`;
+    lookup.error = true;
+    renderLookupSnapshot();
+    return;
+  }
+  if (resourceType === "private-ip" && !exactIpv4(query)) {
+    mfaCode = "";
+    lookup.message = "Enter one exact IPv4 address, such as 10.0.1.25. Hostnames, IPv6, CIDR ranges, and leading-zero octets are not supported.";
     lookup.error = true;
     renderLookupSnapshot();
     return;

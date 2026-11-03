@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from ipaddress import IPv4Address
 import json
 import re
 import secrets
@@ -30,6 +31,7 @@ READ_ACTIONS = {
     "ebs": ["ec2:DescribeVolumes"],
     "security-group": ["ec2:DescribeSecurityGroups"],
     "vpc": ["ec2:DescribeVpcs"],
+    "private-ip": ["ec2:DescribeNetworkInterfaces"],
     "s3": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
     "rds": ["rds:DescribeDBInstances"],
     "lambda": ["lambda:GetFunctionConfiguration"],
@@ -114,6 +116,15 @@ def parse_query(resource_type, query):
     if not isinstance(resource_type, str) or resource_type not in READ_ACTIONS or not _text(query) or query != query.strip():
         raise LookupError("Choose a supported resource type and enter an exact name, ID, or ARN using at most 256 single-line characters.")
     result = {"query": query, "value": query, "account": None, "region": None, "arn": None}
+    if resource_type == "private-ip":
+        # Search the AWS private-address field, not a DNS name or network range.
+        # VPCs can use IPv4 ranges outside RFC 1918, so do not use is_private.
+        try:
+            if str(IPv4Address(query)) != query:
+                raise ValueError
+        except ValueError:
+            raise LookupError("Enter one IPv4 address, such as 10.0.1.25, without a CIDR prefix, hostname, or ARN.") from None
+        return result
     if query.startswith("arn:"):
         parts = query.split(":", 5)
         if len(parts) != 6 or parts[:2] != ["arn", "aws"]:
@@ -390,6 +401,76 @@ def _ec2(client, selected, resource_type, query, rows, deadline):
                 if matched:
                     arn = f"arn:aws:ec2:{selected['region']}:{account}:{kind}/{resource_id}"
                     _add(rows, _row(selected, resource_type, resource_id, name or group_name, arn))
+
+
+def _private_ip(client, selected, query, rows, deadline):
+    account = selected["role_arn"].split(":")[4]
+    address = query["value"]
+    parameters = {"Filters": [{"Name": "addresses.private-ip-address", "Values": [address]}], "MaxResults": PAGE_SIZE}
+
+    def metadata_text(item, key, maximum=256):
+        value = item.get(key, "")
+        if not _text(value, maximum, empty=True):
+            raise ScanError("error", MESSAGES["invalid_response"])
+        return value
+
+    def identifier(item, key, prefix, *, optional=False):
+        value = metadata_text(item, key)
+        if not (optional and not value) and not re.fullmatch(_id_pattern(prefix), value):
+            raise ScanError("error", MESSAGES["invalid_response"])
+        return value
+
+    for page in _pages(client, "describe_network_interfaces", parameters, deadline):
+        interfaces = _list(page, "NetworkInterfaces")
+        if len(interfaces) > MAX_PAGE_ITEMS:
+            raise ScanError("error", MESSAGES["limit"])
+        for item in interfaces:
+            if not _owned_by(item, account):
+                continue
+            addresses = _list(item, "PrivateIpAddresses") if "PrivateIpAddresses" in item else []
+            if len(addresses) > MAX_PAGE_ITEMS:
+                raise ScanError("error", MESSAGES["limit"])
+            reported = [entry.get("PrivateIpAddress") for entry in addresses]
+            if "PrivateIpAddress" in item:
+                reported.append(item["PrivateIpAddress"])
+            if not reported:
+                raise ScanError("error", MESSAGES["invalid_response"])
+            for value in reported:
+                try:
+                    if not isinstance(value, str) or str(IPv4Address(value)) != value:
+                        raise ValueError
+                except ValueError:
+                    raise ScanError("error", MESSAGES["invalid_response"]) from None
+            if address not in reported:
+                continue
+            interface_id = identifier(item, "NetworkInterfaceId", "eni")
+            attachment = item.get("Attachment", {})
+            if not isinstance(attachment, dict):
+                raise ScanError("error", MESSAGES["invalid_response"])
+            # Managed interfaces can report a service alias such as amazon-aws.
+            # This is display metadata; only OwnerId establishes account scope.
+            instance_owner = metadata_text(attachment, "InstanceOwnerId")
+            managed = item.get("RequesterManaged")
+            if managed is not None and not isinstance(managed, bool):
+                raise ScanError("error", MESSAGES["invalid_response"])
+            network = {
+                "privateIpAddress": address,
+                "vpcId": identifier(item, "VpcId", "vpc"),
+                "subnetId": identifier(item, "SubnetId", "subnet"),
+                "interfaceType": metadata_text(item, "InterfaceType", 128),
+                "description": metadata_text(item, "Description", 1024),
+                "instanceId": identifier(attachment, "InstanceId", "i", optional=True),
+                "instanceOwnerId": instance_owner,
+                "requesterId": metadata_text(item, "RequesterId"),
+                "requesterManaged": managed,
+            }
+            # ENI tags are named TagSet by EC2. Descriptions and requester IDs
+            # are returned as hints, never converted into an inferred parent ARN.
+            name = _name_tag({"Tags": item.get("TagSet", [])})
+            row = _row(selected, "private-ip", interface_id, name,
+                       f"arn:aws:ec2:{selected['region']}:{account}:network-interface/{interface_id}")
+            row["network"] = network
+            _add(rows, row)
 
 
 def _s3(client, selected, query, rows, deadline):
@@ -734,10 +815,12 @@ def scan(config_file, payload, emit):
                     if resource_type == "load-balancer":
                         _load_balancers(session, config_class, selected, query, rows, deadline, credentials)
                     else:
-                        service = "ec2" if resource_type in EC2_TYPES else resource_type
+                        service = "ec2" if resource_type in EC2_TYPES or resource_type == "private-ip" else resource_type
                         with closing(_client(session, config_class, service, selected["region"], credentials)) as client:
                             if resource_type in EC2_TYPES:
                                 _ec2(client, selected, resource_type, query, rows, deadline)
+                            elif resource_type == "private-ip":
+                                _private_ip(client, selected, query, rows, deadline)
                             elif resource_type == "s3":
                                 _s3(client, selected, query, rows, deadline)
                             elif resource_type == "rds":

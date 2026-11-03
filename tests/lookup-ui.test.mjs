@@ -25,6 +25,14 @@ function check(index, status, message = status) {
 function result(index = 0, extra = {}) {
   return { profile: profiles[index].profile, accountId: profiles[index].role_arn.match(/::([0-9]{12}):/)[1], region: profiles[index].region, resourceType: 'ec2', resourceId: 'i-0123456789abcdef0', name: 'example-server', arn: '', ...extra };
 }
+function networkResult(index = 0, network = {}, extra = {}) {
+  const row = result(index, { resourceType: 'private-ip', resourceId: 'eni-0123456789abcdef0', name: 'application-interface' });
+  return { ...row, arn: `arn:aws:ec2:${row.region}:${row.accountId}:network-interface/${row.resourceId}`,
+    network: { privateIpAddress: '10.0.1.25', vpcId: 'vpc-0123456789abcdef0', subnetId: 'subnet-0123456789abcdef0',
+      interfaceType: 'interface', description: 'Application network interface', instanceId: 'i-0123456789abcdef0',
+      instanceOwnerId: row.accountId, requesterId: row.accountId, requesterManaged: false, ...network }, ...extra };
+}
+function allText(element) { return [element.textContent, ...element.children.map(allText)].join('\n'); }
 function cliResult() {
   const values = { AWS_ACCESS_KEY_ID: 'TEST_KEY', AWS_SECRET_ACCESS_KEY: 'TEST_SECRET', AWS_SESSION_TOKEN: 'TEST_TOKEN', AWS_REGION: 'us-east-1', AWS_DEFAULT_REGION: 'us-east-1' };
   return { profile: profiles[0], roleArn: profiles[0].role_arn, expiration: new Date(START_TIME + 3600_000).toISOString(), commands: { posix: Object.entries(values).map(([key, value]) => `export ${key}='${value}'`).join('\n'), powershell: Object.entries(values).map(([key, value]) => `$Env:${key} = '${value}'`).join('\n') } };
@@ -390,6 +398,101 @@ test('Load balancer lookup sends its exact name or ARN and displays matches in t
     assert.equal(row.children[3].children[1].textContent, arn);
     assert.equal(ui.get('lookup-mfa').value, '');
     assert.match(ui.get('lookup-checks').children[1].children[1].textContent, /eu-west-1/);
+  }
+});
+
+test('Private IPv4 lookup sends selected profiles and renders every matching interface with its network and attachment', async () => {
+  assert.ok(html.includes('<option value="private-ip">Private IPv4 address</option>'));
+  const rows = [networkResult(), networkResult(1, { vpcId: 'vpc-abcdef0123456789a' })];
+  const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'private-ip', query: '10.0.1.25',
+    results: rows, checks: [check(0, 'found'), check(1, 'found')] })) });
+  ui.get('lookup-type').value = 'private-ip';
+  ui.get('lookup-type').dispatch('change');
+  assert.equal(ui.get('lookup-query-label').textContent, 'Exact private IPv4 address');
+  assert.match(ui.get('lookup-query').placeholder, /10\.0\.1\.25/);
+  assert.match(ui.get('lookup-query-help').textContent, /IPv6, hostnames, and CIDR/);
+  assert.equal(ui.get('lookup-ip-help').hidden, false);
+  assert.match(html, /individually assigned primary and secondary.*visible network interfaces/);
+  assert.match(html, /shared interfaces may not identify a unique parent/);
+  assert.match(html, /Delegated prefixes and pod inventories are outside/);
+  await ui.search({ type: 'private-ip', query: ' 10.0.1.25 ' });
+  assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'private-ip', query: '10.0.1.25', mfaCode: '000123' });
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.equal(ui.get('lookup-results-body').children.length, 2);
+  for (let index = 0; index < 2; index++) {
+    const row = ui.get('lookup-results-body').children[index];
+    assert.equal(row.children[0].textContent, rows[index].accountId);
+    assert.equal(row.children[2].textContent, rows[index].region);
+    const text = allText(row.children[3]);
+    for (const value of ['Private IPv4: 10.0.1.25', rows[index].resourceId, rows[index].network.vpcId,
+      rows[index].network.subnetId, 'Attached instance', rows[index].network.instanceId, 'Attachment owner',
+      rows[index].network.instanceOwnerId, 'AWS description', 'Application network interface']) assert.ok(text.includes(value), value);
+    assert.doesNotMatch(text, /No attached instance/);
+  }
+  ui.get('lookup-type').value = 'ec2';
+  ui.get('lookup-type').dispatch('change');
+  assert.equal(ui.get('lookup-ip-help').hidden, true);
+  assert.equal(ui.get('lookup-query-label').textContent, 'Exact ID, name, or ARN');
+  assert.match(ui.get('lookup-query').placeholder, /i-0123456789abcdef0/);
+  assert.equal(ui.get('lookup-results-body').children.length, 0);
+  assert.equal(ui.get('lookup-results-panel').hidden, true);
+});
+
+test('Private IPv4 requires a canonical single address but permits custom VPC ranges', async () => {
+  const ui = await app({ start: (options) => {
+    const { query, resourceType } = JSON.parse(options.body);
+    return response(snapshot({ state: 'complete', resourceType, query, checks: [check(0, 'not_found'), check(1, 'not_found')] }));
+  } });
+  for (const query of ['10.0.1.256', '10.0.1', '10.00.1.25', '010.0.1.25', '10.0.1.25/32', '10.0.1.25/24', 'db.internal', '::1', '2001:db8::1', '10.0.1.25:80', '10.0.1.25,10.0.1.26']) {
+    await ui.search({ type: 'private-ip', query });
+    assert.match(ui.get('lookup-status').textContent, /one exact IPv4 address/);
+    assert.equal(ui.get('lookup-mfa').value, '');
+  }
+  assert.equal(ui.requests.length, 1);
+  for (const query of ['10.0.1.25', '172.16.0.1', '192.168.1.1', '100.64.0.1', '198.19.0.1']) {
+    await ui.search({ type: 'private-ip', query });
+    assert.equal(JSON.parse(ui.requests.at(-1).options.body).query, query);
+    assert.doesNotMatch(ui.get('lookup-status').textContent, /invalid lookup response/);
+  }
+});
+
+test('Private IPv4 service clues are text-only, retain service attachment owners, and explain unknown parents', async () => {
+  const markup = '<img src=x onerror=alert(1)>';
+  for (const requesterManaged of [true, null]) {
+    const row = networkResult(0, { interfaceType: 'network_load_balancer', instanceId: '', instanceOwnerId: 'amazon-aws',
+      description: markup, requesterId: markup, requesterManaged }, { name: markup });
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'private-ip', query: '10.0.1.25',
+      results: [row], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    await ui.search({ type: 'private-ip', query: '10.0.1.25' });
+    const cell = ui.get('lookup-results-body').children[0].children[3];
+    const details = cell.children.find((element) => element.tagName === 'DL');
+    assert.equal(details.children[5].textContent, 'amazon-aws');
+    assert.equal(details.children[9].textContent, markup);
+    assert.equal(details.children[11].textContent, markup);
+    assert.equal(details.children.at(-1).textContent, requesterManaged ? 'Yes' : 'Unknown');
+    assert.ok(details.children.every((element) => element.children.length === 0));
+    assert.match(allText(cell), /specific parent resource is not identified/);
+    assert.equal(cell.children[2].textContent, markup);
+  }
+});
+
+test('Private IPv4 rejects malformed or mismatched network metadata before rendering', async () => {
+  const networkCases = [{ privateIpAddress: '10.0.1.26' }, { vpcId: '' }, { subnetId: 'subnet-invalid' },
+    { instanceId: 'i-invalid' }, { instanceOwnerId: 123456789012 }, { instanceOwnerId: 'x'.repeat(257) },
+    { requesterId: 'x'.repeat(257) }, { requesterManaged: 'true' }, { requesterManaged: 1 },
+    { interfaceType: 'x'.repeat(129) }, { description: 'x'.repeat(1025) }, { description: 'line\nline' },
+    { requesterId: 'bad\u0085value' }, { description: '\ud800' }, { extraSecret: 'unexpected' }];
+  const cases = networkCases.map((network) => networkResult(0, network));
+  cases.push(networkResult(0, {}, { network: undefined }), networkResult(0, {}, { network: [] }),
+    networkResult(0, {}, { resourceId: 'i-0123456789abcdef0' }), networkResult(0, {}, { arn: 'arn:aws:ec2:us-east-1:222222222222:network-interface/eni-0123456789abcdef0' }),
+    networkResult(0, {}, { region: 'eu-west-1' }));
+  const missing = networkResult(); delete missing.network.requesterManaged; cases.push(missing);
+  for (const row of cases) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'private-ip', query: '10.0.1.25',
+      results: [row], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    await ui.search({ type: 'private-ip', query: '10.0.1.25' });
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
   }
 });
 

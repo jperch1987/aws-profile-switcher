@@ -2,6 +2,7 @@
 """Resource lookup tests use only mocked AWS clients and synthetic metadata."""
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import io
 import json
@@ -50,6 +51,17 @@ def ec2_response(instance_id=INSTANCE, name="example", account=ACCOUNT):
     return {"Reservations": [{"OwnerId": account, "Instances": [{"InstanceId": instance_id, "Tags": [{"Key": "Name", "Value": name}], "PrivateSecretField": "PRIVATE"}]}]}
 
 
+def network_interface(**changes):
+    item = {"NetworkInterfaceId": "eni-0123456789abcdef0", "OwnerId": ACCOUNT,
+            "VpcId": "vpc-0123456789abcdef0", "SubnetId": "subnet-0123456789abcdef0",
+            "PrivateIpAddress": "10.0.1.25", "PrivateIpAddresses": [{"PrivateIpAddress": "10.0.1.25", "Primary": True}],
+            "InterfaceType": "interface", "Description": "Primary interface", "RequesterManaged": False,
+            "RequesterId": ACCOUNT, "Attachment": {"InstanceId": INSTANCE, "InstanceOwnerId": ACCOUNT},
+            "TagSet": [{"Key": "Name", "Value": "web-interface"}], "IgnoredSecret": "PRIVATE"}
+    item.update(changes)
+    return item
+
+
 class LookupTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -66,6 +78,7 @@ class LookupTests(unittest.TestCase):
         self.resource.describe_volumes.return_value = {"Volumes": []}
         self.resource.describe_security_groups.return_value = {"SecurityGroups": []}
         self.resource.describe_vpcs.return_value = {"Vpcs": []}
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": []}
         self.elbv2 = Mock()
         self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": []}
         self.elb = Mock()
@@ -217,6 +230,162 @@ class LookupTests(unittest.TestCase):
         calls = self.resource.describe_instances.call_args_list
         self.assertEqual(calls[0].kwargs, {"Filters": [{"Name": "tag:Name", "Values": ["prod"]}], "MaxResults": 100})
         self.assertEqual(calls[1].kwargs["NextToken"], "TEST_NEXT_PAGE")
+
+    def test_private_ip_input_is_one_canonical_ipv4_literal_before_authentication(self):
+        for query in ["10.0.1.25", "172.16.0.5", "192.168.10.8", "100.64.0.1", "198.19.0.1"]:
+            self.assertEqual(lookup.parse_query("private-ip", query)["value"], query)
+        for query in ["10.00.1.25", "10.0.1.256", "10.1", "10.0.1.25/32", "10.0.1.*", "server.internal",
+                      "http://10.0.1.25", "::1", "2001:db8::1", "::ffff:10.0.1.25", " 10.0.1.25",
+                      "arn:aws:ec2:us-east-1:111111111111:network-interface/eni-01234567", "12345"]:
+            with self.subTest(query=query), self.assertRaises(lookup.LookupError):
+                self.scan(request("private-ip", query))
+        self.sdk.assert_not_called()
+
+    def test_private_ip_primary_match_returns_allowlisted_eni_metadata_and_restricted_policy(self):
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [network_interface()]}
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["results"], [{"profile": "dev", "accountId": ACCOUNT, "region": REGION,
+            "resourceType": "private-ip", "resourceId": "eni-0123456789abcdef0", "name": "web-interface",
+            "arn": f"arn:aws:ec2:{REGION}:{ACCOUNT}:network-interface/eni-0123456789abcdef0",
+            "network": {"privateIpAddress": "10.0.1.25", "vpcId": "vpc-0123456789abcdef0",
+                "subnetId": "subnet-0123456789abcdef0", "interfaceType": "interface", "description": "Primary interface",
+                "instanceId": INSTANCE, "instanceOwnerId": ACCOUNT, "requesterId": ACCOUNT, "requesterManaged": False}}])
+        self.resource.describe_network_interfaces.assert_called_once_with(
+            Filters=[{"Name": "addresses.private-ip-address", "Values": ["10.0.1.25"]}], MaxResults=100)
+        policy = json.loads(self.sts.assume_role.call_args.kwargs["Policy"])
+        self.assertEqual(policy["Statement"][0]["Action"], ["ec2:DescribeNetworkInterfaces"])
+        self.assertEqual(self.clients[-1][0], "ec2")
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.describe_instances.assert_not_called()
+
+    def test_private_ip_secondary_match_preserves_overlapping_vpcs_and_deduplicates_pages(self):
+        first = network_interface(PrivateIpAddress="10.0.1.10", PrivateIpAddresses=[
+            {"PrivateIpAddress": "10.0.1.10", "Primary": True}, {"PrivateIpAddress": "10.0.1.25", "Primary": False}])
+        second = network_interface(NetworkInterfaceId="eni-11111111111111111", VpcId="vpc-11111111111111111")
+        self.resource.describe_network_interfaces.side_effect = [
+            {"NetworkInterfaces": [first], "NextToken": "PAGE_TWO"}, {"NetworkInterfaces": [first, second]}]
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 2)
+        self.assertEqual({row["network"]["vpcId"] for row in event["results"]}, {first["VpcId"], second["VpcId"]})
+        self.assertEqual(self.resource.describe_network_interfaces.call_args_list[1].kwargs,
+            {"Filters": [{"Name": "addresses.private-ip-address", "Values": ["10.0.1.25"]}], "MaxResults": 100, "NextToken": "PAGE_TWO"})
+
+    def test_private_ip_filters_are_rechecked_and_public_ip_is_never_a_match(self):
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [
+            network_interface(OwnerId="999999999999"),
+            network_interface(PrivateIpAddress="10.0.1.26", PrivateIpAddresses=[{"PrivateIpAddress": "10.0.1.26"}],
+                              Association={"PublicIp": "10.0.1.25"}),
+            network_interface(PrivateIpAddress="10.0.1.27", PrivateIpAddresses=[
+                {"PrivateIpAddress": "10.0.1.27", "Association": {"PublicIp": "10.0.1.25"}}])
+        ]}
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "not_found")
+        self.assertEqual(event["results"], [])
+
+    def test_private_ip_service_metadata_is_a_hint_without_inferred_parent_identity(self):
+        item = network_interface(InterfaceType="lambda", Description="AWS Lambda VPC ENI shared by functions",
+                                 RequesterId="amazon-aws", RequesterManaged=True, Attachment={})
+        item.pop("TagSet")
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [item]}
+        row = self.scan(request("private-ip", "10.0.1.25"))[0]["results"][0]
+        self.assertEqual(row["name"], "")
+        self.assertEqual(row["network"]["instanceId"], "")
+        self.assertEqual(row["network"]["instanceOwnerId"], "")
+        self.assertEqual(row["network"]["requesterId"], "amazon-aws")
+        self.assertEqual(row["network"]["interfaceType"], "lambda")
+        self.assertTrue(row["arn"].endswith("network-interface/eni-0123456789abcdef0"))
+        for key in ["InterfaceType", "Description", "RequesterId", "RequesterManaged", "Attachment", "PrivateIpAddresses"]:
+            item.pop(key, None)
+        row = self.scan(request("private-ip", "10.0.1.25"))[0]["results"][0]
+        self.assertIsNone(row["network"]["requesterManaged"])
+        self.assertEqual(row["network"]["description"], "")
+
+    def test_private_ip_nlb_service_owner_alias_without_instance_id_is_a_match(self):
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [network_interface(
+            InterfaceType="network_load_balancer", Description="ELB net/example/0123456789abcdef",
+            Attachment={"InstanceOwnerId": "amazon-aws"}, RequesterId="amazon-elb", RequesterManaged=True)]}
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        network = event["results"][0]["network"]
+        self.assertEqual(network["instanceOwnerId"], "amazon-aws")
+        self.assertEqual(network["instanceId"], "")
+        self.assertEqual(network["interfaceType"], "network_load_balancer")
+
+    def test_private_ip_rejects_malformed_returned_metadata_safely(self):
+        changes = [{"OwnerId": "wrong"}, {"NetworkInterfaceId": "i-01234567"}, {"VpcId": "wrong"},
+            {"SubnetId": "wrong"}, {"PrivateIpAddress": "10.00.1.25"}, {"PrivateIpAddresses": "bad"},
+            {"PrivateIpAddresses": [{"PrivateIpAddress": None}]}, {"PrivateIpAddresses": [False]},
+            {"InterfaceType": []}, {"Description": "PRIVATE\nTOKEN"}, {"Description": "x" * 1025},
+            {"RequesterId": "x" * 257}, {"RequesterManaged": "false"}, {"Attachment": []},
+            {"Attachment": {"InstanceId": "bad"}}, {"Attachment": {"InstanceOwnerId": "x" * 257}},
+            {"TagSet": "bad"}, {"TagSet": [{"Key": "Name", "Value": "PRIVATE\nTOKEN"}]}]
+        for change in changes:
+            with self.subTest(change=change):
+                self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [network_interface(**change)]}
+                event = self.scan(request("private-ip", "10.0.1.25"))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(event["results"], [])
+                self.assertNotIn("PRIVATE", json.dumps(event))
+
+    def test_private_ip_denied_later_page_retains_confirmed_results_and_safe_failure(self):
+        self.resource.describe_network_interfaces.side_effect = [
+            {"NetworkInterfaces": [network_interface()], "NextToken": "PAGE_TWO"}, aws_error("UnauthorizedOperation")]
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.describe_network_interfaces.side_effect = aws_error("UnauthorizedOperation")
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertEqual(event["results"], [])
+
+    def test_private_ip_missing_returned_ipv4_evidence_is_incomplete(self):
+        item = network_interface()
+        item.pop("PrivateIpAddress")
+        item.pop("PrivateIpAddresses")
+        for extra in [{}, {"PrivateIpAddresses": []}]:
+            self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [{**item, **extra}]}
+            event = self.scan(request("private-ip", "10.0.1.25"))[0]
+            self.assertEqual(event["check"]["status"], "error")
+            self.assertEqual(event["results"], [])
+
+    def test_private_ip_page_result_and_response_limits_keep_partial_results(self):
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [network_interface()], "NextToken": "PAGE_TWO"}
+        with patch.object(lookup, "MAX_PAGES", 1):
+            event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": [
+            network_interface(), network_interface(NetworkInterfaceId="eni-11111111111111111")]}
+        with patch.object(lookup, "MAX_RESULTS", 1):
+            event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        with patch.object(lookup, "MAX_PAGE_ITEMS", 1):
+            event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(event["results"], [])
+
+    def test_private_ip_repeated_token_and_bad_later_metadata_are_incomplete(self):
+        first = {"NetworkInterfaces": [network_interface()], "NextToken": "REPEAT"}
+        self.resource.describe_network_interfaces.return_value = first
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        second = deepcopy(first)
+        second["NetworkInterfaces"][0]["VpcId"] = "INVALID"
+        self.resource.describe_network_interfaces.side_effect = [first, second]
+        event = self.scan(request("private-ip", "10.0.1.25"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+
+    def test_private_ip_expired_deadline_prevents_network_read(self):
+        with self.assertRaises(lookup.ScanError) as raised:
+            lookup._private_ip(self.resource, selected(), lookup.parse_query("private-ip", "10.0.1.25"), [], 0)
+        self.assertEqual(raised.exception.status, "skipped")
+        self.resource.describe_network_interfaces.assert_not_called()
 
     def test_wrong_owner_resources_do_not_become_matches(self):
         self.resource.describe_instances.return_value = ec2_response(account="999999999999")
