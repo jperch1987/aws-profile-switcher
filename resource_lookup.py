@@ -64,6 +64,7 @@ MESSAGES = {
     "deadline": "The scan time limit was reached. This profile was not fully checked.",
     "arn_scope": "Skipped because the resource ARN belongs to a different account or region.",
     "invalid_response": "AWS returned unexpected resource metadata. This check is incomplete.",
+    "inventory_not_found": "An unfiltered load balancer inventory request unexpectedly reported no such resource. This check is incomplete.",
 }
 
 
@@ -112,10 +113,48 @@ def _dns_name(value):
     return None
 
 
+def _load_balancer_dns_name(value):
+    """Normalize an AWS-generated regional ELB hostname without resolving it."""
+    if not _text(value, 254) or not value.isascii():
+        return None
+    normalized = value.removesuffix(".").lower()
+    if not 1 <= len(normalized) <= 253:
+        return None
+    labels = normalized.split(".")
+    if len(labels) == 6 and labels[0] == "dualstack":
+        labels = labels[1:]
+    if (len(labels) != 5 or labels[-2:] != ["amazonaws", "com"]
+            or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)):
+        return None
+    if labels[1] == "elb":
+        region = labels[2]
+    elif labels[2] == "elb":
+        region = labels[1]
+    else:
+        return None
+    if not aws_session.REGION_PATTERN.fullmatch(region):
+        return None
+    return normalized, region
+
+
+def _load_balancer_dns_matches(query_dns, returned_dns, allow_alias):
+    if query_dns == returned_dns:
+        return True
+    # Route 53 documents this prefix for Application and Classic Load Balancers.
+    # The API response's validated type decides whether alias matching is valid.
+    return allow_alias and query_dns.removeprefix("dualstack.") == returned_dns.removeprefix("dualstack.")
+
+
 def parse_query(resource_type, query):
     if not isinstance(resource_type, str) or resource_type not in READ_ACTIONS or not _text(query) or query != query.strip():
         raise LookupError("Choose a supported resource type and enter an exact name, ID, or ARN using at most 256 single-line characters.")
     result = {"query": query, "value": query, "account": None, "region": None, "arn": None}
+    if resource_type == "load-balancer" and not query.startswith("arn:") and not re.fullmatch(LOAD_BALANCER_NAME, query):
+        dns = _load_balancer_dns_name(query)
+        if dns is None:
+            raise LookupError("Enter an exact load balancer name, ARN, or AWS-generated hostname. Use the base hostname without a URL, port, path, wildcard, or custom domain.")
+        result.update(value=dns[0], dnsName=dns[0])
+        return result
     if resource_type == "private-ip":
         # Search the AWS private-address field, not a DNS name or network range.
         # VPCs can use IPv4 ranges outside RFC 1918, so do not use is_private.
@@ -586,11 +625,15 @@ def _elasticache(client, selected, query, rows, deadline):
 
 
 def _load_balancer_family(client, family, selected, query, rows, deadline):
+    dns_query = query.get("dnsName")
+    parameters = {}
     if family == "elbv2":
-        parameters = {"LoadBalancerArns": [query["arn"]]} if query["arn"] else {"Names": [query["value"]]}
+        if not dns_query:
+            parameters = {"LoadBalancerArns": [query["arn"]]} if query["arn"] else {"Names": [query["value"]]}
         response_key = "LoadBalancers"
     else:
-        parameters = {"LoadBalancerNames": [query["value"]]}
+        if not dns_query:
+            parameters = {"LoadBalancerNames": [query["value"]]}
         response_key = "LoadBalancerDescriptions"
     parameters["PageSize"] = PAGE_SIZE
     account = selected["role_arn"].split(":")[4]
@@ -600,7 +643,7 @@ def _load_balancer_family(client, family, selected, query, rows, deadline):
             raise ScanError("error", MESSAGES["limit"])
         for balancer in balancers:
             name = balancer.get("LoadBalancerName")
-            if name != query["value"]:
+            if not isinstance(name, str) or not re.fullmatch(LOAD_BALANCER_NAME, name) or (not dns_query and name != query["value"]):
                 raise ScanError("error", MESSAGES["invalid_response"])
             if family == "elbv2":
                 arn = balancer.get("LoadBalancerArn")
@@ -618,7 +661,23 @@ def _load_balancer_family(client, family, selected, query, rows, deadline):
                 # resources, without an ARN. Construct the documented ARN only
                 # after the exact name is confirmed by that authenticated call.
                 arn = f"arn:aws:elasticloadbalancing:{selected['region']}:{account}:loadbalancer/{name}"
-            _add(rows, _row(selected, "load-balancer", name, name, arn))
+            raw_dns = balancer.get("DNSName")
+            dns = None
+            if raw_dns is not None and raw_dns != "":
+                dns = _load_balancer_dns_name(raw_dns)
+                if dns is None or dns[1] != selected["region"]:
+                    raise ScanError("error", MESSAGES["invalid_response"])
+            if dns_query:
+                if dns is None:
+                    if family == "elbv2" and balancer.get("Type") == "gateway":
+                        continue  # Gateway Load Balancers do not expose a DNS name.
+                    raise ScanError("error", MESSAGES["invalid_response"])
+                if not _load_balancer_dns_matches(dns_query, dns[0], family == "elb" or balancer.get("Type") == "application"):
+                    continue
+            row = _row(selected, "load-balancer", name, name, arn)
+            if dns is not None:
+                row["dnsName"] = dns[0]
+            _add(rows, row)
 
 
 def _load_balancer_failure(error, stage):
@@ -679,7 +738,7 @@ def _load_balancers(session, config_class, selected, query, rows, deadline, cred
     explanations = []
     families = [query["kind"]] if query.get("kind") else ["elbv2", "elb"]
     for family in families:
-        if family == "elbv2" and query["value"].startswith("internal-"):
+        if family == "elbv2" and not query.get("dnsName") and query["value"].startswith("internal-"):
             continue  # Reserved by ELBv2, but valid for Classic Load Balancers.
         stage = "client"
         try:
@@ -689,7 +748,9 @@ def _load_balancers(session, config_class, selected, query, rows, deadline, cred
         except Exception as error:
             current = _scan_failure(error)
             if current.status == "not_found":
-                continue
+                if not query.get("dnsName"):
+                    continue
+                error = ScanError("error", MESSAGES["inventory_not_found"])
             current = _load_balancer_failure(error, stage)
             explanations.append(f"{LOAD_BALANCER_FAMILIES[family]}: {current.safe_message}")
             if current.status in {"auth_failed", "skipped"}:

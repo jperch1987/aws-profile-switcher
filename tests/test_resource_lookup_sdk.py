@@ -97,6 +97,29 @@ class ResourceLookupSdkTests(unittest.TestCase):
                             lookup.parse_query("load-balancer", "test-lb"), [], float("inf"))
                     self.assertEqual(lookup._scan_failure(raised.exception).status, "not_found")
 
+    def test_real_sdk_dns_inventory_uses_only_page_controls_for_both_families(self):
+        hostname = "internal-api-edge-123456.us-east-1.elb.amazonaws.com"
+        for family, result_key in [("elbv2", "LoadBalancers"), ("elb", "LoadBalancerDescriptions")]:
+            with self.subTest(family=family):
+                client = self.client(family)
+                item = {"LoadBalancerName": "actual-resource-name", "DNSName": hostname.upper() + "."}
+                first_items = []
+                if family == "elbv2":
+                    item.update(LoadBalancerArn="arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/actual-resource-name/0123456789abcdef", Type="application")
+                    first_items = [{"LoadBalancerName": "gateway", "Type": "gateway",
+                        "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/gwy/gateway/0123456789abcdef"}]
+                with Stubber(client) as stub:
+                    stub.add_response("describe_load_balancers", {result_key: first_items, "NextMarker": "PAGE_TWO"}, {"PageSize": 100})
+                    stub.add_response("describe_load_balancers", {result_key: [item]}, {"PageSize": 100, "Marker": "PAGE_TWO"})
+                    rows = []
+                    lookup._load_balancer_family(client, family, self.selected,
+                        lookup.parse_query("load-balancer", hostname), rows, float("inf"))
+                    stub.assert_no_pending_responses()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["accountId"], "111111111111")
+                    self.assertEqual(rows[0]["name"], "actual-resource-name")
+                    self.assertEqual(rows[0]["dnsName"], hostname)
+
     def test_real_sdk_private_ip_filter_secondary_address_pagination_and_service_metadata(self):
         client = self.client("ec2")
         self.assertEqual(client.meta.endpoint_url, "https://ec2.us-east-1.amazonaws.com")

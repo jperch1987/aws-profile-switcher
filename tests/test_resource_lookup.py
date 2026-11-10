@@ -736,12 +736,12 @@ class LookupTests(unittest.TestCase):
     def modern_balancer(self, kind="app", name="example-lb", **changes):
         result = {"LoadBalancerName": name,
             "LoadBalancerArn": f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/{kind}/{name}/0123456789abcdef",
-            "Type": lookup.LOAD_BALANCER_TYPES[kind], "DNSName": "PRIVATE", "SecurityGroups": ["PRIVATE"]}
+            "Type": lookup.LOAD_BALANCER_TYPES[kind], "SecurityGroups": ["PRIVATE"]}
         result.update(changes)
         return result
 
     def classic_balancer(self, name="example-lb"):
-        return {"LoadBalancerName": name, "DNSName": "PRIVATE", "ListenerDescriptions": [{"PRIVATE": "PRIVATE"}],
+        return {"LoadBalancerName": name, "ListenerDescriptions": [{"PRIVATE": "PRIVATE"}],
             "SourceSecurityGroup": {"OwnerAlias": "amazon-elb", "GroupName": "PRIVATE"}}
 
     def test_load_balancer_modern_types_confirm_exact_arn_and_only_query_v2(self):
@@ -1027,6 +1027,189 @@ class LookupTests(unittest.TestCase):
         self.assertIn("Application/Network/Gateway:", message)
         self.assertIn("Classic:", message)
         self.assertLessEqual(len(message), 500)
+
+    def test_load_balancer_dns_queries_normalize_case_and_one_root_dot(self):
+        for hostname in ["internal-prod-api-edge-123456.us-east-1.elb.amazonaws.com",
+            "prod-api-edge-0123456789abcdef.elb.us-east-1.amazonaws.com",
+            "dualstack.prod-api-edge-123456.us-east-1.elb.amazonaws.com"]:
+            parsed = lookup.parse_query("load-balancer", hostname.upper() + ".")
+            self.assertEqual(parsed["dnsName"], hostname)
+            self.assertEqual(parsed["value"], hostname)
+            self.assertIsNone(parsed["arn"])
+            self.assertNotIn("kind", parsed)
+
+    def test_load_balancer_dns_rejects_urls_custom_domains_and_malformed_hosts_before_mfa(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        invalid = ["https://" + hostname, hostname + ":443", hostname + "/health", "*." + hostname,
+            hostname + "..", hostname + ".evil", "prod-api.example.com", "a..us-east-1.elb.amazonaws.com",
+            "-api.us-east-1.elb.amazonaws.com", "api-.us-east-1.elb.amazonaws.com",
+            "a" * 64 + ".us-east-1.elb.amazonaws.com", "api_us.us-east-1.elb.amazonaws.com",
+            "\u212api.us-east-1.elb.amazonaws.com", "prod-api.cn-north-1.elb.amazonaws.com.cn",
+            "us-east-1a.prod-api-123.elb.us-east-1.amazonaws.com",
+            "dualstack.dualstack." + hostname, "prod-api.invalid-region.elb.amazonaws.com"]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(lookup.LookupError):
+                self.scan(request("load-balancer", value))
+        self.sdk.assert_not_called()
+
+    def test_load_balancer_dns_inventory_matches_internal_hostname_without_deriving_name(self):
+        hostname = "internal-prod-api-edge-123456.us-east-1.elb.amazonaws.com"
+        item = self.modern_balancer(name="actual-resource-name", DNSName=hostname.upper() + ".")
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [item]}
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": []}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["results"][0]["name"], "actual-resource-name")
+        self.assertEqual(event["results"][0]["dnsName"], hostname)
+        self.elbv2.describe_load_balancers.assert_called_once_with(PageSize=100)
+        self.elb.describe_load_balancers.assert_called_once_with(PageSize=100)
+        self.assertNotIn("PRIVATE", json.dumps(event))
+
+    def test_load_balancer_dns_inventory_matches_later_pages_in_both_families(self):
+        hostname = "prod-api-edge-0123456789abcdef.elb.us-east-1.amazonaws.com"
+        other = "other-123.us-east-1.elb.amazonaws.com"
+        classic = {**self.classic_balancer("classic-owner"), "DNSName": hostname}
+        self.elbv2.describe_load_balancers.side_effect = [
+            {"LoadBalancers": [self.modern_balancer(DNSName=other)], "NextMarker": "MODERN_NEXT"},
+            {"LoadBalancers": [self.modern_balancer("net", "modern-owner", DNSName=hostname)]}]
+        self.elb.describe_load_balancers.side_effect = [
+            {"LoadBalancerDescriptions": [], "NextMarker": "CLASSIC_NEXT"}, {"LoadBalancerDescriptions": [classic]}]
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual({row["name"] for row in event["results"]}, {"classic-owner", "modern-owner"})
+        self.assertTrue(all(row["dnsName"] == hostname for row in event["results"]))
+        self.elbv2.describe_load_balancers.assert_called_with(PageSize=100, Marker="MODERN_NEXT")
+        self.elb.describe_load_balancers.assert_called_with(PageSize=100, Marker="CLASSIC_NEXT")
+
+    def test_load_balancer_dns_comparison_is_exact_for_every_hostname_label(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [
+            self.modern_balancer(DNSName=hostname.replace("123456", "123457"))]}
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": []}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "not_found")
+        self.assertEqual(event["results"], [])
+
+    def test_load_balancer_dns_dualstack_alias_only_applies_to_application_and_classic(self):
+        for hostname in ["prod-api-123456.us-east-1.elb.amazonaws.com", "prod-api-123456.elb.us-east-1.amazonaws.com"]:
+            self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer(DNSName=hostname)]}
+            self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [{**self.classic_balancer(), "DNSName": hostname}]}
+            event = self.scan(request("load-balancer", "dualstack." + hostname))[0]
+            self.assertEqual(event["check"]["status"], "found")
+            self.assertEqual(len(event["results"]), 2)
+            self.assertTrue(all(row["dnsName"] == hostname for row in event["results"]))
+            self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer("net", DNSName=hostname)]}
+            self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": []}
+            event = self.scan(request("load-balancer", "dualstack." + hostname))[0]
+            self.assertEqual(event["check"]["status"], "not_found")
+            self.assertEqual(event["results"], [])
+
+    def test_load_balancer_dns_preserves_prefix_when_aws_returns_it(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer(DNSName="DUALSTACK." + hostname.upper() + ".")]}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(event["results"][0]["dnsName"], "dualstack." + hostname)
+
+    def test_load_balancer_dns_gateway_absence_is_skipped_but_other_missing_dns_is_incomplete(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [
+            self.modern_balancer("gwy", "gateway"), self.modern_balancer(DNSName=hostname)]}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 1)
+        for kind in ["app", "net"]:
+            for absent in [None, ""]:
+                self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer(kind, DNSName=absent)]}
+                event = self.scan(request("load-balancer", hostname))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(event["results"], [])
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": []}
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [self.classic_balancer()]}
+        self.assertEqual(self.scan(request("load-balancer", hostname))[0]["check"]["status"], "error")
+
+    def test_load_balancer_dns_metadata_requires_valid_dns_region_and_resource_ownership(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        valid = self.modern_balancer(DNSName=hostname)
+        invalid = [{"DNSName": "PRIVATE_INVALID"}, {"DNSName": hostname + ".evil"},
+            {"DNSName": hostname.replace(REGION, "eu-west-1")}, {"DNSName": "https://" + hostname},
+            {"DNSName": []}, {"LoadBalancerName": "name/invalid"},
+            {"LoadBalancerArn": valid["LoadBalancerArn"].replace(ACCOUNT, "999999999999")},
+            {"LoadBalancerArn": valid["LoadBalancerArn"].replace(REGION, "eu-west-1")}, {"Type": "network"}]
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [{**valid, **changes}]}
+                event = self.scan(request("load-balancer", hostname))[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(event["results"], [])
+                self.assertNotIn("PRIVATE", json.dumps(event))
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": []}
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [{**self.classic_balancer("invalid/name"), "DNSName": hostname}]}
+        self.assertEqual(self.scan(request("load-balancer", hostname))[0]["check"]["status"], "error")
+
+    def test_load_balancer_dns_later_denial_and_page_cap_keep_confirmed_rows(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        page = {"LoadBalancers": [self.modern_balancer(DNSName=hostname)], "NextMarker": "NEXT"}
+        self.elbv2.describe_load_balancers.side_effect = [page, aws_error("AccessDenied")]
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertEqual(event["results"][0]["dnsName"], hostname)
+        self.elbv2.describe_load_balancers.side_effect = None
+        self.elbv2.describe_load_balancers.return_value = page
+        with patch.object(lookup, "MAX_PAGES", 1):
+            event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertIn("page or result limit", event["check"]["message"])
+
+    def test_load_balancer_dns_denied_family_does_not_hide_other_family_match(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.side_effect = aws_error("AccessDenied")
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [{**self.classic_balancer("classic-owner"), "DNSName": hostname}]}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "access_denied")
+        self.assertEqual(event["results"][0]["name"], "classic-owner")
+        self.assertIn("Application/Network/Gateway:", event["check"]["message"])
+
+    def test_load_balancer_dns_unfiltered_notfound_is_incomplete_and_keeps_other_matches(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.side_effect = aws_error("LoadBalancerNotFound")
+        self.elb.describe_load_balancers.return_value = {"LoadBalancerDescriptions": [{**self.classic_balancer(), "DNSName": hostname}]}
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertIn("unfiltered load balancer inventory", event["check"]["message"])
+        self.elb.describe_load_balancers.side_effect = aws_error("LoadBalancerNotFound")
+        event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(event["results"], [])
+        self.assertIn("Classic:", event["check"]["message"])
+
+    def test_load_balancer_name_and_arn_keep_targeted_calls_and_optional_dns_output(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        item = self.modern_balancer(DNSName=hostname.upper() + ".")
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [item]}
+        event = self.scan(request("load-balancer", "example-lb"))[0]
+        self.assertEqual(event["results"][0]["dnsName"], hostname)
+        self.elbv2.describe_load_balancers.assert_called_with(Names=["example-lb"], PageSize=100)
+        item.pop("DNSName")
+        event = self.scan(request("load-balancer", item["LoadBalancerArn"]))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertNotIn("dnsName", event["results"][0])
+        self.elbv2.describe_load_balancers.assert_called_with(LoadBalancerArns=[item["LoadBalancerArn"]], PageSize=100)
+
+    def test_load_balancer_dns_lookup_does_not_resolve_or_contact_the_supplied_host(self):
+        hostname = "prod-api-123456.us-east-1.elb.amazonaws.com"
+        self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": [self.modern_balancer(DNSName=hostname)]}
+        with patch("socket.getaddrinfo", side_effect=AssertionError("DNS resolution is forbidden")) as resolve, \
+                patch("socket.create_connection", side_effect=AssertionError("Direct traffic is forbidden")) as connect:
+            event = self.scan(request("load-balancer", hostname))[0]
+        self.assertEqual(event["check"]["status"], "found")
+        resolve.assert_not_called()
+        connect.assert_not_called()
+        policy = json.loads(self.sts.assume_role.call_args.kwargs["Policy"])
+        self.assertEqual(policy["Statement"][0]["Action"], ["elasticloadbalancing:DescribeLoadBalancers"])
 
     def test_large_selected_scope_survives_worker_stdin_without_truncation(self):
         names = [f"profile-{n}-" + "\u90e8" * 256 for n in range(250)]

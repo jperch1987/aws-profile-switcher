@@ -8,7 +8,7 @@ Clients need Node.js, Python, the packages in `requirements.txt` (including **bo
 
 **Get CLI credentials** requires a fresh six-digit MFA code in the app and produces five ready-to-copy environment assignments. It uses an IAM user's long-term keys through `source_profile`; SSO, `credential_process`, web identity, temporary source credentials, and role chaining are not supported by this CLI flow. **Open AWS Switch Role** opens a new tab in your current browser, using its AWS sign-in session. Review the prefilled account and role, then click **Switch Role** on AWS. AWS handles any sign-in and MFA prompts there.
 
-**Resource Lookup** searches for an exact resource ID, name, ARN, or private IPv4 address using the configured roles and regions. Each search requires fresh MFA for one source identity and can include up to 250 profiles sharing that source and MFA device. It returns resource metadata, not credentials. It uses the existing boto3 dependency and requires no AWS Resource Explorer setup.
+**Resource Lookup** searches for an exact resource ID, name, ARN, load balancer DNS hostname (FQDN), or private IPv4 address using the configured roles and regions. Each search requires fresh MFA for one source identity and can include up to 250 profiles sharing that source and MFA device. It returns resource metadata, not credentials. It uses the existing boto3 dependency and requires no AWS Resource Explorer setup.
 
 ## Install Python and Node.js
 
@@ -297,10 +297,10 @@ For advanced terminal-only use, `aws_session.py` remains available as an optiona
 
 ## Find a resource across profiles
 
-Use **Resource Lookup** when you know a resource's ID, exact name, ARN, or private IPv4 address and need to find which configured role can see it. It queries AWS directly and needs no AWS Resource Explorer index or other discovery service.
+Use **Resource Lookup** when you know a resource's ID, exact name, ARN, load balancer DNS hostname, or private IPv4 address and need to find which configured role can see it. It queries AWS directly and needs no AWS Resource Explorer index or other discovery service.
 
 1. Choose a **Source identity**. Profiles are grouped by their exact `source_profile` and resolved MFA device; a batch cannot mix groups.
-2. Choose one **Resource type** and enter its exact query. For **Private IPv4 address**, enter one address such as `10.0.1.25`. Queries are single-line, limited to 256 characters, and do not support wildcard or substring searches.
+2. Choose one **Resource type** and enter its exact query. For **Load balancer**, enter a name, ARN, or AWS-generated DNS hostname such as `my-app-123.us-east-1.elb.amazonaws.com`. For **Private IPv4 address**, enter one address such as `10.0.1.25`. Queries are single-line, limited to 256 characters, and do not support wildcard or substring searches.
 3. Under **Search scope**, use **Select all** to include all profiles in the group (up to 250), or choose a subset. When everything is selected, the button says **All selected**. Groups larger than 250 need separate searches of at most 250 profiles. Each regional resource is checked only in that profile's resolved configured region. S3 searches owned buckets across regions and reports the bucket's actual region when available. Route 53 hosted zones are global and are checked regardless of the profile's region.
 4. Enter a fresh code in **Lookup MFA code**, then choose **Search resources**. To search another source identity or another batch of profiles, start a new search with a fresh code.
 5. Review both the matches and each profile's coverage/status. Use **Cancel search** to stop an active search or **Clear results** to remove displayed metadata.
@@ -317,10 +317,10 @@ Use **Resource Lookup** when you know a resource's ID, exact name, ARN, or priva
 | EKS cluster | Cluster name or cluster ARN | `eks:DescribeCluster` |
 | ElastiCache | Cache cluster, replication group, or serverless cache ID/name or ARN | `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `elasticache:DescribeServerlessCaches` |
 | Route 53 hosted zone | Exact domain, hosted zone ID (with or without `/hostedzone/`), or hosted zone ARN | `route53:GetHostedZone`, `route53:ListHostedZonesByName` |
-| Load balancer | Exact name or ARN; Application, Network, Gateway, and Classic | `elasticloadbalancing:DescribeLoadBalancers` |
+| Load balancer | Exact name or ARN; AWS-generated DNS hostname for load balancers with a DNS name | `elasticloadbalancing:DescribeLoadBalancers` |
 | Private IPv4 address | Exact individually assigned primary or secondary private IPv4 on a visible network interface (ENI) | `ec2:DescribeNetworkInterfaces` |
 
-This scope does not include load balancer target groups, listeners, DNS-name searches, Route 53 DNS records, EKS workloads or node groups, ElastiCache snapshots, RDS clusters, Lambda versions/aliases, S3 objects, buckets merely shared from another account, or regions absent from the selected profiles. A `Name` tag is not necessarily unique, so multiple exact matches can be valid. Lambda lookup does not download function code or return environment variables. ElastiCache name searches check all three cache kinds; an ARN restricts the search to its kind. Route 53 domain matching accepts a trailing dot and returns all matching owned public/private hosted zones, subject to the search limits. A zone shared for VPC association does not establish ownership. Load balancer name searches check both the current and Classic load balancer APIs in the configured region; an ARN selects its API family. If either API is denied or fails, confirmed matches remain visible and the account is marked incomplete. Classic load balancer ARNs are constructed from the assumed account, configured region, and exact name returned by its API.
+This scope does not include load balancer target groups, listeners, custom-domain or zonal-hostname searches, Route 53 DNS records, EKS workloads or node groups, ElastiCache snapshots, RDS clusters, Lambda versions/aliases, S3 objects, buckets merely shared from another account, or regions absent from the selected profiles. A `Name` tag is not necessarily unique, so multiple exact matches can be valid. Lambda lookup does not download function code or return environment variables. ElastiCache name searches check all three cache kinds; an ARN restricts the search to its kind. Route 53 domain matching accepts a trailing dot and returns all matching owned public/private hosted zones, subject to the search limits. A zone shared for VPC association does not establish ownership. Load balancer name and FQDN searches check both the current and Classic load balancer APIs in the configured region; an ARN selects its API family. Application, Network, Gateway, and Classic Load Balancers remain searchable by name or ARN. If either API is denied or fails, confirmed matches remain visible and the account is marked incomplete. Classic load balancer ARNs are constructed from the assumed account, configured region, and validated name returned by its API.
 
 Searches are bounded: the Python worker has a nine-minute deadline, the server terminates a worker after ten minutes, and results are limited to 100 matches per profile. Paginated scans stop after 10 pages per filter/scan. The server caps total worker output at 32 MiB. Hitting a limit is reported as incomplete. A denied request, timeout, cancelled or unsearched profile, or partial scan **does not establish that a resource does not exist**. Even a completed no-match result applies only to the selected account, resource type, and region/ownership scope. If S3 ownership is confirmed but reading its location is denied, the confirmed match can remain with an unknown region and an access-denied status.
 
@@ -329,6 +329,22 @@ Each search calls [AWS STS GetSessionToken](https://docs.aws.amazon.com/STS/late
 The source user still needs permission to assume the target roles, and their existing trust policies must allow it. The target roles need the read permissions above. [lookup-permissions.example.json](lookup-permissions.example.json) is a target-role permission example for all twelve supported types; review it and narrow resources where the API supports that. The app does not attach policies or grant permissions. Its per-search session policy cannot add permissions missing from the target role. `GetSessionToken` itself does not require an IAM permission grant. MFA is evaluated when assuming the role; assumed-role credentials do not satisfy a separate MFA-context requirement on downstream resource policies. See [AWS MFA-protected API access](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_configure-api-require.html).
 
 The browser displays only resource metadata and scan statuses. **Clear results**, page exit/reload, or **Refresh** clears the local display. The server keeps only the most recent lookup's metadata in memory, replaces it when a new lookup starts, and expires it 10 minutes after the lookup finishes. Clearing the display does not immediately delete that server snapshot; stopping the server clears its memory. The browser also expires displayed results. Neither cancelling nor clearing a search revokes temporary AWS credentials before their normal expiration. Treat account, resource, and naming information as private when sharing screenshots or support reports.
+
+### Find a load balancer by its DNS hostname (FQDN)
+
+Choose **Load balancer**, paste the AWS-generated hostname, select the profiles to search, and enter a fresh MFA code. Supported regional hostname forms include:
+
+```text
+my-app-123.us-east-1.elb.amazonaws.com
+my-app-123.elb.us-east-1.amazonaws.com
+internal-my-app-123.us-east-1.elb.amazonaws.com
+```
+
+Matching ignores DNS letter case and one trailing dot. The documented `dualstack.` prefix is accepted for Application and Classic Load Balancers; Network Load Balancers are matched against their returned DNS name without adding or removing that prefix. The app compares the hostname with the AWS API's `DNSName` value and displays that value with the load balancer's name, ARN, account, profile, and region. It does not infer the resource name by stripping an `internal-` prefix or hostname suffix. See [AWS load balancer metadata](https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/API_LoadBalancer.html) and [Route 53's load balancer hostname guidance](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-to-elb-load-balancer.html).
+
+DNS-name lookup uses paginated `DescribeLoadBalancers` inventory because that API has no DNS-name filter. It may take longer than a name or ARN lookup. The existing limit of 10 pages of 100 entries per API family and the overall time limit still apply; incomplete checks remain visible even when matches are found. Selected profiles must cover the load balancer's region. Each target role still needs only `elasticloadbalancing:DescribeLoadBalancers`; no additional packages or permissions are required for this feature.
+
+Enter only the AWS-generated regional hostname, without `https://`, a port, or a path. Custom aliases such as `app.example.com`, zonal node hostnames, and names outside the app's supported commercial AWS regions are outside this search. Gateway Load Balancers without a DNS name remain searchable by name or ARN. The app does not resolve DNS or connect to the hostname, so looking up an internal load balancer does not require direct network access to that load balancer; access to the AWS STS and Elastic Load Balancing APIs is required.
 
 ### Find what uses a private IPv4 address
 
@@ -353,7 +369,7 @@ Use the reason shown to choose the next step:
 - **Throttling or service failure:** retry a smaller set of profiles with a fresh MFA code.
 - **Unexpected response/helper error:** report the safe reason shown, whether you searched by name or ARN, and the configured region. Do not share credentials or MFA codes.
 
-The overall zero-match summary is not the cause of a failed search. A **No match** result applies only to the selected account and configured region. Names must be the actual load balancer name, not its DNS hostname, listener name, or target-group name. These diagnostics help identify the cause; they do not establish that a failed AWS request has been fixed.
+The overall zero-match summary is not the cause of a failed search. A **No match** result applies only to the selected account and configured region. Use the actual load balancer name, ARN, or supported AWS-generated DNS hostname; listener names, target-group names, and custom domains are outside this search. These diagnostics help identify the cause; they do not establish that a failed AWS request has been fixed.
 
 ## Open a role in AWS Console
 

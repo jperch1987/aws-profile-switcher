@@ -12,6 +12,33 @@ const MAX_LINE = 2 * 1024 * 1024;
 const cleanString = (value, maximum = 1024) => typeof value === 'string' && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value);
 const cleanMetadata = (value, maximum) => cleanString(value, maximum) && !/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value);
 const ec2Id = (value, prefix) => typeof value === 'string' && new RegExp(`^${prefix}-(?:[0-9a-f]{8}|[0-9a-f]{17})$`).test(value);
+const LOAD_BALANCER_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?$/;
+
+function loadBalancerDns(value) {
+  if (!cleanMetadata(value, 254) || !/^[A-Za-z0-9.-]+$/.test(value)) return null;
+  const name = value.toLowerCase().replace(/\.$/, '');
+  if (!name || name.length > 253) return null;
+  const labels = name.split('.');
+  if (labels.length === 6 && labels[0] === 'dualstack') labels.shift();
+  if (labels.length !== 5 || !labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    || labels[3] !== 'amazonaws' || labels[4] !== 'com') return null;
+  const region = labels[1] === 'elb' ? labels[2] : labels[2] === 'elb' ? labels[1] : '';
+  return REGION.test(region) ? { name, region } : null;
+}
+
+function loadBalancerKind(item, target) {
+  const prefix = `arn:aws:elasticloadbalancing:${target.region}:${target.accountId}:loadbalancer/`;
+  if (!item.arn.startsWith(prefix) || !LOAD_BALANCER_NAME.test(item.name) || item.resourceId !== item.name) return null;
+  const path = item.arn.slice(prefix.length).split('/');
+  if (path.length === 1 && path[0] === item.name) return 'classic';
+  return path.length === 3 && ['app', 'net', 'gwy'].includes(path[0]) && path[1] === item.name
+    && /^[a-f0-9]{16}$/.test(path[2]) ? path[0] : null;
+}
+
+function loadBalancerDnsMatches(query, found, kind) {
+  if (query === found) return true;
+  return ['app', 'classic'].includes(kind) && query.replace(/^dualstack\./, '') === found.replace(/^dualstack\./, '');
+}
 
 function networkMetadata(item, target, query) {
   const info = item.network;
@@ -46,6 +73,10 @@ export function validateLookupRequest(body, profiles) {
   if (!RESOURCE_TYPES.includes(body.resourceType)) throw new LookupError('Choose a supported resource type.');
   if (!cleanString(body.query, 256) || !body.query.trim()) throw new LookupError('Enter a resource ID, exact name, or ARN using at most 256 characters on one line.');
   if (body.resourceType === 'private-ip' && !isIPv4(body.query.trim())) throw new LookupError('Enter one exact private IPv4 address, such as 10.0.1.25. CIDR ranges, hostnames, and IPv6 are not supported.');
+  if (body.resourceType === 'load-balancer' && !body.query.trim().startsWith('arn:')
+    && !LOAD_BALANCER_NAME.test(body.query.trim()) && !loadBalancerDns(body.query.trim())) {
+    throw new LookupError('Enter an exact load balancer name, ARN, or AWS-generated DNS hostname. Custom domains, URLs, ports, and zonal hostnames are not supported.');
+  }
   if (typeof body.mfaCode !== 'string' || !/^[0-9]{6}$/.test(body.mfaCode)) throw new LookupError('Enter a fresh six-digit MFA code for this lookup.');
   const targets = body.profiles.map((name) => {
     const profile = profiles.find((item) => item.profile === name);
@@ -124,8 +155,19 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         || (job.data.resourceType === 's3' && !REGION.test(item.region) && !['unknown', 'global'].includes(item.region))) return badWorker(job);
       const network = job.data.resourceType === 'private-ip' ? networkMetadata(item, target, job.data.query) : null;
       if (job.data.resourceType === 'private-ip' && !network) return badWorker(job);
+      let dnsName;
+      if (job.data.resourceType === 'load-balancer') {
+        const queryDns = loadBalancerDns(job.data.query);
+        if (Object.hasOwn(item, 'dnsName')) {
+          const foundDns = loadBalancerDns(item.dnsName);
+          const kind = loadBalancerKind(item, target);
+          if (!foundDns || foundDns.name !== item.dnsName || foundDns.region !== target.region || !kind
+            || (queryDns && !loadBalancerDnsMatches(queryDns.name, foundDns.name, kind))) return badWorker(job);
+          dnsName = foundDns.name;
+        } else if (queryDns) return badWorker(job);
+      }
       rows.push({ profile: target.profile, accountId: target.accountId, region: item.region, resourceType: job.data.resourceType,
-        resourceId: item.resourceId, name: item.name, arn: item.arn, ...(network ? { network } : {}) });
+        resourceId: item.resourceId, name: item.name, arn: item.arn, ...(network ? { network } : {}), ...(dnsName ? { dnsName } : {}) });
     }
     if ((check.status === 'not_found' && rows.length) || (check.status === 'found' && !rows.length)) return badWorker(job);
     job.data.checks.push({ ...target, status: check.status, message: check.message });

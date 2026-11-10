@@ -152,6 +152,94 @@ test('S3 results use verified bucket region while checks keep the configured sco
   assert.equal(manager.get(start.id).results[0].region, 'eu-west-1');
 });
 
+function loadBalancerEvent(kind = 'app', dnsName = 'web-ingress-123.us-east-1.elb.amazonaws.com') {
+  const row = event();
+  Object.assign(row.results[0], { resourceType: 'load-balancer', resourceId: 'web-ingress', name: 'web-ingress', dnsName,
+    arn: `arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/${kind === 'classic' ? 'web-ingress' : `${kind}/web-ingress/0123456789abcdef`}` });
+  return row;
+}
+
+test('load balancer FQDN input accepts AWS hostnames and rejects unsupported destinations before spawning', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ resourceType: 'load-balancer' });
+  for (const query of ['web-ingress', 'internal-classic', 'web-ingress-123.us-east-1.elb.amazonaws.com',
+    'internal-web-ingress-123.elb.us-east-1.amazonaws.com', 'DUALSTACK.Web-Ingress-123.us-east-1.elb.amazonaws.com.']) {
+    assert.equal(validateLookupRequest({ ...body, query }, profiles).query, query);
+  }
+  for (const query of ['app.example.com', 'https://web-ingress-123.us-east-1.elb.amazonaws.com',
+    'web-ingress-123.us-east-1.elb.amazonaws.com:443', 'web-ingress-123.us-east-1.elb.amazonaws.com/path',
+    'web-ingress-123.us-east-1.elb.amazonaws.com.evil.example', '*.us-east-1.elb.amazonaws.com',
+    'us-east-1a.web-ingress-123.elb.us-east-1.amazonaws.com', 'web_ingress.us-east-1.elb.amazonaws.com',
+    'web-ingress-123.us-east-1.elb.amazonaws.com..', 'dualstack.dualstack.web-ingress-123.us-east-1.elb.amazonaws.com',
+    'K-ingress-123.us-east-1.elb.amazonaws.com',
+    'web-ingress-123.us-gov-west-1.elb.amazonaws.com', 'web-ingress-123.cn-north-1.elb.amazonaws.com.cn',
+    `${'x'.repeat(64)}.us-east-1.elb.amazonaws.com`, 'web-ingress-123.not-a-region.elb.amazonaws.com']) {
+    assert.throws(() => manager.start({ ...body, query }, profiles), /AWS-generated DNS hostname/);
+  }
+  assert.equal(children.length, 0);
+});
+
+test('load balancer DNS metadata survives polling with canonical matching and documented dualstack aliases', (t) => {
+  const { manager, children } = fixture(t);
+  for (const [kind, dnsName, query] of [
+    ['app', 'web-ingress-123.us-east-1.elb.amazonaws.com', 'WEB-INGRESS-123.US-EAST-1.ELB.AMAZONAWS.COM.'],
+    ['app', 'web-ingress-123.elb.us-east-1.amazonaws.com', 'dualstack.web-ingress-123.elb.us-east-1.amazonaws.com'],
+    ['classic', 'web-ingress-123.us-east-1.elb.amazonaws.com', 'dualstack.web-ingress-123.us-east-1.elb.amazonaws.com'],
+    ['net', 'internal-web-ingress-123.elb.us-east-1.amazonaws.com', 'internal-web-ingress-123.elb.us-east-1.amazonaws.com'],
+    ['app', 'web-ingress-123.us-east-1.elb.amazonaws.com', 'web-ingress'],
+  ]) {
+    const started = manager.start(request({ profiles: ['dev'], resourceType: 'load-balancer', query }), profiles);
+    const row = loadBalancerEvent(kind, dnsName); row.results[0].sdkSecret = 'PRIVATE_SDK_FIELD';
+    const child = children.at(-1);
+    assert.equal(JSON.parse(child.input).query, query);
+    child.event(row); child.event({ event: 'complete' }); child.end();
+    const result = manager.get(started.id);
+    assert.equal(result.state, 'complete'); assert.equal(result.results[0].dnsName, dnsName);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_SDK_FIELD|mfaCode/);
+  }
+});
+
+test('load balancer DNS results require exact hostname, scoped identity and safe canonical metadata', (t) => {
+  const { manager, children } = fixture(t);
+  const dnsName = 'web-ingress-123.us-east-1.elb.amazonaws.com';
+  const invalid = [
+    (item) => { delete item.dnsName; },
+    (item) => { item.dnsName = ''; },
+    (item) => { item.dnsName = null; },
+    (item) => { item.dnsName = { value: dnsName }; },
+    (item) => { item.dnsName = 'app.example.com'; },
+    (item) => { item.dnsName = dnsName.toUpperCase(); },
+    (item) => { item.dnsName = dnsName + '.'; },
+    (item) => { item.dnsName = dnsName + '\n'; },
+    (item) => { item.dnsName = dnsName.replace('123', '124'); },
+    (item) => { item.dnsName = dnsName.replace('us-east-1', 'eu-west-1'); },
+    (item) => { item.arn = item.arn.replace('111111111111', '222222222222'); },
+    (item) => { item.arn = item.arn.replace('us-east-1', 'eu-west-1'); },
+    (item) => { item.arn = item.arn.replace('web-ingress', 'another-lb'); },
+    (item) => { item.resourceId = 'another-lb'; },
+  ];
+  for (const mutate of invalid) {
+    const started = manager.start(request({ profiles: ['dev'], resourceType: 'load-balancer', query: dnsName }), profiles);
+    const row = loadBalancerEvent(); mutate(row.results[0]); children.at(-1).event(row);
+    assert.equal(manager.get(started.id).state, 'error');
+    assert.equal(manager.get(started.id).results.length, 0);
+  }
+  const started = manager.start(request({ profiles: ['dev'], resourceType: 'load-balancer', query: `dualstack.${dnsName}` }), profiles);
+  children.at(-1).event(loadBalancerEvent('net'));
+  assert.equal(manager.get(started.id).state, 'error', 'Network Load Balancers do not use Application/Classic dualstack alias equivalence');
+});
+
+test('confirmed load balancer DNS matches remain visible when inventory is incomplete', (t) => {
+  const { manager, children } = fixture(t);
+  const started = manager.start(request({ profiles: ['dev'], resourceType: 'load-balancer', query: 'web-ingress-123.us-east-1.elb.amazonaws.com' }), profiles);
+  const row = loadBalancerEvent(); row.check.status = 'error';
+  row.check.message = 'The scan reached its page limit; this check is incomplete.';
+  children[0].event(row); children[0].event({ event: 'complete' }); children[0].end();
+  const result = manager.get(started.id);
+  assert.equal(result.results[0].dnsName, 'web-ingress-123.us-east-1.elb.amazonaws.com');
+  assert.equal(result.checks[0].status, 'error');
+});
+
 function privateIpEvent(profile = 'dev', overrides = {}) {
   const row = event(profile);
   const target = row.results[0];

@@ -386,7 +386,7 @@ test('Load balancer lookup sends its exact name or ARN and displays matches in t
       checks: [check(0, 'found'), check(1, 'not_found')] })) });
     ui.get('lookup-type').value = 'load-balancer';
     ui.get('lookup-type').dispatch('change');
-    assert.match(ui.get('lookup-query').placeholder, /production-web.*load balancer ARN/);
+    assert.match(ui.get('lookup-query').placeholder, /production-web.*elb\.amazonaws\.com.*ARN/);
     assert.match(ui.get('lookup-region-help').textContent, /Application, Network, Gateway, and Classic.*configured region/);
     await ui.search({ type: 'load-balancer', query });
     assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'load-balancer', query, mfaCode: '000123' });
@@ -398,6 +398,134 @@ test('Load balancer lookup sends its exact name or ARN and displays matches in t
     assert.equal(row.children[3].children[1].textContent, arn);
     assert.equal(ui.get('lookup-mfa').value, '');
     assert.match(ui.get('lookup-checks').children[1].children[1].textContent, /eu-west-1/);
+  }
+});
+
+test('Load balancer DNS lookup preserves the input query and renders canonical AWS hostnames as plain text', async () => {
+  for (const [dnsName, family] of [['production-web-123.us-east-1.elb.amazonaws.com', 'app'], ['production-web-123.elb.us-east-1.amazonaws.com', 'net'], ['dualstack.us-east-1.elb.amazonaws.com', 'app']]) {
+    const query = `${dnsName.toUpperCase()}.`;
+    const arn = `arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/${family}/production-web/0123456789abcdef`;
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query,
+      results: [result(0, { resourceType: 'load-balancer', resourceId: 'production-web', name: 'production-web', arn, dnsName })],
+      checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    ui.get('lookup-type').value = 'load-balancer';
+    ui.get('lookup-type').dispatch('change');
+    assert.equal(ui.get('lookup-query-label').textContent, 'Exact name, AWS DNS name (FQDN), or ARN');
+    assert.match(ui.get('lookup-query-help').textContent, /AWS-provided DNS name.*custom domain or URL.*may take longer.*10-minute/);
+    await ui.search({ type: 'load-balancer', query });
+    assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'load-balancer', query, mfaCode: '000123' });
+    const row = ui.get('lookup-results-body').children[0];
+    assert.equal(row.children[0].textContent, '111111111111');
+    assert.equal(row.children[2].textContent, 'us-east-1');
+    assert.equal(row.children[3].children[1].textContent, arn);
+    const dns = row.children[3].children[2];
+    assert.equal(dns.textContent, `DNS: ${dnsName}`);
+    assert.equal(dns.tagName, 'CODE');
+    assert.equal(dns.children.length, 0);
+    assert.equal(dns.href, undefined);
+    assert.equal(ui.get('lookup-mfa').value, '');
+    ui.get('lookup-type').value = 'ec2';
+    ui.get('lookup-type').dispatch('change');
+    assert.equal(ui.get('lookup-query-label').textContent, 'Exact ID, name, or ARN');
+    assert.equal(ui.get('lookup-query-help').textContent, 'Exact matches only. Up to 256 characters; no wildcard search.');
+    assert.match(ui.get('lookup-query').placeholder, /i-0123456789abcdef0/);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.equal(ui.get('lookup-results-panel').hidden, true);
+  }
+});
+
+test('Load balancer rejects custom domains and malformed AWS hostnames before MFA validation or submission', async () => {
+  const ui = await app();
+  for (const query of ['app.example.com', 'https://production-web-123.us-east-1.elb.amazonaws.com',
+    'production-web-123.us-east-1.elb.amazonaws.com:443', '*.us-east-1.elb.amazonaws.com',
+    'production_web.us-east-1.elb.amazonaws.com', 'production-web-123.us-east-1.elb.amazonaws.com..',
+    '-production.us-east-1.elb.amazonaws.com', 'production-.us-east-1.elb.amazonaws.com',
+    `${'a'.repeat(64)}.us-east-1.elb.amazonaws.com`, 'production.us-east-1.elb.amazonaws.com.example.com',
+    'us-east-1a.production.elb.us-east-1.amazonaws.com', 'dualstack.dualstack.production.us-east-1.elb.amazonaws.com',
+    'production.us-east-1.elb.amazonaws.cn', 'production.us-unknown-1.elb.amazonaws.com',
+    'production.Ks-east-1.elb.amazonaws.com', 'K.us-east-1.elb.amazonaws.com', 'production/web', 'production:443', 'x'.repeat(33)]) {
+    await ui.search({ type: 'load-balancer', query, code: '' });
+    assert.match(ui.get('lookup-status').textContent, /exact load balancer name, AWS-provided DNS name/);
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+  }
+  assert.deepEqual(ui.requests.map(({ url }) => url), ['/api/profiles']);
+});
+
+test('Load balancer rejects invalid DNS metadata and DNS results that do not match the requested hostname', async () => {
+  const dnsName = 'production-web-123.us-east-1.elb.amazonaws.com';
+  const base = result(0, { resourceType: 'load-balancer', resourceId: 'production-web', name: 'production-web',
+    arn: 'arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/production-web/0123456789abcdef' });
+  const invalid = [null, 123, {}, '', dnsName.toUpperCase(), `${dnsName}.`, `${dnsName}..`, ` ${dnsName}`, `${dnsName}\n`,
+    'production-web-123.eu-west-1.elb.amazonaws.com', 'production-web-123.us-east-1.elb.amazonaws.com.evil.test',
+    'https://production-web-123.us-east-1.elb.amazonaws.com', 'production-web-123.us-east-1.elb.amazonaws.com:443',
+    'production_web.us-east-1.elb.amazonaws.com', '*.us-east-1.elb.amazonaws.com', '-app.us-east-1.elb.amazonaws.com',
+    'app-.us-east-1.elb.amazonaws.com', `${'a'.repeat(64)}.us-east-1.elb.amazonaws.com`,
+    'dualstack.dualstack.production.us-east-1.elb.amazonaws.com', 'us-east-1a.production.elb.us-east-1.amazonaws.com',
+    'production.us-east-1.elb.amazonaws.cn', 'production.Ks-east-1.elb.amazonaws.com', '<img src=x onerror=alert(1)>'];
+  for (const query of ['production-web', dnsName]) {
+    for (const bad of invalid) {
+      const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query,
+        results: [{ ...base, dnsName: bad }], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+      await ui.search({ type: 'load-balancer', query });
+      assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+      assert.equal(ui.get('lookup-results-body').children.length, 0);
+    }
+  }
+  for (const row of [base, { ...base, dnsName: 'other-load-balancer.us-east-1.elb.amazonaws.com' }]) {
+    const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query: dnsName,
+      results: [row], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+    await ui.search({ type: 'load-balancer', query: dnsName });
+    assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+  }
+});
+
+test('Load balancer DNS metadata requires a matching valid ARN, resource ID, and name even without an alias', async () => {
+  const dnsName = 'production-web-123.us-east-1.elb.amazonaws.com';
+  const prefix = 'arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/';
+  const base = result(0, { resourceType: 'load-balancer', resourceId: 'production-web', name: 'production-web',
+    arn: `${prefix}app/production-web/0123456789abcdef`, dnsName });
+  const invalid = [
+    { arn: '' }, { arn: `${prefix}invalid/production-web/0123456789abcdef` }, { arn: `${prefix}app/production-web/invalid-id` },
+    { arn: `${prefix}production-web/extra-path` }, { arn: `${prefix}app/wrong-name/0123456789abcdef` },
+    { arn: 'arn:aws:elasticloadbalancing:eu-west-1:111111111111:loadbalancer/production-web' },
+    { arn: 'arn:aws:elasticloadbalancing:us-east-1:222222222222:loadbalancer/production-web' },
+    { resourceId: 'wrong-name' }, { name: 'wrong-name' }, { name: '' },
+    { resourceId: 'x'.repeat(33), name: 'x'.repeat(33), arn: `${prefix}${'x'.repeat(33)}` },
+  ];
+  for (const query of [dnsName, 'production-web']) {
+    for (const overrides of invalid) {
+      const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query,
+        results: [{ ...base, ...overrides }], checks: [check(0, 'found'), check(1, 'not_found')] })) });
+      await ui.search({ type: 'load-balancer', query });
+      assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+      assert.equal(ui.get('lookup-results-body').children.length, 0);
+    }
+  }
+});
+
+test('Load balancer dualstack equivalence requires a verified Application or Classic ARN', async () => {
+  const hostname = 'production-web-123.us-east-1.elb.amazonaws.com';
+  const prefix = 'arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/';
+  const cases = [
+    [`${prefix}app/production-web/0123456789abcdef`, true], [`${prefix}production-web`, true],
+    [`${prefix}net/production-web/0123456789abcdef`, false], [`${prefix}gwy/production-web/0123456789abcdef`, false],
+    [`${prefix}app/production-web/not-an-id`, false], [`${prefix}app/wrong-name/0123456789abcdef`, false],
+    [`${prefix}production-web/extra-path`, false],
+    ['arn:aws:elasticloadbalancing:eu-west-1:111111111111:loadbalancer/production-web', false],
+    ['arn:aws:elasticloadbalancing:us-east-1:222222222222:loadbalancer/production-web', false],
+  ];
+  for (const [arn, accepted] of cases) {
+    for (const [query, dnsName] of [[`dualstack.${hostname}`, hostname], [hostname, `dualstack.${hostname}`]]) {
+      const ui = await app({ start: () => response(snapshot({ state: 'complete', resourceType: 'load-balancer', query,
+        results: [result(0, { resourceType: 'load-balancer', resourceId: 'production-web', name: 'production-web', arn, dnsName })],
+        checks: [check(0, 'found'), check(1, 'not_found')] })) });
+      await ui.search({ type: 'load-balancer', query });
+      assert.equal(ui.get('lookup-results-body').children.length, accepted ? 1 : 0, `${arn}: ${query}`);
+      if (accepted) assert.equal(ui.get('lookup-results-body').children[0].children[3].children[2].textContent, `DNS: ${dnsName}`);
+      else assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+    }
   }
 });
 

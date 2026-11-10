@@ -461,14 +461,15 @@ function renderLookupControls() {
   const unavailable = Math.max(0, state.profiles.length - eligible);
   const total = group?.profiles.length || 0;
   const privateIp = $("lookup-type").value === "private-ip";
+  const loadBalancer = $("lookup-type").value === "load-balancer";
   const limitMessage = selected > lookupProfileLimit ? `Select no more than ${lookupProfileLimit} profiles per search.` : total > lookupProfileLimit ? `This identity exceeds the ${lookupProfileLimit}-profile search limit. Select all is unavailable; choose up to ${lookupProfileLimit} profiles manually, then search the remaining profiles separately.${selected === 0 ? " None have been selected automatically." : ""}` : `Choose 1–${lookupProfileLimit} profiles sharing this source identity and MFA device.`;
   $("lookup-scope-summary").textContent = `${selected} of ${total} profiles selected. ${limitMessage}`;
   $("lookup-scope-summary").classList.toggle("is-error", selected > lookupProfileLimit);
   $("lookup-source-help").textContent = group ? `MFA device: ${group.mfa}${unavailable ? `. ${unavailable} ${unavailable === 1 ? "profile needs" : "profiles need"} role/source/MFA setup and cannot be searched.` : ""}` : "No profiles have the role, source credentials configuration, region, and MFA device required for lookup.";
   $("lookup-region-help").textContent = $("lookup-type").value === "s3" ? "S3 bucket lookup is global. A match shows the bucket’s verified region when available." : $("lookup-type").value === "route53" ? "Route 53 hosted zone lookup is global. Search by exact domain name, hosted zone ID, or ARN; individual DNS records are outside this search." : `${$("lookup-type").value === "load-balancer" ? "Includes Application, Network, Gateway, and Classic Load Balancers. " : ""}Searches only each selected profile’s configured region: role region, then source region, or us-east-1 by default. Other regions are outside this search.`;
-  $("lookup-query").placeholder = ({ ec2: "For example: i-0123456789abcdef0 or web-server", ebs: "For example: vol-0123456789abcdef0", "security-group": "For example: sg-0123456789abcdef0", vpc: "For example: vpc-0123456789abcdef0", s3: "For example: my-application-bucket", rds: "For example: production-database", lambda: "For example: process-orders", eks: "For example: production-cluster or cluster ARN", elasticache: "Cache cluster, replication group, or serverless cache ID / ARN", route53: "For example: example.com or Z0123456789ABC", "load-balancer": "For example: production-web or load balancer ARN", "private-ip": "For example: 10.0.1.25" })[$("lookup-type").value] || "Exact resource name, ID, or ARN";
-  $("lookup-query-label").textContent = privateIp ? "Exact private IPv4 address" : "Exact ID, name, or ARN";
-  $("lookup-query-help").textContent = privateIp ? "One IPv4 address, without a subnet mask. IPv6, hostnames, and CIDR ranges are outside this search." : "Exact matches only. Up to 256 characters; no wildcard search.";
+  $("lookup-query").placeholder = ({ ec2: "For example: i-0123456789abcdef0 or web-server", ebs: "For example: vol-0123456789abcdef0", "security-group": "For example: sg-0123456789abcdef0", vpc: "For example: vpc-0123456789abcdef0", s3: "For example: my-application-bucket", rds: "For example: production-database", lambda: "For example: process-orders", eks: "For example: production-cluster or cluster ARN", elasticache: "Cache cluster, replication group, or serverless cache ID / ARN", route53: "For example: example.com or Z0123456789ABC", "load-balancer": "production-web, production-web-123.us-east-1.elb.amazonaws.com, or ARN", "private-ip": "For example: 10.0.1.25" })[$("lookup-type").value] || "Exact resource name, ID, or ARN";
+  $("lookup-query-label").textContent = privateIp ? "Exact private IPv4 address" : loadBalancer ? "Exact name, AWS DNS name (FQDN), or ARN" : "Exact ID, name, or ARN";
+  $("lookup-query-help").textContent = privateIp ? "One IPv4 address, without a subnet mask. IPv6, hostnames, and CIDR ranges are outside this search." : loadBalancer ? "Use the AWS-provided DNS name, not a custom domain or URL. Exact matches only; no wildcards. DNS lookup checks load balancer inventories and may take longer, up to the 10-minute search limit. Unfinished checks do not prove absence." : "Exact matches only. Up to 256 characters; no wildcard search.";
   $("lookup-ip-help").hidden = !privateIp;
   for (const id of ["lookup-group", "lookup-type", "lookup-query", "lookup-mfa"]) $(id).disabled = locked || !group;
   for (const row of $("lookup-profiles").children) if (row.children[0]?.tagName === "INPUT") row.children[0].disabled = locked;
@@ -488,6 +489,38 @@ function lookupText(value, limit = 1024) { return typeof value === "string" && v
 
 function exactIpv4(value) {
   return typeof value === "string" && /^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$/.test(value) && value.split(".").every((part) => Number(part) <= 255);
+}
+
+function loadBalancerDns(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9.-]+$/.test(value)) return null;
+  const hostname = value.toLowerCase().replace(/\.$/, "");
+  if (hostname.length > 253) return null;
+  const labels = hostname.split(".");
+  if (!labels.every((label) => label.length >= 1 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) return null;
+  if (labels.length === 6 && labels[0] === "dualstack") labels.shift();
+  if (labels.length !== 5 || labels[3] !== "amazonaws" || labels[4] !== "com") return null;
+  const region = labels[2] === "elb" ? labels[1] : labels[1] === "elb" ? labels[2] : "";
+  return lookupRegion.test(region) ? { hostname, region } : null;
+}
+
+function loadBalancerName(value) {
+  return typeof value === "string" && value.length <= 32 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(value);
+}
+
+function validLookupLoadBalancerDns(row, query) {
+  const requested = loadBalancerDns(query);
+  if (!Object.hasOwn(row, "dnsName")) return !requested;
+  const actual = loadBalancerDns(row.dnsName);
+  if (!actual || actual.hostname !== row.dnsName || actual.region !== row.region) return false;
+  const prefix = `arn:aws:elasticloadbalancing:${row.region}:${row.accountId}:loadbalancer/`;
+  if (!row.arn.startsWith(prefix)) return false;
+  const path = row.arn.slice(prefix.length);
+  const modern = /^(app|net|gwy)\/([^/]+)\/[0-9a-f]{16}$/.exec(path);
+  const name = modern ? modern[2] : path;
+  if (!loadBalancerName(name) || name !== row.resourceId || name !== row.name) return false;
+  if (!requested || requested.hostname === actual.hostname) return true;
+  return (!modern || modern[1] === "app")
+    && requested.hostname.replace(/^dualstack\./, "") === actual.hostname.replace(/^dualstack\./, "");
 }
 
 function validLookupNetwork(row, query) {
@@ -525,6 +558,7 @@ function validLookupSnapshot(snapshot, expected, id = null) {
     if (!scope || row.accountId !== scope.accountId || row.resourceType !== expected.resourceType || ![row.region, row.resourceId, row.name, row.arn].every((value) => lookupText(value)) || !row.resourceId) return false;
     if (expected.resourceType === "route53" ? row.region !== "global" : expected.resourceType === "s3" ? !lookupRegion.test(row.region) && !["unknown", "global"].includes(row.region) : row.region !== scope.region) return false;
     if (expected.resourceType === "private-ip" && !validLookupNetwork(row, expected.query)) return false;
+    if (expected.resourceType === "load-balancer" && !validLookupLoadBalancerDns(row, expected.query)) return false;
   }
   if (snapshot.expiresAt != null && (typeof snapshot.expiresAt !== "string" || !Number.isFinite(Date.parse(snapshot.expiresAt)))) return false;
   return true;
@@ -564,6 +598,7 @@ function renderLookupSnapshot() {
     resource.append(makeElement("code", "lookup-resource-id", result.resourceId));
     if (result.name && result.name !== result.resourceId) resource.append(makeElement("span", "lookup-resource-name", result.name));
     if (result.arn) resource.append(makeElement("code", "lookup-resource-arn", result.arn));
+    if (result.resourceType === "load-balancer" && result.dnsName) resource.append(makeElement("code", "lookup-resource-dns", `DNS: ${result.dnsName}`));
     if (result.resourceType === "private-ip") {
       const network = result.network;
       const details = makeElement("dl", "lookup-network-details");
@@ -671,6 +706,13 @@ async function searchResources(event) {
   if (resourceType === "private-ip" && !exactIpv4(query)) {
     mfaCode = "";
     lookup.message = "Enter one exact IPv4 address, such as 10.0.1.25. Hostnames, IPv6, CIDR ranges, and leading-zero octets are not supported.";
+    lookup.error = true;
+    renderLookupSnapshot();
+    return;
+  }
+  if (resourceType === "load-balancer" && !query.startsWith("arn:") && !loadBalancerName(query) && !loadBalancerDns(query)) {
+    mfaCode = "";
+    lookup.message = "Enter an exact load balancer name, AWS-provided DNS name (FQDN), or ARN. Custom domains, URLs, ports, and wildcards are not supported.";
     lookup.error = true;
     renderLookupSnapshot();
     return;
