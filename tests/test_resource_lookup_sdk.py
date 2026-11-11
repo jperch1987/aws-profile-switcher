@@ -2,6 +2,8 @@
 """Optional real-SDK smoke checks; synthetic credentials and all sockets blocked."""
 
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import socket
@@ -15,7 +17,7 @@ import resource_lookup as lookup
 try:
     import boto3
     from botocore.config import Config
-    from botocore.stub import Stubber
+    from botocore.stub import ANY, Stubber
 except ImportError:
     boto3 = None
 
@@ -47,6 +49,41 @@ class ResourceLookupSdkTests(unittest.TestCase):
         client = lookup._client(self.session, Config, family, "us-east-1", self.credentials)
         self.addCleanup(client.close)
         return client
+
+    def test_real_sdk_vpc_id_name_and_arn_filters_paginate_and_return_metadata(self):
+        client = self.client("ec2")
+        vpc_id = "vpc-0123456789abcdef0"
+        arn = f"arn:aws:ec2:us-east-1:111111111111:vpc/{vpc_id}"
+        for query, filter_name, value in [(vpc_id, "vpc-id", vpc_id), ("production-vpc", "tag:Name", "production-vpc"), (arn, "vpc-id", vpc_id)]:
+            with self.subTest(query=query):
+                parameters = {"Filters": [{"Name": filter_name, "Values": [value]}], "MaxResults": 100}
+                operation = client.meta.service_model.operation_model("DescribeVpcs")
+                serialized = client._serializer.serialize_to_request(parameters, operation)
+                self.assertEqual(serialized["body"], {"Action": "DescribeVpcs", "Version": "2016-11-15",
+                    "Filter.1.Name": filter_name, "Filter.1.Value.1": value, "MaxResults": 100})
+                with Stubber(client) as stub:
+                    stub.add_response("describe_vpcs", {"Vpcs": [], "NextToken": "PAGE_TWO"}, parameters)
+                    stub.add_response("describe_vpcs", {"Vpcs": [{"VpcId": vpc_id, "OwnerId": "111111111111",
+                        "State": "available", "CidrBlock": "10.0.0.0/16", "Tags": [{"Key": "Name", "Value": "production-vpc"}]}]},
+                        {**parameters, "NextToken": "PAGE_TWO"})
+                    rows = []
+                    lookup._ec2(client, self.selected, "vpc", lookup.parse_query("vpc", query), rows, float("inf"))
+                    stub.assert_no_pending_responses()
+                    self.assertEqual(rows, [{"profile": "test", "accountId": "111111111111", "region": "us-east-1",
+                        "resourceType": "vpc", "resourceId": vpc_id, "name": "production-vpc", "arn": arn}])
+
+    def test_real_sdk_vpc_role_assumption_has_valid_restricted_session_parameters(self):
+        client = self.client("sts")
+        expected = {"RoleArn": self.selected["role_arn"], "RoleSessionName": ANY, "DurationSeconds": 900,
+            "Policy": json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+                "Action": ["ec2:DescribeVpcs"], "Resource": "*"}]}, separators=(",", ":"))}
+        temporary = {"AccessKeyId": "TEST_ROLE_KEY_12345678", "SecretAccessKey": "TEST_ROLE_SECRET",
+            "SessionToken": "TEST_ROLE_TOKEN", "Expiration": datetime.now(timezone.utc) + timedelta(seconds=900)}
+        with Stubber(client) as stub, patch.object(self.session, "client", return_value=client):
+            stub.add_response("assume_role", {"Credentials": temporary}, expected)
+            returned = lookup._assume(self.session, Config, {**self.selected, "external_id": ""}, self.credentials, "vpc", float("inf"))
+            stub.assert_no_pending_responses()
+            self.assertEqual(returned, temporary)
 
     def test_real_sdk_client_parameters_serializer_and_signing_match_both_apis(self):
         for family, parameter, result_key, version in [

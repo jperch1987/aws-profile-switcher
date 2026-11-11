@@ -79,6 +79,14 @@ class ScanError(Exception):
         self.safe_message = message or MESSAGES[status]
 
 
+class _AssumeFailure(ScanError):
+    """An STS stage failure whose public text has already been sanitized."""
+
+    def __init__(self, error, stage):
+        failure = _request_failure(error, "sts", stage)
+        super().__init__(failure.status, failure.safe_message)
+
+
 def _text(value, maximum=256, *, empty=False):
     return (isinstance(value, str) and (empty or bool(value)) and len(value) <= maximum
             and not any(unicodedata.category(character) in {"Cc", "Cs"} or character in "\u2028\u2029" for character in value))
@@ -268,11 +276,11 @@ def _error_code(error):
 
 
 def _scan_failure(error, *, authenticating=False):
+    if authenticating:
+        return error if isinstance(error, _AssumeFailure) else _request_failure(error, "sts", "request")
     if isinstance(error, ScanError):
         return error
     code = _error_code(error)
-    if authenticating:
-        return ScanError("auth_failed")
     if code in {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "AuthorizationError", "Forbidden", "403"}:
         return ScanError("access_denied")
     if code in {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException", "SignatureDoesNotMatch"}:
@@ -280,6 +288,77 @@ def _scan_failure(error, *, authenticating=False):
     if code in {"DBInstanceNotFound", "DBInstanceNotFoundFault", "ResourceNotFoundException", "NoSuchBucket", "InvalidInstanceID.NotFound", "InvalidVolume.NotFound", "InvalidGroup.NotFound", "InvalidVpcID.NotFound", "CacheClusterNotFound", "CacheClusterNotFoundFault", "ReplicationGroupNotFound", "ReplicationGroupNotFoundFault", "ServerlessCacheNotFoundFault", "NoSuchHostedZone", "LoadBalancerNotFound", "LoadBalancerNotFoundException"}:
         return ScanError("not_found")
     return ScanError("error")
+
+
+def _request_failure(error, service, stage):
+    """Classify STS/VPC failures using only fixed text and allowlisted codes."""
+    assuming = service == "sts"
+    if assuming:
+        step = {"client": "STS client setup failed", "credentials": "STS credential response validation failed"}.get(stage, "STS AssumeRole failed")
+    else:
+        step = "VPC client setup failed (ec2:DescribeVpcs)" if stage == "client" else "VPC read failed (ec2:DescribeVpcs)"
+    if isinstance(error, ScanError):
+        if error.status == "skipped" and error.safe_message == MESSAGES["deadline"]:
+            return ScanError("skipped", MESSAGES["deadline"])
+        # Only our fixed metadata/page diagnostics can cross this boundary.
+        # Never forward custom ScanError text, including from SDK mocks/hooks.
+        if not assuming and error.status == "not_found" and error.safe_message == MESSAGES["not_found"]:
+            return ScanError("not_found")
+        message = error.safe_message if error.safe_message in {MESSAGES["invalid_response"], MESSAGES["limit"]} else MESSAGES["error"]
+        return ScanError("error", f"{step}: {message}")
+    if assuming and stage == "credentials":
+        return ScanError("error", f"{step}: AWS returned missing, malformed, or invalid-duration temporary credentials. No resource read was attempted.")
+    code = _error_code(error)
+    if code in {"AccessDenied", "AccessDeniedException", "AccessDeniedFault", "UnauthorizedOperation", "AuthorizationError", "Forbidden", "ForbiddenException", "NotAuthorized", "403"}:
+        if assuming:
+            return ScanError("auth_failed", f"{step}: AWS denied sts:AssumeRole ({code}). Check the source identity's AssumeRole permission and the target role's trust policy, external ID, and session-name conditions.")
+        return ScanError("access_denied", f"{step}: AWS denied the VPC read ({code}). Check ec2:DescribeVpcs permission on the role and any policies restricting that permission.")
+    if code in {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "UnrecognizedClientException", "SignatureDoesNotMatch", "InvalidSignatureException", "MissingAuthenticationToken"}:
+        session = "source MFA session" if assuming else "temporary role session"
+        return ScanError("auth_failed", f"{step}: AWS rejected the {session} ({code}). Retry the lookup with a fresh MFA code.")
+    if not assuming and code == "AuthFailure":
+        return ScanError("auth_failed", f"{step}: EC2 could not validate the role credentials or account authorization (AuthFailure). Verify the account's EC2 access and retry with a fresh MFA session.")
+    if not assuming and code == "InvalidVpcID.NotFound":
+        return ScanError("not_found")
+    if code in {"RequestExpired", "RequestTimeTooSkewed", "RequestInTheFuture"}:
+        reason = f"AWS rejected the request timing ({code}). Synchronize the computer's clock, then retry with a fresh MFA session. Temporary credentials may also have expired."
+    elif code in {"ValidationError", "InvalidParameter", "InvalidParameterValue", "InvalidParameterCombination", "InvalidConfigurationRequest", "InvalidQueryParameter", "MissingParameter", "MalformedPolicyDocument", "PackedPolicyTooLarge"}:
+        reason = f"AWS rejected the request parameters ({code}). Check the profile settings and app version."
+    elif code in {"Throttling", "ThrottlingException", "RequestLimitExceeded", "DependencyThrottle"}:
+        reason = f"AWS limited the requests ({code}). Wait briefly and retry."
+    elif code in {"ServiceUnavailable", "ServiceUnavailableException", "InternalFailure", "InternalError"}:
+        reason = f"AWS could not complete the request ({code}). Retry later."
+    elif code == "RegionDisabledException" and assuming:
+        reason = "AWS STS is disabled in the configured region (RegionDisabledException). Check the account's regional STS settings."
+    else:
+        name = type(error).__name__
+        messages = {
+            "EndpointConnectionError": "Could not connect to the regional AWS endpoint.",
+            "ConnectTimeoutError": "Connection to the regional AWS endpoint timed out.",
+            "ReadTimeoutError": "AWS did not reply before the read timeout.",
+            "ConnectionClosedError": "The AWS connection closed before the response finished.",
+            "SSLError": "The TLS connection or certificate verification failed.",
+            "ProxyConnectionError": "A proxy connection failed.",
+            "ResponseParserError": "AWS returned a response that the Python SDK could not read.",
+            "ParamValidationError": "The Python SDK rejected the request parameters. Check the app version and Python dependencies.",
+            "UnknownSignatureVersionError": "The Python SDK could not use the required request signing method.",
+            "UnsupportedSignatureVersionError": "The Python SDK could not use the required request signing method.",
+            "EndpointResolutionError": "The Python SDK could not resolve the AWS endpoint settings.",
+            "InvalidEndpointConfigurationError": "The Python SDK could not resolve the AWS endpoint settings.",
+        }
+        if name in messages:
+            reason = messages[name]
+        elif name in {"UnknownServiceError", "DataNotFoundError", "UnknownAPIVersionError", "UnknownEndpointError", "ImportError", "ModuleNotFoundError"}:
+            reason = "The Python AWS SDK service data is missing or unsupported. Reinstall requirements.txt."
+        elif name in {"NoCredentialsError", "PartialCredentialsError", "CredentialRetrievalError"}:
+            reason = "The Python SDK could not load the temporary session credentials. Check the app and its Python dependencies, then retry."
+        elif name in {"TypeError", "AttributeError", "KeyError", "ValueError"}:
+            reason = f"Unexpected application or SDK error ({name}). Update the app and its Python dependencies."
+        elif code is not None:
+            reason = "AWS returned an unrecognized service error. This check is incomplete."
+        else:
+            reason = "Unexpected application or SDK failure. This check is incomplete."
+    return ScanError("error", f"{step}: {reason}")
 
 
 def _before_call(deadline):
@@ -332,9 +411,15 @@ def _assume(session, config_class, selected, source_credentials, resource_type, 
                   "DurationSeconds": SESSION_SECONDS, "Policy": json.dumps(policy, separators=(",", ":"))}
     if selected["external_id"]:
         parameters["ExternalId"] = selected["external_id"]
-    with closing(_client(session, config_class, "sts", selected["region"], source_credentials)) as client:
-        response = _call(client, "assume_role", parameters, deadline)
-    return aws_session._credentials(response)
+    stage = "client"
+    try:
+        with closing(_client(session, config_class, "sts", selected["region"], source_credentials)) as client:
+            stage = "request"
+            response = _call(client, "assume_role", parameters, deadline)
+        stage = "credentials"
+        return aws_session._credentials(response)
+    except Exception as error:
+        raise _AssumeFailure(error, stage) from None
 
 
 def _list(response, key):
@@ -872,12 +957,14 @@ def scan(config_file, payload, emit):
                     failure = _scan_failure(error, authenticating=True)
                     _emit_check(emit, selected, failure.status, rows, failure.safe_message)
                     continue
+                read_stage = "client"
                 try:
                     if resource_type == "load-balancer":
                         _load_balancers(session, config_class, selected, query, rows, deadline, credentials)
                     else:
                         service = "ec2" if resource_type in EC2_TYPES or resource_type == "private-ip" else resource_type
                         with closing(_client(session, config_class, service, selected["region"], credentials)) as client:
+                            read_stage = "read"
                             if resource_type in EC2_TYPES:
                                 _ec2(client, selected, resource_type, query, rows, deadline)
                             elif resource_type == "private-ip":
@@ -896,7 +983,7 @@ def scan(config_file, payload, emit):
                                 _route53(client, selected, query, rows, deadline)
                     _emit_check(emit, selected, "found" if rows else "not_found", rows)
                 except Exception as error:
-                    failure = _scan_failure(error)
+                    failure = _request_failure(error, "vpc", read_stage) if resource_type == "vpc" else _scan_failure(error)
                     if rows and failure.status == "not_found":
                         failure = ScanError("error")
                     _emit_check(emit, selected, failure.status, rows, failure.safe_message)

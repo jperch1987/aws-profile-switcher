@@ -356,6 +356,20 @@ Results show the matching IP, ENI ID/ARN and optional Name tag, VPC, subnet, int
 
 This is an AWS metadata lookup: it does not ping the address, scan ports, resolve DNS names, or connect to workloads. It searches only selected accounts and configured regions and only interfaces visible through the API. It does not discover IPv6, CIDR ranges, on-premises resources, hidden managed interfaces, or IPs within delegated prefixes that are not individually assigned to an ENI (including some EKS pod configurations). It does not inventory Kubernetes pods or resolve every service's parent resource. The input accepts exact IPv4 literals beyond RFC1918 ranges because VPCs can use other address ranges; it always queries the ENI's **private** address fields. A no-match result is limited to that scope.
 
+### When VPC lookup or every profile reports Authentication failed
+
+Read the reason in **Why checks did not complete** and the individual profile card. Earlier versions labeled every failure during role assumption as **Authentication failed**, including connection, SDK, and request-validation errors. Version 1.8.1 distinguishes those failures and identifies the step that failed. This corrects the reporting; it does not by itself fix an AWS permission or connectivity problem.
+
+- **STS client setup:** the helper could not prepare the AWS client. Follow the reported SDK or connection diagnostic. On WSL, use the installer-selected virtual environment in Linux home and restart the app after reinstalling dependencies.
+- **STS AssumeRole:** AWS has not issued credentials for that target role. A denied request requires checking the source identity's `sts:AssumeRole` permission and the target role's trust conditions, including any external ID or role-session-name requirement. Changing VPC read permissions alone does not resolve a role-assumption denial. Lookup currently generates `resource-lookup-<random>` session names.
+- **STS credential response validation:** the helper rejected an invalid or expired credential response. It does not query resources using that response.
+- **VPC client setup:** the role was assumed, but the helper could not prepare the EC2 client. Follow the SDK or connection reason shown.
+- **VPC read:** the role was assumed, but `ec2:DescribeVpcs` failed. A read denial requires checking that action on the target role and applicable boundaries or organization policies. Expired/invalid session and clock errors are reported separately from read denials.
+
+Connection, TLS, SDK, throttling, request-validation, and unexpected failures are shown as **Check failed**, with a safe reason. These do not establish a trust-policy problem. Clock-related errors require checking the app machine's time before starting a new search. Raw AWS error messages and credentials are never displayed.
+
+Retry **one profile** with a fresh MFA code and compare VPC with an EC2 lookup using the same source identity and profile. Share only the safe step and reason from the result when reporting a problem. A VPC search supports the VPC ID, exact `Name` tag, or VPC ARN; it checks only the profile's configured region. An unsuccessful lookup does not establish that the resource is absent.
+
 ### When load balancer lookup says Check failed
 
 **Check failed** means the profile could not be fully searched; it is different from **No match**. The **Why checks did not complete** panel above the profile checks shows the safe error reasons and how many profiles share them. Individual profile cards retain their own messages. Application/Network/Gateway and Classic failures are identified separately; a match from one API remains visible if the other API fails.

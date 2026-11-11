@@ -221,6 +221,195 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(self.resource.describe_instances.call_count, 1)
         self.assertNotIn("PRIVATE", json.dumps(events))
 
+    def test_assume_failures_classify_known_aws_codes_without_exposing_private_details(self):
+        groups = [
+            (["AccessDenied", "AccessDeniedException", "ForbiddenException", "NotAuthorized"], "auth_failed", "denied sts:AssumeRole"),
+            (["ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "SignatureDoesNotMatch"], "auth_failed", "source MFA session"),
+            (["ValidationError", "InvalidParameterValue", "MalformedPolicyDocument", "PackedPolicyTooLarge"], "error", "request parameters"),
+            (["Throttling", "ThrottlingException", "RequestLimitExceeded"], "error", "limited the requests"),
+            (["ServiceUnavailable", "InternalFailure", "InternalError"], "error", "could not complete"),
+            (["RequestExpired", "RequestTimeTooSkewed", "RequestInTheFuture"], "error", "computer's clock"),
+            (["RegionDisabledException"], "error", "regional STS settings"),
+        ]
+        for codes, status, reason in groups:
+            for code in codes:
+                with self.subTest(code=code):
+                    self.sts.assume_role.side_effect = aws_error(code)
+                    event = self.scan(request("vpc", "vpc-01234567"))[0]
+                    self.assertEqual(event["check"]["status"], status)
+                    message = event["check"]["message"]
+                    self.assertIn("STS AssumeRole failed", message)
+                    self.assertIn(reason, message)
+                    self.assertIn(code, message)
+                    self.assertNotIn("PRIVATE", message)
+                    self.assertNotIn("012345", message)
+                    self.assertNotIn(ACCOUNT, message)
+                    self.assertLessEqual(len(message), 500)
+        self.resource.describe_vpcs.assert_not_called()
+
+    def test_denied_assume_names_the_source_permission_and_target_trust_conditions(self):
+        self.sts.assume_role.side_effect = aws_error("AccessDenied")
+        message = self.scan(request("vpc", "vpc-01234567"))[0]["check"]["message"]
+        for text in ["source identity's AssumeRole permission", "target role's trust policy", "external ID", "session-name conditions"]:
+            self.assertIn(text, message)
+        self.assertNotIn("ec2:DescribeVpcs", message)
+
+    def test_assume_network_failure_is_check_failed_and_other_profiles_still_run(self):
+        self.sts.assume_role.side_effect = [type("ReadTimeoutError", (Exception,), {})("PRIVATE_ENDPOINT_TOKEN"), {"Credentials": credentials()}]
+        self.resource.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-01234567", "OwnerId": ACCOUNT}]}
+        events = self.scan(request("vpc", "vpc-01234567", ["dev", "prod"]))
+        self.assertEqual([event["check"]["status"] for event in events], ["error", "found"])
+        self.assertIn("STS AssumeRole failed", events[0]["check"]["message"])
+        self.assertIn("read timeout", events[0]["check"]["message"])
+        self.assertNotIn("trust", events[0]["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(events))
+        self.resource.describe_vpcs.assert_called_once()
+        self.source_client.get_session_token.assert_called_once()
+
+    def test_assume_client_setup_failure_is_distinct_from_the_sts_request(self):
+        original = self.session.client.side_effect
+        def client(service, **kwargs):
+            if service == "sts" and kwargs["aws_session_token"] is not None:
+                raise type("DataNotFoundError", (Exception,), {})("PRIVATE_SDK_PATH")
+            return original(service, **kwargs)
+        self.session.client.side_effect = client
+        event = self.scan(request("vpc", "vpc-01234567"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertIn("STS client setup failed", event["check"]["message"])
+        self.assertIn("service data", event["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.sts.assume_role.assert_not_called()
+        self.resource.describe_vpcs.assert_not_called()
+
+    def test_sts_and_vpc_network_sdk_errors_never_become_false_authentication_failures(self):
+        examples = [("EndpointConnectionError", "Could not connect"), ("ConnectTimeoutError", "timed out"),
+            ("ReadTimeoutError", "read timeout"), ("ConnectionClosedError", "connection closed"),
+            ("SSLError", "TLS connection"), ("ProxyConnectionError", "proxy connection"),
+            ("ResponseParserError", "could not read"), ("ParamValidationError", "request parameters"),
+            ("UnknownSignatureVersionError", "signing method"), ("EndpointResolutionError", "endpoint settings"),
+            ("UnknownServiceError", "service data"), ("DataNotFoundError", "service data"),
+            ("ModuleNotFoundError", "service data"), ("NoCredentialsError", "temporary session credentials"),
+            ("PartialCredentialsError", "temporary session credentials"), ("TypeError", "application or SDK error")]
+        for service in ["sts", "vpc"]:
+            for name, reason in examples:
+                for stage in ["client", "request"]:
+                    with self.subTest(service=service, name=name, stage=stage):
+                        failure = lookup._request_failure(type(name, (Exception,), {})("PRIVATE_URL_TOKEN_PATH"), service, stage)
+                        self.assertEqual(failure.status, "error")
+                        self.assertIn(reason, failure.safe_message)
+                        self.assertNotIn("PRIVATE", failure.safe_message)
+                        self.assertNotIn("trust", failure.safe_message)
+                        self.assertLessEqual(len(failure.safe_message), 500)
+
+    def test_invalid_assumed_credentials_are_response_errors_and_next_profile_continues(self):
+        invalid = [None, {}, {"Credentials": {}}, {"Credentials": {**credentials(), "SessionToken": "PRIVATE\nTOKEN"}},
+            {"Credentials": {**credentials(), "Expiration": datetime.now(timezone.utc) - timedelta(minutes=1)}}]
+        for response in invalid:
+            with self.subTest(response_type=type(response).__name__):
+                self.sts.assume_role.side_effect = [response, {"Credentials": credentials()}]
+                self.resource.describe_instances.reset_mock()
+                events = self.scan(request(profiles=["dev", "prod"]))
+                self.assertEqual([event["check"]["status"] for event in events], ["error", "found"])
+                self.assertIn("STS credential response validation failed", events[0]["check"]["message"])
+                self.assertNotIn("PRIVATE", json.dumps(events))
+                self.assertNotIn("TEST_", json.dumps(events))
+                self.resource.describe_instances.assert_called_once()
+
+    def test_role_and_vpc_diagnostics_hide_unknown_errors_and_custom_scan_messages(self):
+        errors = [aws_error("PRIVATE_AWS_CODE"), type("PRIVATE_CLASS_NAME", (Exception,), {})("PRIVATE_PATH"),
+            aws_session.SessionError("PRIVATE_SESSION_MESSAGE"), lookup.ScanError("error", "PRIVATE_CUSTOM_MESSAGE"),
+            lookup.ScanError("auth_failed", "PRIVATE_AUTH_MESSAGE"), lookup.ScanError("skipped", "PRIVATE_SKIP_MESSAGE")]
+        for error in errors:
+            for assuming in [True, False]:
+                with self.subTest(error_type=type(error).__name__, assuming=assuming):
+                    if assuming:
+                        self.sts.assume_role.side_effect = error
+                    else:
+                        self.sts.assume_role.side_effect = lambda **_: {"Credentials": credentials()}
+                        self.resource.describe_vpcs.side_effect = error
+                    event = self.scan(request("vpc", "vpc-01234567"))[0]
+                    self.assertEqual(event["check"]["status"], "error")
+                    self.assertNotIn("PRIVATE", json.dumps(event))
+                    self.assertNotIn("012345", event["check"]["message"])
+        failure = lookup._scan_failure(lookup.ScanError("auth_failed", "PRIVATE_AUTH_MESSAGE"), authenticating=True)
+        self.assertEqual(failure.status, "error")
+        self.assertNotIn("PRIVATE", failure.safe_message)
+
+    def test_vpc_read_failures_name_describe_vpcs_without_sts_trust_advice(self):
+        groups = [(["AccessDenied", "UnauthorizedOperation", "ForbiddenException"], "access_denied", "denied the VPC read"),
+            (["ExpiredToken", "InvalidClientTokenId"], "auth_failed", "temporary role session"),
+            (["AuthFailure"], "auth_failed", "credentials or account authorization"),
+            (["RequestExpired", "RequestTimeTooSkewed", "RequestInTheFuture"], "error", "computer's clock"),
+            (["ValidationError", "InvalidParameterValue"], "error", "request parameters"),
+            (["Throttling"], "error", "limited the requests"), (["InternalError"], "error", "could not complete")]
+        for codes, status, reason in groups:
+            for code in codes:
+                with self.subTest(code=code):
+                    self.resource.describe_vpcs.side_effect = aws_error(code)
+                    event = self.scan(request("vpc", "vpc-01234567"))[0]
+                    self.assertEqual(event["check"]["status"], status)
+                    message = event["check"]["message"]
+                    self.assertIn("VPC read failed (ec2:DescribeVpcs)", message)
+                    self.assertIn(reason, message)
+                    self.assertIn(code, message)
+                    for forbidden in ["PRIVATE", "012345", "trust policy", "external ID", "STS AssumeRole"]:
+                        self.assertNotIn(forbidden, message)
+                    self.assertLessEqual(len(message), 500)
+
+    def test_vpc_client_setup_failure_names_the_read_phase_without_calling_describe(self):
+        original = self.session.client.side_effect
+        def client(service, **kwargs):
+            if service == "ec2":
+                raise type("SSLError", (Exception,), {})("PRIVATE_CERTIFICATE_PATH")
+            return original(service, **kwargs)
+        self.session.client.side_effect = client
+        event = self.scan(request("vpc", "vpc-01234567"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertIn("VPC client setup failed (ec2:DescribeVpcs)", event["check"]["message"])
+        self.assertIn("TLS connection", event["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.sts.assume_role.assert_called_once()
+        self.resource.describe_vpcs.assert_not_called()
+
+    def test_vpc_read_failure_retains_confirmed_matches_and_continues_profiles(self):
+        page = {"Vpcs": [{"VpcId": "vpc-01234567", "OwnerId": ACCOUNT}]}
+        self.resource.describe_vpcs.side_effect = [{**page, "NextToken": "PRIVATE_PAGE_TOKEN"}, aws_error("UnauthorizedOperation"), page]
+        events = self.scan(request("vpc", "vpc-01234567", ["dev", "prod"]))
+        self.assertEqual([event["check"]["status"] for event in events], ["access_denied", "found"])
+        self.assertEqual([len(event["results"]) for event in events], [1, 1])
+        self.assertIn("ec2:DescribeVpcs", events[0]["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(events))
+
+    def test_vpc_metadata_page_limits_and_initial_not_found_preserve_correct_status(self):
+        self.resource.describe_vpcs.side_effect = aws_error("InvalidVpcID.NotFound")
+        self.assertEqual(self.scan(request("vpc", "vpc-01234567"))[0]["check"]["status"], "not_found")
+        self.resource.describe_vpcs.side_effect = None
+        self.resource.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-01234567", "OwnerId": "PRIVATE_OWNER"}]}
+        event = self.scan(request("vpc", "vpc-01234567"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertIn("VPC read failed (ec2:DescribeVpcs)", event["check"]["message"])
+        self.assertIn("unexpected resource metadata", event["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(event))
+        self.resource.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-01234567", "OwnerId": ACCOUNT}], "NextToken": "PRIVATE_REPEAT"}
+        event = self.scan(request("vpc", "vpc-01234567"))[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
+        self.assertIn("page or result limit", event["check"]["message"])
+        self.assertNotIn("PRIVATE", json.dumps(event))
+
+    def test_role_and_vpc_deadlines_remain_skipped_with_fixed_safe_message(self):
+        for assuming in [True, False]:
+            with self.subTest(assuming=assuming):
+                deadline = lookup.ScanError("skipped", lookup.MESSAGES["deadline"])
+                if assuming:
+                    self.sts.assume_role.side_effect = deadline
+                else:
+                    self.sts.assume_role.side_effect = lambda **_: {"Credentials": credentials()}
+                    self.resource.describe_vpcs.side_effect = deadline
+                events = self.scan(request("vpc", "vpc-01234567", ["dev", "prod"]))
+                self.assertEqual([event["check"]["status"] for event in events], ["skipped", "skipped"])
+                self.assertTrue(all(event["check"]["message"] == lookup.MESSAGES["deadline"] for event in events))
+
     def test_exact_name_tag_filter_is_postchecked_and_pagination_is_followed(self):
         first = ec2_response(name="prod-extra")
         first["NextToken"] = "TEST_NEXT_PAGE"
