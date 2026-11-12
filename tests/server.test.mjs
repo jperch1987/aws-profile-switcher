@@ -472,6 +472,47 @@ test('CLI credential exports require fresh MFA and never persist or restore secr
   assert.deepEqual((await app.request('/api/active')).json(),{profile:null,commands:null});
 });
 
+test('CLI session names are optional, exact, and validated before authentication', async (t) => {
+  const names = [];
+  let consoleCalls = 0;
+  const app = await fixture(t, exampleConfig, {
+    cliSession: async (profile, code, roleSessionName) => {
+      names.push(roleSessionName);
+      assert.equal(code, '012345');
+      return fakeCliSession(profile);
+    },
+    consoleSession: async (profile) => { consoleCalls++; return fakeSession(profile); },
+  });
+  const { token } = (await app.request('/api/profiles')).json();
+  const post = (body, endpoint = '/api/cli') => app.request(endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-csrf-token': token }, body: JSON.stringify(body),
+  });
+  const base = { profile: 'dev', mfaCode: '012345' };
+  for (const roleSessionName of [null, 123, false, {}, [], 'a', 'A'.repeat(65), ' ', ' name', 'name ', 'PRIVATE_NAME\n', 'name\r', 'name\t', 'na\0me', '用户', 'na/me', 'na:me', '$(whoami)']) {
+    const response = await post({ ...base, roleSessionName });
+    assert.equal(response.status, 400);
+    assert.match(response.json().error, /Role session name must/);
+    assert.doesNotMatch(response.text, /PRIVATE_NAME|012345/);
+  }
+  for (const body of [{ ...base, unexpected: true }, { ...base, roleSessionName: 'valid', unexpected: true }, [], null]) {
+    assert.equal((await post(body)).status, 400);
+  }
+  assert.deepEqual(names, []);
+  for (const roleSessionName of ['', 'jperch1987-cli']) {
+    assert.equal((await post({ ...base, roleSessionName }, '/api/console')).status, 400);
+  }
+  assert.equal(consoleCalls, 0);
+  assert.equal((await post(base)).status, 200);
+  for (const roleSessionName of ['', 'ab', 'jperch1987-cli', 'User_01+=,.@-', 'A'.repeat(64)]) {
+    assert.equal((await post({ ...base, roleSessionName })).status, 200);
+  }
+  assert.deepEqual(names, ['', '', 'ab', 'jperch1987-cli', 'User_01+=,.@-', 'A'.repeat(64)]);
+  assert.equal((await post(base, '/api/console')).status, 200);
+  assert.equal(consoleCalls, 1);
+  assert.equal(await readFile(app.configFile, 'utf8'), exampleConfig);
+  assert.doesNotMatch((await app.request('/api/profiles')).text, /jperch1987-cli|roleSessionName/);
+});
+
 test('short exports apply literal temporary values and region without helper commands', {skip:process.platform==='win32'},async()=>{
   const result=fakeCliSession({role_arn:'arn:aws:iam::123456789012:role/Dev'});
   result.credentials.SecretAccessKey="TEST_ONLY_'$(printf${IFS}substituted)'`false`";

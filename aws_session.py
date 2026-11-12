@@ -37,6 +37,7 @@ REGION_PATTERN = re.compile(
 )
 MFA_SERIAL_PATTERN = re.compile(r"[A-Za-z0-9_+=/:,.@-]{9,256}\Z")
 EXTERNAL_ID_PATTERN = re.compile(r"[A-Za-z0-9_+=,.@:/-]{2,1224}\Z")
+ROLE_SESSION_NAME_PATTERN = re.compile(r"[A-Za-z0-9_+=,.@-]{2,64}\Z")
 CONFLICTING_ENV = (
     "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SECURITY_TOKEN", "AWS_ROLE_ARN",
     "AWS_ROLE_SESSION_NAME", "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -47,6 +48,12 @@ CONFLICTING_ENV = (
 
 class SessionError(ValueError):
     """An actionable diagnostic safe to display without AWS response details."""
+
+
+def _validate_role_session_name(value: str) -> str:
+    if not isinstance(value, str) or (value != "" and not ROLE_SESSION_NAME_PATTERN.fullmatch(value)):
+        raise SessionError("Role session name must be blank or 2–64 characters using letters, numbers, or _+=,.@- without spaces.")
+    return value
 
 
 def _selected_profile(config_file: str | Path, profile_name: str, *, config: dict | None = None) -> dict[str, str]:
@@ -160,10 +167,11 @@ def _credentials(response: dict, now: datetime | None = None) -> dict:
     return {key: value[key] for key in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")}
 
 
-def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict:
+def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str, *, role_session_name: str = "", progress=None) -> dict:
     """Make one fresh AssumeRole call; no MFA or credential cache is used."""
     if not isinstance(mfa_code, str) or not re.fullmatch(r"[0-9]{6}", mfa_code):
         raise SessionError("Enter the six-digit code from your MFA device.")
+    _validate_role_session_name(role_session_name)
     if progress:
         progress("configuration")
     selected = _selected_profile(config_file, profile_name)
@@ -204,7 +212,7 @@ def assume_profile(config_file: str | Path, profile_name: str, mfa_code: str, *,
             )
             parameters = {
                 "RoleArn": selected["role_arn"],
-                "RoleSessionName": f"profile-switcher-{secrets.token_hex(8)}",
+                "RoleSessionName": role_session_name or f"profile-switcher-{secrets.token_hex(8)}",
                 "DurationSeconds": SESSION_SECONDS,
                 "SerialNumber": selected["mfa_serial"],
                 "TokenCode": mfa_code,
@@ -309,9 +317,9 @@ def console_session(config_file: str | Path, profile_name: str, mfa_code: str, *
     }
 
 
-def cli_session(config_file: str | Path, profile_name: str, mfa_code: str, *, progress=None) -> dict:
+def cli_session(config_file: str | Path, profile_name: str, mfa_code: str, *, role_session_name: str = "", progress=None) -> dict:
     """Return only newly assumed role credentials to the local CLI session UI."""
-    result = assume_profile(config_file, profile_name, mfa_code, progress=progress)
+    result = assume_profile(config_file, profile_name, mfa_code, role_session_name=role_session_name, progress=progress)
     credentials = result["credentials"]
     return {
         "credentials": {
@@ -353,7 +361,7 @@ def _prompt_mfa() -> str:
         raise SessionError("MFA entry needs an interactive terminal that can hide input. Run the switch command in your terminal.") from None
 
 
-def _worker_request() -> tuple[str, str]:
+def _worker_request(*, allow_role_session_name: bool = False) -> tuple[str, str, str]:
     raw = sys.stdin.buffer.read(MAX_WORKER_BYTES + 1)
     if len(raw) > MAX_WORKER_BYTES:
         raise SessionError("The sign-in request is too large.")
@@ -361,12 +369,15 @@ def _worker_request() -> tuple[str, str]:
         payload = json.loads(raw)
     except (ValueError, UnicodeError):
         raise SessionError("Invalid sign-in request.") from None
-    if not isinstance(payload, dict) or set(payload) != {"profile", "mfaCode"}:
+    required = {"profile", "mfaCode"}
+    allowed = required | ({"roleSessionName"} if allow_role_session_name else set())
+    if not isinstance(payload, dict) or not required <= set(payload) <= allowed:
         raise SessionError("Invalid sign-in request.")
     profile_name, mfa_code = payload["profile"], payload["mfaCode"]
     if not isinstance(profile_name, str) or not 1 <= len(profile_name) <= 2048 or not isinstance(mfa_code, str):
         raise SessionError("Invalid sign-in request.")
-    return profile_name, mfa_code
+    role_session_name = _validate_role_session_name(payload.get("roleSessionName", ""))
+    return profile_name, mfa_code, role_session_name
 
 
 def _worker_stage(stage: str) -> None:
@@ -380,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", required=True, help="Local AWS config file")
     parser.add_argument("--profile", help="Role profile for an interactive CLI session")
+    parser.add_argument("--role-session-name", help="Optional CLI session name; blank uses a generated name")
     parser.add_argument("--shell", choices=("posix", "powershell"), default="posix")
     workers = parser.add_mutually_exclusive_group()
     workers.add_argument("--console-worker", action="store_true", help=argparse.SUPPRESS)
@@ -387,18 +399,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.console_worker or args.cli_worker:
-            profile_name, mfa_code = _worker_request()
+            if args.role_session_name is not None:
+                raise SessionError("Worker session names must be supplied in the CLI request, not as a command argument.")
+            profile_name, mfa_code, role_session_name = _worker_request(allow_role_session_name=args.cli_worker)
             if args.console_worker:
                 result = console_session(args.file, profile_name, mfa_code, progress=_worker_stage)
             else:
-                result = cli_session(args.file, profile_name, mfa_code, progress=_worker_stage)
+                result = cli_session(args.file, profile_name, mfa_code, role_session_name=role_session_name, progress=_worker_stage)
             output = json.dumps(result, ensure_ascii=True)
         else:
             if not args.profile:
                 raise SessionError("Choose a profile with --profile.")
+            role_session_name = _validate_role_session_name(args.role_session_name if args.role_session_name is not None else "")
             # Catch configuration mistakes before prompting for a one-time code.
             _selected_profile(args.file, args.profile)
-            result = assume_profile(args.file, args.profile, _prompt_mfa())
+            result = assume_profile(args.file, args.profile, _prompt_mfa(), role_session_name=role_session_name)
             output = shell_exports(result, args.shell)
             expiration = result["credentials"]["Expiration"].astimezone(timezone.utc).isoformat()
             print(

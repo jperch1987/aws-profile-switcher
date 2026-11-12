@@ -110,6 +110,7 @@ function clearConsoleAction() {
   $("console-link").hidden = true;
   $("console-link").removeAttribute("href");
   $("mfa-code").disabled = true;
+  $("role-session-name").disabled = true;
   $("console-reason").hidden = true;
   $("console-reason").textContent = "";
   $("cli-reason").hidden = true;
@@ -198,6 +199,7 @@ function renderDetails() {
   $("switch-help").textContent = "Enter a fresh MFA code here for CLI credentials. Console switching uses your existing AWS browser session.";
   const url = approvedConsoleUrl(selected.console?.url);
   $("mfa-code").disabled = busy() || lookup.running || !enabled;
+  $("role-session-name").disabled = busy() || lookup.running || !enabled;
   $("detail-mfa").textContent = selected.auth?.mfaSerial || "Not set";
   $("detail-mfa").classList.toggle("not-set", !selected.auth?.mfaSerial);
   if (!enabled) {
@@ -322,10 +324,17 @@ async function loadProfiles(isRefresh = false) {
 async function switchProfile() {
   if (busy() || lookup.running || state.profiles.find((profile) => profile.profile === state.selected)?.auth?.enabled !== true) return;
   const selected = state.profiles.find((profile) => profile.profile === state.selected);
+  const roleSessionName = $("role-session-name").value;
   let mfaCode = $("mfa-code").value;
   clearMfa();
   clearLookupMfa();
   clearCredentials();
+  if (roleSessionName !== "" && (roleSessionName.length < 2 || roleSessionName.length > 64 || /[^A-Za-z0-9_+=,.@-]/.test(roleSessionName))) {
+    mfaCode = "";
+    announce("Role session name must be 2–64 letters, numbers, or _+=,.@- with no spaces. Leave it blank to use the default name, then enter a fresh MFA code.", true);
+    $("role-session-name").focus();
+    return;
+  }
   if (!/^[0-9]{6}$/.test(mfaCode)) {
     mfaCode = "";
     announce("Enter a fresh six-digit MFA code to get CLI credentials.", true);
@@ -337,7 +346,7 @@ async function switchProfile() {
   clearNotice();
   renderBusy();
   try {
-    const pending = request("/api/cli", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode }) });
+    const pending = request("/api/cli", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.token }, body: JSON.stringify({ profile: selected.profile, mfaCode, ...(roleSessionName === "" ? {} : { roleSessionName }) }) });
     mfaCode = "";
     const result = await pending;
     if (authVersion !== state.authVersion) return;

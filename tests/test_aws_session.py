@@ -31,7 +31,7 @@ ASSUME_STAGES = ["configuration", "python-sdk", "source-credentials", "python-sd
 
 def assumed_result(result=None, failure=None):
     """Simulate an already covered AssumeRole flow in downstream worker tests."""
-    def assume(*args, progress=None):
+    def assume(*args, role_session_name="", progress=None):
         if progress:
             for stage in ASSUME_STAGES:
                 progress(stage)
@@ -97,6 +97,79 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(first["region"], "ap-southeast-1")
         self.assertEqual(second["roleArn"], ROLE)
         self.assertEqual(self.client.close.call_count, 2)
+
+    def test_custom_cli_role_session_names_are_passed_exactly_to_sts(self):
+        for name in ("ab", "jperch1987-cli", "User_01+=,.@-", "A" * 64):
+            with self.subTest(name=name):
+                result = aws_session.cli_session(CONFIG, "dev", "012345", role_session_name=name)
+                self.assertEqual(self.client.assume_role.call_args.kwargs["RoleSessionName"], name)
+                self.assertEqual(self.client.assume_role.call_args.kwargs["TokenCode"], "012345")
+                self.assertEqual(set(result), {"credentials", "region", "expiration", "roleArn"})
+
+    def test_missing_and_blank_names_use_fresh_default_even_if_config_has_a_name(self):
+        self.profile_reader.return_value = metadata(role_session_name="CONFIG_NAME_NOT_USED")
+        aws_session.assume_profile(CONFIG, "dev", "123456")
+        aws_session.assume_profile(CONFIG, "dev", "654321", role_session_name="")
+        names = [call.kwargs["RoleSessionName"] for call in self.client.assume_role.call_args_list]
+        for name in names:
+            self.assertRegex(name, r"\Aprofile-switcher-[0-9a-f]{16}\Z")
+        self.assertNotEqual(names[0], names[1])
+
+    def test_invalid_session_names_never_load_configuration_or_sdk(self):
+        for name in (None, 123, False, {}, [], "a", "A" * 65, " ", " name", "name ", "name\n", "name\r", "name\t", "na\x00me", "用户", "na/me", "na:me", "$(whoami)"):
+            with self.subTest(name=name), self.assertRaisesRegex(aws_session.SessionError, "Role session name must"):
+                aws_session.assume_profile(CONFIG, "dev", "012345", role_session_name=name)
+        self.profile_reader.assert_not_called()
+        self.sdk.Session.assert_not_called()
+
+    def test_cli_worker_forwards_custom_name_without_printing_it(self):
+        output, errors = io.StringIO(), io.StringIO()
+        payload = json.dumps({"profile": "dev", "mfaCode": "012345", "roleSessionName": "jperch1987-cli"}).encode()
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
+        self.assertEqual(self.client.assume_role.call_args.kwargs["RoleSessionName"], "jperch1987-cli")
+        self.assertNotIn("jperch1987-cli", output.getvalue() + errors.getvalue())
+        self.assertNotIn("012345", output.getvalue() + errors.getvalue())
+
+    def test_invalid_worker_names_fail_before_sdk_and_console_rejects_name_field(self):
+        for mode, names in (("--cli-worker", [None, 123, "a", "A" * 65, "PRIVATE_NAME\n", " ", "用户"]), ("--console-worker", ["", "PRIVATE_NAME"])):
+            for name in names:
+                with self.subTest(mode=mode, name=name):
+                    output, errors = io.StringIO(), io.StringIO()
+                    payload = json.dumps({"profile": "dev", "mfaCode": "012345", "roleSessionName": name}).encode()
+                    with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), redirect_stdout(output), redirect_stderr(errors):
+                        self.assertEqual(aws_session.main(["--file", CONFIG, mode]), 1)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertNotIn("PRIVATE_NAME", errors.getvalue())
+                    self.assertNotIn("012345", errors.getvalue())
+        self.profile_reader.assert_not_called()
+        self.sdk.Session.assert_not_called()
+
+    def test_standalone_cli_name_is_validated_before_mfa_and_used_exactly(self):
+        for name in ("a", "PRIVATE_NAME\n", "A" * 65):
+            output, errors = io.StringIO(), io.StringIO()
+            with patch.object(aws_session, "_prompt_mfa") as prompt, redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(aws_session.main(["--file", CONFIG, "--profile", "dev", "--role-session-name", name]), 1)
+            prompt.assert_not_called()
+            self.assertEqual(output.getvalue(), "")
+            self.assertNotIn("PRIVATE_NAME", errors.getvalue())
+        self.profile_reader.assert_not_called()
+        self.sdk.Session.assert_not_called()
+        for name in ("jperch1987-cli", ""):
+            with patch.object(aws_session, "_prompt_mfa", return_value="012345"), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(aws_session.main(["--file", CONFIG, "--profile", "dev", "--role-session-name", name]), 0)
+            used = self.client.assume_role.call_args.kwargs["RoleSessionName"]
+            if name:
+                self.assertEqual(used, name)
+            else:
+                self.assertRegex(used, r"\Aprofile-switcher-[0-9a-f]{16}\Z")
+
+    def test_worker_modes_reject_session_name_command_arguments(self):
+        for mode in ("--cli-worker", "--console-worker"):
+            with self.subTest(mode=mode), patch.object(aws_session, "_worker_request") as request, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(aws_session.main(["--file", CONFIG, mode, "--role-session-name", "jperch1987-cli"]), 1)
+            request.assert_not_called()
+        self.sdk.Session.assert_not_called()
 
     def test_cli_worker_uses_fresh_mfa_sessions_and_preserves_leading_zeroes(self):
         outputs = []
@@ -510,7 +583,7 @@ class EntrypointTests(unittest.TestCase):
         payload = b'{"profile":"dev","mfaCode":"012345"}'
         with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(payload))), patch.object(aws_session, "assume_profile", side_effect=assumed_result(result)) as assume, patch.object(aws_session, "_signin_token") as federation, redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(aws_session.main(["--file", CONFIG, "--cli-worker"]), 0)
-        assume.assert_called_once_with(CONFIG, "dev", "012345", progress=aws_session._worker_stage)
+        assume.assert_called_once_with(CONFIG, "dev", "012345", role_session_name="", progress=aws_session._worker_stage)
         federation.assert_not_called()
         self.assertEqual([json.loads(line) for line in errors.getvalue().splitlines()], [{"stage": stage} for stage in ASSUME_STAGES])
         self.assertNotIn("PRIVATE", output.getvalue())

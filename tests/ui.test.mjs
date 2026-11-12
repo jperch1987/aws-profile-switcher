@@ -226,6 +226,88 @@ test('CLI click and Enter send only the MFA CLI request and remain independent o
   }
 });
 
+test('custom role session names are sent exactly for CLI credentials without changing the five exports', async () => {
+  for (const roleSessionName of ['jperch1987-cli', 'ab', 'A'.repeat(64), 'User_+=,.@-9']) {
+    const ui = await app();
+    ui.get('role-session-name').value = roleSessionName;
+    await ui.authenticate();
+    const call = ui.requests.find(({ url }) => url === '/api/cli');
+    assert.deepEqual(JSON.parse(call.options.body), { profile: 'dev', mfaCode: '000123', roleSessionName });
+    assert.equal(ui.get('terminal-command').textContent, cliResponse().commands.posix);
+    assert.equal(ui.get('terminal-command').textContent.split('\n').length, 5);
+    assert.equal(ui.get('role-session-name').value, roleSessionName);
+    assert.equal(ui.get('role-session-name').disabled, false);
+  }
+});
+
+test('blank role session names omit the optional request field and retain the default behavior', async () => {
+  const ui = await app();
+  assert.equal(ui.get('role-session-name').value, '');
+  await ui.authenticate();
+  assert.deepEqual(JSON.parse(ui.requests[1].options.body), { profile: 'dev', mfaCode: '000123' });
+  assert.match(html, /Role session name \(optional\)/);
+  assert.match(html, /Leave blank for <code>profile-switcher-&lt;random&gt;<\/code>/);
+});
+
+test('invalid role session names clear MFA and old credentials without sending a request or affecting Console', async () => {
+  for (const name of ['a', 'A'.repeat(65), ' ', ' user', 'user ', 'two words', 'user/name', 'user:name', '用户', 'naïve', 'ab\n', 'ab\r', 'ab\r\n', 'ab\t', 'ab\0']) {
+    const ui = await app();
+    await ui.authenticate();
+    const requestCount = ui.requests.length;
+    ui.get('role-session-name').value = name;
+    await ui.authenticate('654321');
+    assert.equal(ui.requests.length, requestCount, JSON.stringify(name));
+    assert.equal(ui.get('mfa-code').value, '');
+    assert.doesNotMatch(ui.get('terminal-command').textContent, /TEST_ONLY/);
+    assert.equal(ui.get('copy-button').disabled, true);
+    assert.match(ui.get('notice').textContent, /Role session name must be 2–64/);
+    assert.equal(ui.get('role-session-name').focused, true);
+    await ui.openConsole();
+    assert.equal(ui.get('console-link').href, profiles[0].console.url);
+    assert.equal(ui.get('console-link').hidden, false);
+    assert.equal(ui.requests.length, requestCount);
+  }
+});
+
+test('the optional role session name is disabled during CLI or lookup work and for unavailable profiles', async () => {
+  let resolveResponse;
+  const ui = await app({ cli: () => new Promise((resolve) => { resolveResponse = resolve; }) });
+  assert.equal(ui.get('role-session-name').disabled, false);
+  ui.get('role-session-name').value = 'jperch1987-cli';
+  const authentication = ui.authenticate();
+  assert.equal(ui.get('role-session-name').disabled, true);
+  resolveResponse(response(cliResponse()));
+  await authentication;
+  assert.equal(ui.get('role-session-name').disabled, false);
+  vm.runInContext('lookup.running = true; renderDetails()', ui.context);
+  assert.equal(ui.get('role-session-name').disabled, true);
+  assert.equal(ui.get('console-link').hidden, false);
+  vm.runInContext('lookup.running = false; renderDetails()', ui.context);
+  assert.equal(ui.get('role-session-name').disabled, false);
+  const unavailable = await app({ list: [{ ...profiles[0], auth: { enabled: false } }] });
+  assert.equal(unavailable.get('role-session-name').disabled, true);
+  assert.equal(unavailable.get('console-link').hidden, false);
+  const empty = await app({ list: [] });
+  assert.equal(empty.get('role-session-name').disabled, true);
+});
+
+test('role session name changes apply to the next request and stay only in the current page', async () => {
+  const ui = await app();
+  ui.get('role-session-name').value = 'first-session';
+  await ui.authenticate();
+  const commands = ui.get('terminal-command').textContent;
+  ui.get('role-session-name').value = 'next-session';
+  assert.equal(ui.get('terminal-command').textContent, commands);
+  assert.equal(ui.requests.filter(({ url }) => url === '/api/cli').length, 1);
+  await ui.authenticate('654321');
+  assert.equal(JSON.parse(ui.requests.at(-1).options.body).roleSessionName, 'next-session');
+  ui.get('profile-list').children[1].dispatch('click');
+  assert.equal(ui.get('role-session-name').value, 'next-session');
+  const reloaded = await app();
+  assert.equal(reloaded.get('role-session-name').value, '');
+  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/);
+});
+
 test('a new CLI attempt clears old exports before sending and requires a fresh code', async () => {
   let fail = false;
   const ui = await app({ cli: async () => fail ? { ok: false, json: async () => ({ error: 'MFA rejected.' }) } : { ok: true, json: async () => cliResponse() } });

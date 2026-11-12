@@ -163,9 +163,9 @@ export function createProfileServer(options = {}) {
   let authenticationPending = false;
   const lookup = options.lookupManager || createLookupManager({ python, configFile });
 
-  async function createSession(kind, profile, mfaCode) {
+  async function createSession(kind, profile, mfaCode, roleSessionName = '') {
     const handler = kind === 'cli' ? options.cliSession : options.consoleSession;
-    if (handler) return handler(profile, mfaCode);
+    if (handler) return kind === 'cli' ? handler(profile, mfaCode, roleSessionName) : handler(profile, mfaCode);
     return new Promise((resolve, reject) => {
       const child = execFile(python, [path.join(APP_DIR, 'aws_session.py'), `--${kind}-worker`, '--file', configFile], {
         // Console sign-in performs STS and federation requests sequentially.
@@ -179,7 +179,7 @@ export function createProfileServer(options = {}) {
         }
       });
       child.stdin.on('error', () => {});
-      child.stdin.end(JSON.stringify({ profile: profile.profile, mfaCode }));
+      child.stdin.end(JSON.stringify({ profile: profile.profile, mfaCode, ...(kind === 'cli' ? { roleSessionName } : {}) }));
     });
   }
 
@@ -285,8 +285,17 @@ export function createProfileServer(options = {}) {
       } else if (req.method === 'POST' && ['/api/console', '/api/cli'].includes(url.pathname)) {
         if (req.headers['x-csrf-token'] !== token) throw new AppError('Refresh the page before authenticating to AWS.', 403);
         const body = await readJson(req);
+        const kind = url.pathname === '/api/cli' ? 'cli' : 'console';
+        const allowedKeys = kind === 'cli' ? ['profile', 'mfaCode', 'roleSessionName'] : ['profile', 'mfaCode'];
+        if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).some((key) => !allowedKeys.includes(key))) {
+          throw new AppError('Invalid AWS sign-in request.');
+        }
         if (!body || typeof body.profile !== 'string' || typeof body.mfaCode !== 'string' || !/^[0-9]{6}$/.test(body.mfaCode)) {
           throw new AppError('Choose a profile and enter the six-digit MFA code.');
+        }
+        const roleSessionName = Object.hasOwn(body, 'roleSessionName') ? body.roleSessionName : '';
+        if (typeof roleSessionName !== 'string' || (roleSessionName !== '' && (roleSessionName.length < 2 || roleSessionName.length > 64 || /[^A-Za-z0-9_+=,.@-]/.test(roleSessionName)))) {
+          throw new AppError('Role session name must be blank or 2–64 characters using letters, numbers, or _+=,.@- without spaces.');
         }
         if (authenticationPending) throw new AppError('An AWS sign-in is already in progress. Wait before trying again.', 409);
         if (lookup.running()) throw new AppError('A resource lookup is in progress. Finish or cancel it before authenticating again.', 409);
@@ -296,8 +305,7 @@ export function createProfileServer(options = {}) {
           const profile = profiles.find((entry) => entry.profile === body.profile);
           if (!profile) throw new AppError('This profile no longer exists. Refresh the profile list.', 404);
           if (!profile.auth.enabled) throw new AppError(profile.auth.reason, 422);
-          const kind = url.pathname === '/api/cli' ? 'cli' : 'console';
-          const raw = await createSession(kind, profile, body.mfaCode);
+          const raw = await createSession(kind, profile, body.mfaCode, roleSessionName);
           const result = kind === 'cli' ? validateCliResult(raw) : validateFederationResult(raw);
           if (result.roleArn !== profile.role_arn) throw new AppError('The AWS session did not match the selected role.', 502);
           sendJson(res, 200, kind === 'cli' ? { profile, ...result } : result);

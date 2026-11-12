@@ -67,6 +67,11 @@
               <p class="console-reason" id="console-reason" hidden></p>
             </div>
             <div class="cli-action">
+              <div class="session-name-field">
+                <label class="mfa-label" for="role-session-name">Role session name (optional)</label>
+                <input id="role-session-name" type="text" minlength="2" maxlength="64" autocomplete="off" spellcheck="false" placeholder="e.g. jperch1987-cli" aria-describedby="role-session-name-help" disabled />
+                <p class="action-help" id="role-session-name-help">Used exactly as entered for your next CLI credentials and visible in AWS activity records. Use 2–64 letters, numbers, or <code>_+=,.@-</code>, with no spaces. Leave blank for <code>profile-switcher-&lt;random&gt;</code>. Kept in this page only.</p>
+              </div>
               <label class="mfa-label" for="mfa-code">CLI MFA code</label>
               <div class="mfa-action"><input id="mfa-code" type="password" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" spellcheck="false" placeholder="6-digit code" aria-describedby="mfa-help cli-reason" disabled /><button class="button button-quiet" id="switch-button" type="button"><span id="switch-label">Get CLI credentials</span><svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="m4 5 5 5-5 5m8 0h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
               <p class="action-help" id="mfa-help">Wait for a newly displayed authenticator code, then submit it before the code changes.</p>

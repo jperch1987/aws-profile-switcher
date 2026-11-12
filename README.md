@@ -247,7 +247,7 @@ Prefer a metadata-only profile file. The parser reads its bytes before filtering
 ## Use a profile in a terminal
 
 1. Select a role profile and review its account, role, source, and MFA device.
-2. Enter a fresh six-digit MFA code **in the web app**, then choose **Get CLI credentials**.
+2. Optionally enter a **Role session name**, such as `jperch1987-cli`. Enter a fresh six-digit MFA code **in the web app**, then choose **Get CLI credentials**.
 3. Choose Bash/Zsh or PowerShell. Review the role and expiration shown with the five environment assignments, then copy them.
 4. Paste the assignments into a fresh terminal without prior AWS environment overrides, especially `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, or the legacy `AWS_SECURITY_TOKEN`. Run AWS commands without `--profile`.
 
@@ -262,6 +262,18 @@ export AWS_DEFAULT_REGION='ap-southeast-1'
 ```
 
 The actual values come from the app; the example above contains placeholders. PowerShell uses `$Env:NAME = 'value'` for the same five variables. Bash/Zsh exports are not for Fish or Windows Command Prompt. Pasting them requires no Python installation, local helper invocation, or second MFA prompt in the target terminal. Python and boto3 are still required on the computer running the local server.
+
+### Optional CLI role session name
+
+The **Role session name** field controls the next CLI session you create. A custom name is used exactly as entered, without an added suffix. Leave it empty to generate the existing default: `profile-switcher-` followed by 16 random hexadecimal characters, for example `profile-switcher-a98128923898abcd`.
+
+Custom names must contain 2–64 ASCII letters, digits, or these characters: `_+=,.@-`. Spaces, leading/trailing whitespace, and other characters are rejected before the AWS request. The field stays available across profile selections in the current page; reloading the page clears it. The app does not save the name to your profile file or browser storage, and it does not read `role_session_name` from the profile file as a fallback.
+
+The name appears after the colon in `UserId` and at the end of the assumed-role `Arn` returned by `aws sts get-caller-identity`. AWS can record it in CloudTrail for requests using the session. Your role's trust policy may restrict allowed session names; a user-entered name is a label, not verified identity. [AWS role session name rules](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
+
+The name is set when credentials are issued, so changing the field does not rename credentials already generated. The five export commands and one-hour duration remain the same. This field applies to **Get CLI credentials**; Resource Lookup and AWS Console switching keep their existing behavior.
+
+### Apply the exports
 
 If you reuse a terminal, clear these older profile/token/provider overrides **before** pasting the new five assignments. For Bash/Zsh:
 
@@ -293,7 +305,7 @@ Use **Clear credentials** to remove the displayed values. The app also removes t
 
 Temporary credentials are returned over the loopback HTTP connection and held in the browser's memory and page content. They are not saved to browser storage or server state. The new CLI flow does not save the selection. Any legacy selection in `.state/active-profile.json` contains only profile/config metadata; restoring a selection never restores credentials.
 
-For advanced terminal-only use, `aws_session.py` remains available as an optional helper that prompts for MFA in the terminal. It is separate from the web app's copy-and-paste workflow.
+For advanced terminal-only use, `aws_session.py` remains available as an optional helper that prompts for MFA in the terminal. Pass `--role-session-name jperch1987-cli` to choose a name, or omit that option for the random default; the same name validation applies before the MFA prompt. It is separate from the web app's copy-and-paste workflow.
 
 ## Find a resource across profiles
 
