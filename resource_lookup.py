@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from datetime import datetime, timezone
 from ipaddress import IPv4Address
 import json
 import re
@@ -24,6 +25,9 @@ MAX_PAGES = 10
 MAX_RESULTS = 100
 PAGE_SIZE = 100
 MAX_PAGE_ITEMS = 1000
+ACM_MAX_RESULTS = 5000
+ACM_MAX_PAGES = 100
+ACM_MAX_TOTAL_RESULTS = 10000
 SCAN_SECONDS = 540
 SESSION_SECONDS = 900
 READ_ACTIONS = {
@@ -39,7 +43,15 @@ READ_ACTIONS = {
     "elasticache": ["elasticache:DescribeCacheClusters", "elasticache:DescribeReplicationGroups", "elasticache:DescribeServerlessCaches"],
     "route53": ["route53:GetHostedZone", "route53:ListHostedZonesByName"],
     "load-balancer": ["elasticloadbalancing:DescribeLoadBalancers"],
+    "acm": ["acm:ListCertificates"],
 }
+ACM_KEY_TYPES = ("RSA_1024", "RSA_2048", "RSA_3072", "RSA_4096", "EC_prime256v1", "EC_secp384r1", "EC_secp521r1")
+ACM_ORIGINS = ("AWS_MANAGED", "ACME", "CUSTOMER_PROVIDED")
+ACM_TYPES = {"IMPORTED", "AMAZON_ISSUED", "PRIVATE"}
+ACM_STATUSES = {"PENDING_VALIDATION", "ISSUED", "INACTIVE", "EXPIRED", "VALIDATION_TIMED_OUT", "REVOKED", "FAILED"}
+ACM_ID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+ACM_SDK_MESSAGE = "ACM inventory requires a newer Python AWS SDK to include every certificate origin. Upgrade the app's virtual environment with python -m pip install -r requirements.txt, restart, and retry with a fresh MFA code. This profile was not checked."
+ACM_TOTAL_MESSAGE = "ACM inventory reached the 10,000-certificate search limit. This profile was not fully checked; search fewer profiles with a fresh MFA code."
 LOAD_BALANCER_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?"
 LOAD_BALANCER_TYPES = {"app": "application", "net": "network", "gwy": "gateway"}
 LOAD_BALANCER_FAMILIES = {"elbv2": "Application/Network/Gateway", "elb": "Classic"}
@@ -154,6 +166,10 @@ def _load_balancer_dns_matches(query_dns, returned_dns, allow_alias):
 
 
 def parse_query(resource_type, query):
+    if resource_type == "acm":
+        if query != "":
+            raise LookupError("ACM inventory lists all certificates in the selected region; leave the resource query empty.")
+        return {"query": "", "value": "", "account": None, "region": None, "arn": None}
     if not isinstance(resource_type, str) or resource_type not in READ_ACTIONS or not _text(query) or query != query.strip():
         raise LookupError("Choose a supported resource type and enter an exact name, ID, or ARN using at most 256 single-line characters.")
     result = {"query": query, "value": query, "account": None, "region": None, "arn": None}
@@ -249,8 +265,14 @@ def parse_query(resource_type, query):
 
 
 def validate_request(config_file, payload):
-    if not isinstance(payload, dict) or set(payload) != {"profiles", "resourceType", "query", "mfaCode"}:
+    if not isinstance(payload, dict):
         raise LookupError("Invalid resource lookup request.")
+    required = {"profiles", "resourceType", "query", "mfaCode"}
+    is_acm = payload.get("resourceType") == "acm"
+    if set(payload) != required | ({"region"} if is_acm else set()):
+        raise LookupError("Invalid resource lookup request.")
+    if is_acm and (not isinstance(payload["region"], str) or len(payload["region"]) > 64 or not aws_session.REGION_PATTERN.fullmatch(payload["region"])):
+        raise LookupError("Choose a supported commercial AWS region for ACM inventory, such as us-east-1.")
     names = payload["profiles"]
     if (not isinstance(names, list) or not 1 <= len(names) <= MAX_PROFILES
             or any(not _text(name, 2048) for name in names) or len(set(names)) != len(names)):
@@ -265,6 +287,8 @@ def validate_request(config_file, payload):
         raise LookupError("A selected role profile is missing or invalid. Check its role, source profile, MFA device, and region, then refresh.") from None
     if len({(profile["source_profile"], profile["mfa_serial"]) for profile in profiles}) != 1:
         raise LookupError("Selected profiles must use the same source profile and MFA device. Search each source group separately.")
+    if is_acm:
+        profiles = [{**profile, "region": payload["region"]} for profile in profiles]
     return profiles, payload["resourceType"], query
 
 
@@ -429,9 +453,9 @@ def _list(response, key):
     return value
 
 
-def _pages(client, operation, parameters, deadline, token_key="NextToken", request_token_key=None):
+def _pages(client, operation, parameters, deadline, token_key="NextToken", request_token_key=None, *, max_pages=None):
     seen = set()
-    for page_number in range(MAX_PAGES):
+    for page_number in range(MAX_PAGES if max_pages is None else max_pages):
         try:
             response = _call(client, operation, parameters, deadline)
         except Exception as error:
@@ -487,6 +511,71 @@ def _add(rows, row):
     if len(rows) >= MAX_RESULTS:
         raise ScanError("error", MESSAGES["limit"])
     rows.append(row)
+
+
+def _acm_parameters(client):
+    # Older service models cannot request ACME-origin certificates. Refuse to
+    # silently omit them even when an old SDK can list other certificate types.
+    try:
+        members = client.meta.service_model.operation_model("ListCertificates").input_shape.members
+        origins = members["CertificateKeyPairOrigins"].member.enum
+        if not set(ACM_ORIGINS) <= set(origins):
+            raise ValueError
+    except Exception:
+        raise ScanError("error", ACM_SDK_MESSAGE) from None
+    return {"MaxItems": PAGE_SIZE, "Includes": {"keyTypes": list(ACM_KEY_TYPES)},
+            "CertificateKeyPairOrigins": list(ACM_ORIGINS)}
+
+
+def _acm_date(value):
+    if value is None:
+        return ""
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ScanError("error", MESSAGES["invalid_response"])
+    try:
+        return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        raise ScanError("error", MESSAGES["invalid_response"]) from None
+
+
+def _acm(client, selected, rows, deadline, remaining):
+    parameters = _acm_parameters(client)
+    seen = set()
+    account = selected["role_arn"].split(":")[4]
+    prefix = f"arn:aws:acm:{selected['region']}:{account}:certificate/"
+    for page in _pages(client, "list_certificates", parameters, deadline, max_pages=ACM_MAX_PAGES):
+        items = _list(page, "CertificateSummaryList")
+        token = page.get("NextToken")
+        if len(items) > MAX_PAGE_ITEMS or (token is not None and (not isinstance(token, str) or len(token) > 10000)):
+            raise ScanError("error", MESSAGES["invalid_response"])
+        for item in items:
+            arn = item.get("CertificateArn")
+            if not isinstance(arn, str) or not arn.startswith(prefix) or not re.fullmatch(ACM_ID_PATTERN, arn[len(prefix):]):
+                raise ScanError("error", MESSAGES["invalid_response"])
+            name = item.get("DomainName", "")
+            if not _text(name, 253, empty=True):
+                raise ScanError("error", MESSAGES["invalid_response"])
+            metadata = {}
+            for source, target, allowed in (("Type", "type", ACM_TYPES), ("Status", "status", ACM_STATUSES),
+                                             ("KeyAlgorithm", "keyAlgorithm", ACM_KEY_TYPES)):
+                value = item.get(source, "")
+                if not isinstance(value, str) or (value and value not in allowed):
+                    raise ScanError("error", MESSAGES["invalid_response"])
+                metadata[target] = value
+            in_use = item.get("InUse")
+            if in_use is not None and type(in_use) is not bool:
+                raise ScanError("error", MESSAGES["invalid_response"])
+            metadata.update(inUse=in_use, notBefore=_acm_date(item.get("NotBefore")), notAfter=_acm_date(item.get("NotAfter")))
+            row = _row(selected, "acm", arn[len(prefix):], name, arn)
+            row["certificate"] = metadata
+            if arn in seen:
+                continue
+            if len(rows) >= remaining:
+                raise ScanError("error", ACM_TOTAL_MESSAGE)
+            if len(rows) >= ACM_MAX_RESULTS:
+                raise ScanError("error", MESSAGES["limit"])
+            seen.add(arn)
+            rows.append(row)
 
 
 def _ec2(client, selected, resource_type, query, rows, deadline):
@@ -946,8 +1035,12 @@ def scan(config_file, payload, emit):
         finally:
             payload["mfaCode"] = ""
         try:
+            acm_total = 0
             for selected in candidates:
                 rows = []
+                if resource_type == "acm" and acm_total >= ACM_MAX_TOTAL_RESULTS:
+                    _emit_check(emit, selected, "skipped", rows, ACM_TOTAL_MESSAGE)
+                    continue
                 if time.monotonic() >= deadline:
                     _emit_check(emit, selected, "skipped", rows, MESSAGES["deadline"])
                     continue
@@ -979,15 +1072,21 @@ def scan(config_file, payload, emit):
                                 _eks(client, selected, query, rows, deadline)
                             elif resource_type == "elasticache":
                                 _elasticache(client, selected, query, rows, deadline)
+                            elif resource_type == "acm":
+                                _acm(client, selected, rows, deadline, ACM_MAX_TOTAL_RESULTS - acm_total)
                             else:
                                 _route53(client, selected, query, rows, deadline)
-                    _emit_check(emit, selected, "found" if rows else "not_found", rows)
+                    acm_message = ("ACM certificates were listed for this account in the selected region." if rows else
+                                   "No ACM certificates were returned for this account in the selected region.") if resource_type == "acm" else None
+                    _emit_check(emit, selected, "found" if rows else "not_found", rows, acm_message)
                 except Exception as error:
                     failure = _request_failure(error, "vpc", read_stage) if resource_type == "vpc" else _scan_failure(error)
-                    if rows and failure.status == "not_found":
+                    if (rows or resource_type == "acm") and failure.status == "not_found":
                         failure = ScanError("error")
                     _emit_check(emit, selected, failure.status, rows, failure.safe_message)
                 finally:
+                    if resource_type == "acm":
+                        acm_total += len(rows)
                     credentials.clear()
         finally:
             source_credentials.clear()

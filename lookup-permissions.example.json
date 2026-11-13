@@ -20,7 +20,8 @@
         "elasticache:DescribeServerlessCaches",
         "route53:GetHostedZone",
         "route53:ListHostedZonesByName",
-        "elasticloadbalancing:DescribeLoadBalancers"
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "acm:ListCertificates"
       ],
       "Resource": "*"
     }

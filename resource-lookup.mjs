@@ -4,11 +4,17 @@ import { randomBytes } from 'node:crypto';
 import { isIPv4 } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53', 'load-balancer', 'private-ip']);
+export const RESOURCE_TYPES = Object.freeze(['ec2', 'ebs', 'security-group', 'vpc', 's3', 'rds', 'lambda', 'eks', 'elasticache', 'route53', 'load-balancer', 'private-ip', 'acm']);
 const CHECK_STATES = new Set(['found', 'not_found', 'access_denied', 'auth_failed', 'error', 'skipped']);
 const REGION = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
 const MAX_OUTPUT = 32 * 1024 * 1024;
 const MAX_LINE = 2 * 1024 * 1024;
+const ACM_MAX_LINE = 16 * 1024 * 1024;
+const ACM_MAX_PROFILE_RESULTS = 5000;
+const ACM_MAX_RESULTS = 10000;
+const CERTIFICATE_TYPES = new Set(['', 'IMPORTED', 'AMAZON_ISSUED', 'PRIVATE']);
+const CERTIFICATE_STATES = new Set(['', 'PENDING_VALIDATION', 'ISSUED', 'INACTIVE', 'EXPIRED', 'VALIDATION_TIMED_OUT', 'REVOKED', 'FAILED']);
+const CERTIFICATE_KEYS = new Set(['', 'RSA_1024', 'RSA_2048', 'RSA_3072', 'RSA_4096', 'EC_prime256v1', 'EC_secp384r1', 'EC_secp521r1']);
 const cleanString = (value, maximum = 1024) => typeof value === 'string' && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value);
 const cleanMetadata = (value, maximum) => cleanString(value, maximum) && !/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value);
 const ec2Id = (value, prefix) => typeof value === 'string' && new RegExp(`^${prefix}-(?:[0-9a-f]{8}|[0-9a-f]{17})$`).test(value);
@@ -58,20 +64,46 @@ function networkMetadata(item, target, query) {
     instanceOwnerId: info.instanceOwnerId, requesterId: info.requesterId, requesterManaged: info.requesterManaged };
 }
 
+function certificateTimestamp(value) {
+  if (value === '') return true;
+  if (typeof value !== 'string' || value.length !== 24 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function certificateMetadata(item, target) {
+  const info = item.certificate;
+  if (!info || typeof info !== 'object' || Array.isArray(info)
+    || item.resourceId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(item.resourceId)
+    || item.arn !== `arn:aws:acm:${target.region}:${target.accountId}:certificate/${item.resourceId}`
+    || !cleanMetadata(item.name, 253)
+    || !CERTIFICATE_TYPES.has(info.type) || !CERTIFICATE_STATES.has(info.status) || !CERTIFICATE_KEYS.has(info.keyAlgorithm)
+    || !(info.inUse === null || typeof info.inUse === 'boolean')
+    || !certificateTimestamp(info.notBefore) || !certificateTimestamp(info.notAfter)) return null;
+  return { type: info.type, status: info.status, keyAlgorithm: info.keyAlgorithm,
+    inUse: info.inUse, notBefore: info.notBefore, notAfter: info.notAfter };
+}
+
 export class LookupError extends Error {
   constructor(message, status = 400) { super(message); this.name = 'LookupError'; this.status = status; }
 }
 
 export function validateLookupRequest(body, profiles) {
+  const inventory = body?.resourceType === 'acm';
   if (!body || typeof body !== 'object' || Array.isArray(body)
-    || Object.keys(body).sort().join(',') !== 'mfaCode,profiles,query,resourceType'
+    || Object.keys(body).sort().join(',') !== (inventory ? 'mfaCode,profiles,query,region,resourceType' : 'mfaCode,profiles,query,resourceType')
     || !Array.isArray(body.profiles) || body.profiles.length < 1 || body.profiles.length > 250
     || body.profiles.some((name) => !cleanString(name, 2048) || !name)
     || new Set(body.profiles).size !== body.profiles.length) {
     throw new LookupError('Choose between 1 and 250 distinct role profiles for the lookup.');
   }
   if (!RESOURCE_TYPES.includes(body.resourceType)) throw new LookupError('Choose a supported resource type.');
-  if (!cleanString(body.query, 256) || !body.query.trim()) throw new LookupError('Enter a resource ID, exact name, or ARN using at most 256 characters on one line.');
+  if (inventory) {
+    if (body.query !== '') throw new LookupError('ACM inventory lists certificates without a resource query.');
+    if (typeof body.region !== 'string' || body.region.length > 64 || /[^a-z0-9-]/.test(body.region) || !REGION.test(body.region)) {
+      throw new LookupError('Choose a supported commercial AWS region for the ACM inventory.');
+    }
+  } else if (!cleanString(body.query, 256) || !body.query.trim()) throw new LookupError('Enter a resource ID, exact name, or ARN using at most 256 characters on one line.');
   if (body.resourceType === 'private-ip' && !isIPv4(body.query.trim())) throw new LookupError('Enter one exact private IPv4 address, such as 10.0.1.25. CIDR ranges, hostnames, and IPv6 are not supported.');
   if (body.resourceType === 'load-balancer' && !body.query.trim().startsWith('arn:')
     && !LOAD_BALANCER_NAME.test(body.query.trim()) && !loadBalancerDns(body.query.trim())) {
@@ -84,14 +116,15 @@ export function validateLookupRequest(body, profiles) {
     if (profile.auth?.enabled !== true) throw new LookupError('Every selected profile must support IAM-user MFA authentication.', 422);
     const accountId = /^arn:aws:iam::([0-9]{12}):role\//.exec(profile.role_arn || '')?.[1];
     const source = profiles.find((item) => item.profile === profile.source_profile);
-    const region = profile.region || source?.region || 'us-east-1';
+    const region = inventory ? body.region : profile.region || source?.region || 'us-east-1';
     if (!accountId || !REGION.test(region)) throw new LookupError('A selected profile has an unsupported account or region.', 422);
     return { profile: profile.profile, accountId, region, source: profile.source_profile, mfa: profile.auth.mfaSerial };
   });
   if (targets.some((target) => target.source !== targets[0].source || target.mfa !== targets[0].mfa)) {
     throw new LookupError('Search profiles with the same source identity and MFA device together. Use a fresh code for each identity.', 422);
   }
-  return { profiles: targets.map(({ profile, accountId, region }) => ({ profile, accountId, region })), query: body.query.trim(), resourceType: body.resourceType };
+  return { profiles: targets.map(({ profile, accountId, region }) => ({ profile, accountId, region })), query: body.query.trim(), resourceType: body.resourceType,
+    ...(inventory ? { region: body.region } : {}) };
 }
 
 // Only the short-lived Python worker sees source and session keys. Node forwards
@@ -143,10 +176,14 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
     }
     const check = event.check;
     const target = job.data.profiles.find((item) => item.profile === check?.profile);
+    const inventory = job.data.resourceType === 'acm';
     if (event.event !== 'profile' || !target || job.data.checks.some((item) => item.profile === target.profile)
       || check.accountId !== target.accountId || check.region !== target.region || !CHECK_STATES.has(check.status)
-      || !cleanString(check.message, 500) || !Array.isArray(event.results) || event.results.length > 100) return badWorker(job);
+      || !cleanString(check.message, 500) || !Array.isArray(event.results)
+      || event.results.length > (inventory ? ACM_MAX_PROFILE_RESULTS : 100)
+      || (inventory && job.data.results.length + event.results.length > ACM_MAX_RESULTS)) return badWorker(job);
     const rows = [];
+    const certificateArns = new Set();
     for (const item of event.results) {
       if (!item || item.profile !== target.profile || item.accountId !== target.accountId || item.resourceType !== job.data.resourceType
         || !['region', 'resourceId', 'name', 'arn'].every((key) => cleanString(item[key])) || !item.resourceId
@@ -155,6 +192,11 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         || (job.data.resourceType === 's3' && !REGION.test(item.region) && !['unknown', 'global'].includes(item.region))) return badWorker(job);
       const network = job.data.resourceType === 'private-ip' ? networkMetadata(item, target, job.data.query) : null;
       if (job.data.resourceType === 'private-ip' && !network) return badWorker(job);
+      const certificate = inventory ? certificateMetadata(item, target) : null;
+      if (inventory) {
+        if (!certificate || certificateArns.has(item.arn)) return badWorker(job);
+        certificateArns.add(item.arn);
+      }
       let dnsName;
       if (job.data.resourceType === 'load-balancer') {
         const queryDns = loadBalancerDns(job.data.query);
@@ -167,7 +209,8 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         } else if (queryDns) return badWorker(job);
       }
       rows.push({ profile: target.profile, accountId: target.accountId, region: item.region, resourceType: job.data.resourceType,
-        resourceId: item.resourceId, name: item.name, arn: item.arn, ...(network ? { network } : {}), ...(dnsName ? { dnsName } : {}) });
+        resourceId: item.resourceId, name: item.name, arn: item.arn, ...(network ? { network } : {}), ...(dnsName ? { dnsName } : {}),
+        ...(certificate ? { certificate } : {}) });
     }
     if ((check.status === 'not_found' && rows.length) || (check.status === 'found' && !rows.length)) return badWorker(job);
     job.data.checks.push({ ...target, status: check.status, message: check.message });
@@ -193,7 +236,7 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         if (job.data.state !== 'running') return;
         job.bytes += Buffer.byteLength(chunk);
         job.buffer += chunk;
-        if (job.bytes > MAX_OUTPUT || job.buffer.length > MAX_LINE) return badWorker(job);
+        if (job.bytes > MAX_OUTPUT || Buffer.byteLength(job.buffer) > (job.data.resourceType === 'acm' ? ACM_MAX_LINE : MAX_LINE)) return badWorker(job);
         let newline;
         while ((newline = job.buffer.indexOf('\n')) !== -1) {
           const line = job.buffer.slice(0, newline); job.buffer = job.buffer.slice(newline + 1);
@@ -212,7 +255,8 @@ export function createLookupManager({ python, configFile, spawnProcess = spawn, 
         if (code === 0 && job.completeReceived && !job.buffer.trim()) finish(job, 'complete', 'Lookup finished. Review each profile’s status; denied or skipped profiles may still contain the resource.');
         else finish(job, 'error', 'The lookup helper stopped early. Results may be incomplete; check the Python environment and try again.');
       });
-      job.child.stdin.end(JSON.stringify({ profiles: body.profiles, resourceType: scope.resourceType, query: scope.query, mfaCode: body.mfaCode }));
+      job.child.stdin.end(JSON.stringify({ profiles: body.profiles, resourceType: scope.resourceType, query: scope.query, mfaCode: body.mfaCode,
+        ...(scope.resourceType === 'acm' ? { region: scope.region } : {}) }));
     } catch {
       finish(job, 'error', 'The lookup helper could not start. Check Python and install requirements.txt in the app environment.', true);
     }

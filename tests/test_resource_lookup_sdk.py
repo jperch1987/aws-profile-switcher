@@ -50,6 +50,53 @@ class ResourceLookupSdkTests(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
+    def test_real_sdk_acm_lists_every_key_type_and_origin_with_scoped_paginated_metadata(self):
+        client = self.client("acm")
+        self.assertEqual(client.meta.endpoint_url, "https://acm.us-east-1.amazonaws.com")
+        self.assertEqual(client._request_signer.signing_name, "acm")
+        expected = {"MaxItems": 100, "Includes": {"keyTypes": list(lookup.ACM_KEY_TYPES)},
+                    "CertificateKeyPairOrigins": ["AWS_MANAGED", "ACME", "CUSTOMER_PROVIDED"]}
+        parameters = lookup._acm_parameters(client)
+        self.assertEqual(parameters, expected)
+        operation = client.meta.service_model.operation_model("ListCertificates")
+        serialized = client._serializer.serialize_to_request(parameters, operation)
+        self.assertEqual(json.loads(serialized["body"]), expected)
+        self.assertEqual(serialized["headers"]["X-Amz-Target"], "CertificateManager.ListCertificates")
+        certificates = [{"CertificateArn": f"arn:aws:acm:us-east-1:111111111111:certificate/00000000-0000-0000-0000-{index:012x}",
+                         "DomainName": "*.example.com", "Type": kind, "Status": status, "KeyAlgorithm": key,
+                         "InUse": False, "CertificateKeyPairOrigin": origin,
+                         "NotAfter": datetime(2027, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc)}
+                        for index, (kind, status, key, origin) in enumerate([
+                            ("IMPORTED", "EXPIRED", "RSA_4096", "CUSTOMER_PROVIDED"),
+                            ("AMAZON_ISSUED", "ISSUED", "EC_prime256v1", "ACME"),
+                            ("PRIVATE", "PENDING_VALIDATION", "EC_secp384r1", "AWS_MANAGED")], start=1)]
+        with Stubber(client) as stub:
+            stub.add_response("list_certificates", {"CertificateSummaryList": certificates[:1], "NextToken": "PAGE_TWO"}, expected)
+            stub.add_response("list_certificates", {"CertificateSummaryList": certificates[1:]}, {**expected, "NextToken": "PAGE_TWO"})
+            rows = []
+            lookup._acm(client, self.selected, rows, float("inf"), 10000)
+            stub.assert_no_pending_responses()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["certificate"]["type"] for row in rows], ["IMPORTED", "AMAZON_ISSUED", "PRIVATE"])
+        for row in rows:
+            self.assertEqual(row["accountId"], "111111111111")
+            self.assertEqual(row["region"], "us-east-1")
+            self.assertEqual(row["certificate"]["notAfter"], "2027-01-02T03:04:05.123Z")
+            self.assertNotIn("CertificateKeyPairOrigin", row)
+
+    def test_real_sdk_acm_session_policy_grants_only_list_certificates(self):
+        client = self.client("sts")
+        expected = {"RoleArn": self.selected["role_arn"], "RoleSessionName": ANY, "DurationSeconds": 900,
+                    "Policy": json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["acm:ListCertificates"],
+                        "Resource": "*"}]}, separators=(",", ":"))}
+        temporary = {"AccessKeyId": "TEST_ROLE_KEY_12345678", "SecretAccessKey": "TEST_ROLE_SECRET", "SessionToken": "TEST_ROLE_TOKEN",
+                     "Expiration": datetime.now(timezone.utc) + timedelta(seconds=900)}
+        with Stubber(client) as stub, patch.object(self.session, "client", return_value=client):
+            stub.add_response("assume_role", {"Credentials": temporary}, expected)
+            result = lookup._assume(self.session, Config, {**self.selected, "external_id": ""}, self.credentials, "acm", float("inf"))
+            stub.assert_no_pending_responses()
+        self.assertEqual(result, temporary)
+
     def test_real_sdk_vpc_id_name_and_arn_filters_paginate_and_return_metadata(self):
         client = self.client("ec2")
         vpc_id = "vpc-0123456789abcdef0"

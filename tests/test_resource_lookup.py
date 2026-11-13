@@ -62,6 +62,20 @@ def network_interface(**changes):
     return item
 
 
+def acm_certificate(number=1, region=REGION, account=ACCOUNT, **changes):
+    item = {"CertificateArn": f"arn:aws:acm:{region}:{account}:certificate/00000000-0000-0000-0000-{number:012x}",
+            "DomainName": "*.example.com", "Type": "AMAZON_ISSUED", "Status": "ISSUED", "InUse": True,
+            "KeyAlgorithm": "RSA_2048", "NotBefore": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+            "NotAfter": datetime(2027, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc),
+            "SubjectAlternativeNameSummaries": ["PRIVATE_NONDISPLAYED_DOMAIN"], "Certificate": "PRIVATE_PEM"}
+    item.update(changes)
+    return item
+
+
+def acm_request(region=REGION, profiles=None):
+    return {**request("acm", "", profiles), "region": region}
+
+
 class LookupTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -79,6 +93,9 @@ class LookupTests(unittest.TestCase):
         self.resource.describe_security_groups.return_value = {"SecurityGroups": []}
         self.resource.describe_vpcs.return_value = {"Vpcs": []}
         self.resource.describe_network_interfaces.return_value = {"NetworkInterfaces": []}
+        self.resource.list_certificates.return_value = {"CertificateSummaryList": []}
+        self.resource.meta.service_model.operation_model.return_value = SimpleNamespace(input_shape=SimpleNamespace(members={
+            "CertificateKeyPairOrigins": SimpleNamespace(member=SimpleNamespace(enum=list(lookup.ACM_ORIGINS)))}))
         self.elbv2 = Mock()
         self.elbv2.describe_load_balancers.return_value = {"LoadBalancers": []}
         self.elb = Mock()
@@ -596,6 +613,147 @@ class LookupTests(unittest.TestCase):
                 lookup._assume(self.session, self.config, selected(), credentials("SOURCE_SESSION"), kind, float("inf"))
                 statement = json.loads(self.sts.assume_role.call_args.kwargs["Policy"])["Statement"]
                 self.assertEqual(statement, [{"Effect": "Allow", "Action": actions, "Resource": "*"}])
+
+    def test_acm_region_override_is_validated_before_aws_and_preserves_configuration(self):
+        invalid = [request("acm", ""), {**acm_request(), "query": "example.com"}, {**acm_request(), "query": " "},
+                   {**acm_request(), "query": None}, {**request(), "region": REGION}, {**acm_request(), "extra": "PRIVATE"}]
+        invalid.extend(acm_request(region) for region in (None, [], "us-east-1\n", "us-east-" + "1" * 65, "us-gov-west-1", "cn-north-1", "https://attacker.example", ""))
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(lookup.LookupError):
+                self.scan(payload)
+        self.sdk.assert_not_called()
+        before = deepcopy(self.profiles)
+        self.profiles["prod"]["region"] = "eu-west-1"
+        events = self.scan(acm_request("ap-southeast-1", ["dev", "prod"]))
+        self.assertEqual([event["check"]["region"] for event in events], ["ap-southeast-1"] * 2)
+        self.assertEqual([event["check"]["status"] for event in events], ["not_found"] * 2)
+        self.assertEqual(self.profiles["dev"], before["dev"])
+        self.assertEqual(self.profiles["prod"]["region"], "eu-west-1")
+        self.source_client.get_session_token.assert_called_once()
+        self.boto3.Session.assert_called_once_with(profile_name="base", region_name="ap-southeast-1")
+        for service, options in self.clients:
+            self.assertEqual(options["region_name"], "ap-southeast-1")
+            self.assertEqual(options["endpoint_url"], f"https://{service}.ap-southeast-1.amazonaws.com")
+        for call in self.sts.assume_role.call_args_list:
+            self.assertEqual(json.loads(call.kwargs["Policy"])["Statement"][0]["Action"], ["acm:ListCertificates"])
+
+    def test_acm_lists_all_keys_statuses_and_sources_with_pagination_and_metadata_only(self):
+        certificates = [acm_certificate(index + 1, KeyAlgorithm=key, Status=status, Type=kind)
+                        for index, (key, status, kind) in enumerate(zip(lookup.ACM_KEY_TYPES, sorted(lookup.ACM_STATUSES),
+                                ["IMPORTED", "AMAZON_ISSUED", "PRIVATE", "IMPORTED", "PRIVATE", "AMAZON_ISSUED", "IMPORTED"]))]
+        self.resource.list_certificates.side_effect = [{"CertificateSummaryList": certificates[:3], "NextToken": "PAGE_TWO"},
+                                                     {"CertificateSummaryList": [certificates[0], *certificates[3:]]}]
+        event = self.scan(acm_request())[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 7)
+        expected = {"MaxItems": 100, "Includes": {"keyTypes": list(lookup.ACM_KEY_TYPES)},
+                    "CertificateKeyPairOrigins": ["AWS_MANAGED", "ACME", "CUSTOMER_PROVIDED"]}
+        self.assertEqual(self.resource.list_certificates.call_args_list[0].kwargs, expected)
+        self.assertEqual(self.resource.list_certificates.call_args_list[1].kwargs, {**expected, "NextToken": "PAGE_TWO"})
+        self.assertEqual({row["certificate"]["type"] for row in event["results"]}, lookup.ACM_TYPES)
+        self.assertEqual({row["certificate"]["status"] for row in event["results"]}, lookup.ACM_STATUSES)
+        for row in event["results"]:
+            self.assertEqual(set(row), {"profile", "accountId", "region", "resourceType", "resourceId", "name", "arn", "certificate"})
+            self.assertEqual(set(row["certificate"]), {"type", "status", "keyAlgorithm", "inUse", "notBefore", "notAfter"})
+            self.assertEqual(row["certificate"]["notBefore"], "2026-01-02T03:04:05.000Z")
+            self.assertEqual(row["certificate"]["notAfter"], "2027-01-02T03:04:05.123Z")
+        self.assertNotIn("PRIVATE_", json.dumps(event))
+        self.resource.describe_certificate.assert_not_called()
+        self.resource.get_certificate.assert_not_called()
+        self.resource.export_certificate.assert_not_called()
+
+    def test_acm_optional_summary_fields_remain_unknown_and_do_not_invent_metadata(self):
+        arn = acm_certificate()["CertificateArn"]
+        self.resource.list_certificates.return_value = {"CertificateSummaryList": [{"CertificateArn": arn}]}
+        row = self.scan(acm_request())[0]["results"][0]
+        self.assertEqual(row["name"], "")
+        self.assertEqual(row["certificate"], {"type": "", "status": "", "keyAlgorithm": "", "inUse": None, "notBefore": "", "notAfter": ""})
+        self.resource.list_certificates.return_value = {"CertificateSummaryList": [acm_certificate(NotBefore=datetime(2026, 1, 2, 11, 4, 5, tzinfo=timezone(timedelta(hours=8))))]}
+        self.assertEqual(self.scan(acm_request())[0]["results"][0]["certificate"]["notBefore"], "2026-01-02T03:04:05.000Z")
+
+    def test_acm_rejects_wrong_owner_region_and_malformed_metadata_preserving_prior_rows(self):
+        invalid = [acm_certificate(2, account="999999999999"), acm_certificate(2, region="eu-west-1"),
+                   acm_certificate(2, CertificateArn="arn:aws:acm:us-east-1:111111111111:certificate/invalid"),
+                   acm_certificate(2, DomainName="name\nPRIVATE"), acm_certificate(2, DomainName="a" * 254),
+                   acm_certificate(2, Type="UNKNOWN"), acm_certificate(2, Status=None), acm_certificate(2, KeyAlgorithm="UNKNOWN"),
+                   acm_certificate(2, InUse=1), acm_certificate(2, NotBefore="2026-01-01T00:00:00Z"),
+                   acm_certificate(2, NotAfter=datetime(2027, 1, 1))]
+        for item in invalid:
+            with self.subTest(item=item):
+                self.resource.list_certificates.return_value = {"CertificateSummaryList": [acm_certificate(), item]}
+                event = self.scan(acm_request())[0]
+                self.assertEqual(event["check"]["status"], "error")
+                self.assertEqual(len(event["results"]), 1)
+                self.assertNotIn("PRIVATE", event["check"]["message"])
+
+    def test_acm_old_sdk_cannot_silently_omit_acme_certificates(self):
+        for members in ({}, {"CertificateKeyPairOrigins": SimpleNamespace(member=SimpleNamespace(enum=["AWS_MANAGED", "CUSTOMER_PROVIDED"]))}):
+            self.resource.meta.service_model.operation_model.return_value = SimpleNamespace(input_shape=SimpleNamespace(members=members))
+            event = self.scan(acm_request())[0]
+            self.assertEqual(event["check"]["status"], "error")
+            self.assertEqual(event["results"], [])
+            self.assertIn("requirements.txt", event["check"]["message"])
+        self.resource.list_certificates.assert_not_called()
+
+    def test_acm_more_than_100_certificates_does_not_use_exact_lookup_result_limit(self):
+        self.resource.list_certificates.side_effect = [{"CertificateSummaryList": [acm_certificate(index) for index in range(1, 101)], "NextToken": "NEXT"},
+                                                     {"CertificateSummaryList": [acm_certificate(101)]}]
+        event = self.scan(acm_request())[0]
+        self.assertEqual(event["check"]["status"], "found")
+        self.assertEqual(len(event["results"]), 101)
+
+    def test_acm_per_profile_limits_are_incomplete_only_when_more_data_remains(self):
+        with patch.object(lookup, "ACM_MAX_RESULTS", 2):
+            self.resource.list_certificates.return_value = {"CertificateSummaryList": [acm_certificate(1), acm_certificate(2)]}
+            self.assertEqual(self.scan(acm_request())[0]["check"]["status"], "found")
+            self.resource.list_certificates.return_value = {"CertificateSummaryList": [acm_certificate(1), acm_certificate(2), acm_certificate(3)]}
+            event = self.scan(acm_request())[0]
+            self.assertEqual(event["check"]["status"], "error")
+            self.assertEqual(len(event["results"]), 2)
+            self.assertIn("limit", event["check"]["message"])
+        with patch.object(lookup, "ACM_MAX_PAGES", 1):
+            self.resource.list_certificates.return_value = {"CertificateSummaryList": [acm_certificate()], "NextToken": "NEXT"}
+            event = self.scan(acm_request())[0]
+            self.assertEqual(event["check"]["status"], "error")
+            self.assertEqual(len(event["results"]), 1)
+
+    def test_acm_global_limit_preserves_rows_and_skips_remaining_profiles_before_auth(self):
+        self.profiles["third"] = selected("third")
+        with patch.object(lookup, "ACM_MAX_TOTAL_RESULTS", 2):
+            self.resource.list_certificates.side_effect = [{"CertificateSummaryList": [acm_certificate(1)]},
+                                                         {"CertificateSummaryList": [acm_certificate(2), acm_certificate(3)]}]
+            events = self.scan(acm_request(profiles=["dev", "prod", "third"]))
+            self.assertEqual([event["check"]["status"] for event in events], ["found", "error", "skipped"])
+            self.assertEqual([len(event["results"]) for event in events], [1, 1, 0])
+            self.assertEqual(self.sts.assume_role.call_count, 2)
+            self.assertIn("search limit", events[1]["check"]["message"])
+            self.assertIn("search limit", events[2]["check"]["message"])
+
+    def test_acm_partial_errors_continue_later_profiles_and_never_claim_absence(self):
+        for code, status in [("AccessDeniedException", "access_denied"), ("ResourceNotFoundException", "error"),
+                             ("ThrottlingException", "error"), ("ExpiredToken", "auth_failed")]:
+            with self.subTest(code=code):
+                self.resource.list_certificates.side_effect = [{"CertificateSummaryList": [acm_certificate()], "NextToken": "NEXT"},
+                                                             aws_error(code), {"CertificateSummaryList": []}]
+                events = self.scan(acm_request(profiles=["dev", "prod"]))
+                self.assertEqual([event["check"]["status"] for event in events], [status, "not_found"])
+                self.assertEqual(len(events[0]["results"]), 1)
+                self.assertNotIn("PRIVATE", json.dumps(events))
+        self.resource.list_certificates.side_effect = aws_error("ResourceNotFoundException")
+        self.assertEqual(self.scan(acm_request())[0]["check"]["status"], "error")
+
+    def test_acm_invalid_page_and_token_metadata_are_not_complete_inventory(self):
+        for response in [{}, {"CertificateSummaryList": [None]}, {"CertificateSummaryList": [], "NextToken": False},
+                         {"CertificateSummaryList": [], "NextToken": "x" * 10001},
+                         {"CertificateSummaryList": [acm_certificate()] * 1001}]:
+            with self.subTest(response_type=type(response)):
+                self.resource.list_certificates.return_value = response
+                self.assertEqual(self.scan(acm_request())[0]["check"]["status"], "error")
+        self.resource.list_certificates.side_effect = [{"CertificateSummaryList": [acm_certificate()], "NextToken": "REPEAT"},
+                                                     {"CertificateSummaryList": [], "NextToken": "REPEAT"}]
+        event = self.scan(acm_request())[0]
+        self.assertEqual(event["check"]["status"], "error")
+        self.assertEqual(len(event["results"]), 1)
 
     def test_ebs_and_vpc_exact_ids_and_names_produce_only_metadata(self):
         for kind, operation, key, id_key, resource_id in [("ebs", "describe_volumes", "Volumes", "VolumeId", "vol-01234567"), ("vpc", "describe_vpcs", "Vpcs", "VpcId", "vpc-01234567")]:

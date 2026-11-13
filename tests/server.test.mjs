@@ -185,6 +185,38 @@ test('resource lookup endpoints require CSRF, isolate authentication, and return
   await assert.rejects(readFile(path.join(app.stateDirectory, 'active-profile.json')), { code: 'ENOENT' });
 });
 
+test('ACM inventory endpoint forwards the selected region and never exposes MFA or credentials', async (t) => {
+  let child;
+  let input = '';
+  const manager = createLookupManager({ python: 'unused', configFile: '/unused/config', spawnProcess: () => {
+    child = new EventEmitter(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.stdin.on('data', (chunk) => { input += chunk; });
+    child.kill = () => { queueMicrotask(() => child.emit('close', 1)); };
+    return child;
+  } });
+  const app = await fixture(t, exampleConfig, { lookupManager: manager });
+  const { token } = (await app.request('/api/profiles')).json();
+  const headers = { 'content-type': 'application/json', 'x-csrf-token': token };
+  const body = { profiles: ['dev'], resourceType: 'acm', query: '', region: 'eu-west-1', mfaCode: '012345' };
+  const post = (value) => app.request('/api/lookup', { method: 'POST', headers, body: JSON.stringify(value) });
+  for (const override of [{ query: '*' }, { region: 'eu-west-1\n' }, { region: null }]) assert.equal((await post({ ...body, ...override })).status, 400);
+  assert.equal(child, undefined, 'invalid inventory input does not start authentication');
+  const started = await post(body);
+  assert.equal(started.status, 202);
+  const snapshot = started.json();
+  assert.equal(snapshot.region, 'eu-west-1');
+  assert.equal(snapshot.profiles[0].region, 'eu-west-1');
+  assert.deepEqual(JSON.parse(input), body);
+  assert.doesNotMatch(started.text, /012345|mfaCode|DO_NOT_RETURN|credentials/);
+  child.stdout.write(JSON.stringify({ event: 'profile', check: { profile: 'dev', accountId: '123456789012', region: 'eu-west-1',
+    status: 'not_found', message: 'No certificates were returned in this region.' }, results: [] }) + '\n');
+  child.stdout.write('{"event":"complete"}\n'); child.emit('close', 0);
+  const completed = (await app.request(`/api/lookup?id=${snapshot.id}`)).json();
+  assert.equal(completed.state, 'complete');
+  assert.equal(completed.checks[0].region, 'eu-west-1');
+  assert.equal(await readFile(app.configFile, 'utf8'), exampleConfig);
+});
+
 test('removed browser automation endpoints return 404 without creating state or authenticating', async (t) => {
   const app = await fixture(t, exampleConfig, {
     cliSession: () => assert.fail('Removed endpoints must not request CLI credentials'),

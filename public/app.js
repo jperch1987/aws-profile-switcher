@@ -4,10 +4,10 @@
 const $ = (id) => document.getElementById(id);
 const state = { profiles: [], selected: null, active: null, commands: null, expiration: 0, expiryTimer: null, sessionVersion: 0, authVersion: 0, loadVersion: 0, token: "", shell: "posix", loading: false, switching: false, loaded: false, copyTimer: null };
 
-const lookupTypes = new Map([["ec2", "EC2 instance"], ["ebs", "EBS volume"], ["security-group", "Security group"], ["vpc", "VPC"], ["s3", "S3 bucket"], ["rds", "RDS database"], ["lambda", "Lambda function"], ["eks", "EKS cluster"], ["elasticache", "ElastiCache cache"], ["route53", "Route 53 hosted zone"], ["load-balancer", "Load balancer"], ["private-ip", "Private IPv4 address"]]);
+const lookupTypes = new Map([["ec2", "EC2 instance"], ["ebs", "EBS volume"], ["security-group", "Security group"], ["vpc", "VPC"], ["s3", "S3 bucket"], ["rds", "RDS database"], ["lambda", "Lambda function"], ["eks", "EKS cluster"], ["elasticache", "ElastiCache cache"], ["route53", "Route 53 hosted zone"], ["load-balancer", "Load balancer"], ["private-ip", "Private IPv4 address"], ["acm", "ACM certificates (inventory)"]]);
 const lookupProfileLimit = 250;
 const lookupRegion = /^(?:af|ap|ca|eu|il|me|mx|sa|us)-(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-[1-9][0-9]*$/;
-const lookup = { groups: [], group: null, selected: new Set(), snapshot: null, expected: null, version: 0, timer: null, expiryTimer: null, running: false, mutation: false, message: "", error: false };
+const lookup = { groups: [], group: null, regionEdited: false, resultPage: 0, selected: new Set(), snapshot: null, expected: null, version: 0, timer: null, expiryTimer: null, running: false, mutation: false, message: "", error: false };
 
 function busy() { return state.loading || state.switching; }
 function clearMfa() { $("mfa-code").value = ""; }
@@ -378,6 +378,14 @@ function effectiveRegion(profile) {
   return profile.region || state.profiles.find((source) => source.profile === profile.source_profile)?.region || "us-east-1";
 }
 
+function validCertificateRegion(value) {
+  return typeof value === "string" && value.length <= 64 && !/[^a-z0-9-]/.test(value) && lookupRegion.test(value);
+}
+
+function lookupScopeRegion(profile) {
+  return $("lookup-type").value === "acm" ? $("lookup-region").value : effectiveRegion(profile);
+}
+
 function resetLookup(cancelPending = false, message = "") {
   const pendingId = lookup.running ? lookup.snapshot?.id : null;
   lookup.version++;
@@ -386,6 +394,7 @@ function resetLookup(cancelPending = false, message = "") {
   lookup.timer = null;
   lookup.expiryTimer = null;
   lookup.snapshot = null;
+  lookup.resultPage = 0;
   lookup.expected = null;
   lookup.running = false;
   lookup.mutation = false;
@@ -429,6 +438,7 @@ function rebuildLookupGroups() {
 
 function selectLookupGroup() {
   const group = currentLookupGroup();
+  if (!lookup.regionEdited) $("lookup-region").value = group?.profiles[0] ? effectiveRegion(group.profiles[0]) : "us-east-1";
   lookup.selected = new Set(group && group.profiles.length <= lookupProfileLimit ? group.profiles.map((profile) => profile.profile) : []);
   clearLookupMfa();
   renderLookupScope();
@@ -444,7 +454,7 @@ function renderLookupScope() {
     checkbox.type = "checkbox";
     checkbox.checked = lookup.selected.has(profile.profile);
     checkbox.value = profile.profile;
-    checkbox.setAttribute("aria-label", `Search ${profile.profile} in ${effectiveRegion(profile)}`);
+    checkbox.setAttribute("aria-label", `Search ${profile.profile} in ${lookupScopeRegion(profile) || "the chosen region"}`);
     checkbox.addEventListener("change", () => {
       if (busy() || lookup.running) return;
       if (checkbox.checked) lookup.selected.add(profile.profile);
@@ -454,7 +464,7 @@ function renderLookupScope() {
     });
     const details = makeElement("span", "lookup-scope-text");
     const account = /^arn:aws:iam::([0-9]{12}):role\//.exec(profile.role_arn)?.[1] || "Account not set";
-    details.append(makeElement("strong", "", profile.profile), makeElement("span", "", `${account} · ${effectiveRegion(profile)}`));
+    details.append(makeElement("strong", "", profile.profile), makeElement("span", "", `${account} · ${lookupScopeRegion(profile) || "Choose a region"}`));
     label.append(checkbox, details);
     rows.push(label);
   }
@@ -469,25 +479,31 @@ function renderLookupControls() {
   const eligible = lookup.groups.reduce((count, item) => count + item.profiles.length, 0);
   const unavailable = Math.max(0, state.profiles.length - eligible);
   const total = group?.profiles.length || 0;
+  const inventory = $("lookup-type").value === "acm";
   const privateIp = $("lookup-type").value === "private-ip";
   const loadBalancer = $("lookup-type").value === "load-balancer";
   const limitMessage = selected > lookupProfileLimit ? `Select no more than ${lookupProfileLimit} profiles per search.` : total > lookupProfileLimit ? `This identity exceeds the ${lookupProfileLimit}-profile search limit. Select all is unavailable; choose up to ${lookupProfileLimit} profiles manually, then search the remaining profiles separately.${selected === 0 ? " None have been selected automatically." : ""}` : `Choose 1–${lookupProfileLimit} profiles sharing this source identity and MFA device.`;
   $("lookup-scope-summary").textContent = `${selected} of ${total} profiles selected. ${limitMessage}`;
   $("lookup-scope-summary").classList.toggle("is-error", selected > lookupProfileLimit);
   $("lookup-source-help").textContent = group ? `MFA device: ${group.mfa}${unavailable ? `. ${unavailable} ${unavailable === 1 ? "profile needs" : "profiles need"} role/source/MFA setup and cannot be searched.` : ""}` : "No profiles have the role, source credentials configuration, region, and MFA device required for lookup.";
-  $("lookup-region-help").textContent = $("lookup-type").value === "s3" ? "S3 bucket lookup is global. A match shows the bucket’s verified region when available." : $("lookup-type").value === "route53" ? "Route 53 hosted zone lookup is global. Search by exact domain name, hosted zone ID, or ARN; individual DNS records are outside this search." : `${$("lookup-type").value === "load-balancer" ? "Includes Application, Network, Gateway, and Classic Load Balancers. " : ""}Searches only each selected profile’s configured region: role region, then source region, or us-east-1 by default. Other regions are outside this search.`;
+  $("lookup-region-help").textContent = inventory ? `Lists certificates in ${validCertificateRegion($("lookup-region").value) ? $("lookup-region").value : "the region you enter"} for every selected profile. Other accounts and regions are outside this inventory; different source identities require separate searches.` : $("lookup-type").value === "s3" ? "S3 bucket lookup is global. A match shows the bucket’s verified region when available." : $("lookup-type").value === "route53" ? "Route 53 hosted zone lookup is global. Search by exact domain name, hosted zone ID, or ARN; individual DNS records are outside this search." : `${$("lookup-type").value === "load-balancer" ? "Includes Application, Network, Gateway, and Classic Load Balancers. " : ""}Searches only each selected profile’s configured region: role region, then source region, or us-east-1 by default. Other regions are outside this search.`;
   $("lookup-query").placeholder = ({ ec2: "For example: i-0123456789abcdef0 or web-server", ebs: "For example: vol-0123456789abcdef0", "security-group": "For example: sg-0123456789abcdef0", vpc: "For example: vpc-0123456789abcdef0", s3: "For example: my-application-bucket", rds: "For example: production-database", lambda: "For example: process-orders", eks: "For example: production-cluster or cluster ARN", elasticache: "Cache cluster, replication group, or serverless cache ID / ARN", route53: "For example: example.com or Z0123456789ABC", "load-balancer": "production-web, production-web-123.us-east-1.elb.amazonaws.com, or ARN", "private-ip": "For example: 10.0.1.25" })[$("lookup-type").value] || "Exact resource name, ID, or ARN";
   $("lookup-query-label").textContent = privateIp ? "Exact private IPv4 address" : loadBalancer ? "Exact name, AWS DNS name (FQDN), or ARN" : "Exact ID, name, or ARN";
   $("lookup-query-help").textContent = privateIp ? "One IPv4 address, without a subnet mask. IPv6, hostnames, and CIDR ranges are outside this search." : loadBalancer ? "Use the AWS-provided DNS name, not a custom domain or URL. Exact matches only; no wildcards. DNS lookup checks load balancer inventories and may take longer, up to the 10-minute search limit. Unfinished checks do not prove absence." : "Exact matches only. Up to 256 characters; no wildcard search.";
   $("lookup-ip-help").hidden = !privateIp;
+  $("lookup-acm-help").hidden = !inventory;
+  $("lookup-query-field").hidden = inventory;
+  $("lookup-region-field").hidden = !inventory;
+  $("lookup-region").disabled = locked || !group || !inventory;
   for (const id of ["lookup-group", "lookup-type", "lookup-query", "lookup-mfa"]) $(id).disabled = locked || !group;
+  $("lookup-query").disabled = locked || !group || inventory;
   for (const row of $("lookup-profiles").children) if (row.children[0]?.tagName === "INPUT") row.children[0].disabled = locked;
   $("lookup-select-all").disabled = locked || !group || total > lookupProfileLimit;
   $("lookup-select-all").textContent = total > 0 && selected === total ? "All selected" : "Select all";
   $("lookup-select-all").setAttribute("aria-describedby", "lookup-scope-summary");
   $("lookup-select-none").disabled = locked || selected === 0;
   $("lookup-submit").disabled = locked || selected < 1 || selected > lookupProfileLimit;
-  $("lookup-submit-label").textContent = lookup.running ? "Searching…" : "Search resources";
+  $("lookup-submit-label").textContent = lookup.running ? inventory ? "Listing certificates…" : "Searching…" : inventory ? "List certificates" : "Search resources";
   $("lookup-cancel").hidden = !lookup.running;
   $("lookup-cancel").disabled = !lookup.running || lookup.mutation || !lookup.snapshot?.id;
   $("lookup-clear").disabled = !lookup.snapshot && !lookup.message && !lookup.running;
@@ -547,9 +563,31 @@ function validLookupNetwork(row, query) {
     && (network.requesterManaged === null || typeof network.requesterManaged === "boolean");
 }
 
+function validLookupCertificate(row) {
+  const certificate = row.certificate;
+  const fields = ["type", "status", "keyAlgorithm", "inUse", "notBefore", "notAfter"];
+  const clean = (value, maximum) => typeof value === "string" && value.length <= maximum && !/[\p{Cc}\p{Cs}\u2028\u2029]/u.test(value);
+  const date = (value) => value === "" || (typeof value === "string" && value.length === 24
+    && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
+  return certificate && typeof certificate === "object" && !Array.isArray(certificate)
+    && Object.keys(certificate).length === fields.length && fields.every((field) => Object.hasOwn(certificate, field))
+    && typeof row.resourceId === "string" && row.resourceId.length === 36 && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(row.resourceId)
+    && row.arn === `arn:aws:acm:${row.region}:${row.accountId}:certificate/${row.resourceId}` && clean(row.name, 253)
+    && ["", "IMPORTED", "AMAZON_ISSUED", "PRIVATE"].includes(certificate.type)
+    && ["", "PENDING_VALIDATION", "ISSUED", "INACTIVE", "EXPIRED", "VALIDATION_TIMED_OUT", "REVOKED", "FAILED"].includes(certificate.status)
+    && ["", "RSA_1024", "RSA_2048", "RSA_3072", "RSA_4096", "EC_prime256v1", "EC_secp384r1", "EC_secp521r1"].includes(certificate.keyAlgorithm)
+    && (certificate.inUse === null || typeof certificate.inUse === "boolean")
+    && date(certificate.notBefore) && date(certificate.notAfter);
+}
+
 function validLookupSnapshot(snapshot, expected, id = null) {
+  const inventory = expected.resourceType === "acm";
+  const perProfileLimit = inventory ? 5000 : 100;
+  const resultLimit = inventory ? Math.min(10000, expected.profiles.length * perProfileLimit) : expected.profiles.length * perProfileLimit;
+  if (inventory && (!validCertificateRegion(expected.region) || snapshot?.region !== expected.region)) return false;
   if (!snapshot || typeof snapshot.id !== "string" || !/^[a-f0-9]{32}$/.test(snapshot.id) || (id && snapshot.id !== id) || !["running", "complete", "error", "cancelled"].includes(snapshot.state) || snapshot.query !== expected.query || snapshot.resourceType !== expected.resourceType || !lookupText(snapshot.message, 2000)) return false;
-  if (!Array.isArray(snapshot.profiles) || snapshot.profiles.length !== expected.profiles.length || !Array.isArray(snapshot.results) || snapshot.results.length > expected.profiles.length * 100 || !Array.isArray(snapshot.checks) || snapshot.checks.length > expected.profiles.length || snapshot.total !== expected.profiles.length || !Number.isInteger(snapshot.completed) || snapshot.completed !== snapshot.checks.length || (snapshot.state !== "running" && snapshot.completed !== snapshot.total)) return false;
+  if (!Array.isArray(snapshot.profiles) || snapshot.profiles.length !== expected.profiles.length || !Array.isArray(snapshot.results) || snapshot.results.length > resultLimit || !Array.isArray(snapshot.checks) || snapshot.checks.length > expected.profiles.length || snapshot.total !== expected.profiles.length || !Number.isInteger(snapshot.completed) || snapshot.completed !== snapshot.checks.length || (snapshot.state !== "running" && snapshot.completed !== snapshot.total)) return false;
   const scopes = new Map();
   for (const profile of snapshot.profiles) {
     const expectedScope = expected.scopes.find((scope) => scope.profile === profile?.profile);
@@ -562,10 +600,20 @@ function validLookupSnapshot(snapshot, expected, id = null) {
     if (!scope || checked.has(check.profile) || scope.accountId !== check.accountId || scope.region !== check.region || !["found", "not_found", "access_denied", "auth_failed", "error", "skipped"].includes(check.status) || !lookupText(check.message, 2000)) return false;
     checked.add(check.profile);
   }
+  const certificateIds = new Set();
+  const certificateCounts = new Map();
   for (const row of snapshot.results) {
     const scope = scopes.get(row?.profile);
     if (!scope || row.accountId !== scope.accountId || row.resourceType !== expected.resourceType || ![row.region, row.resourceId, row.name, row.arn].every((value) => lookupText(value)) || !row.resourceId) return false;
     if (expected.resourceType === "route53" ? row.region !== "global" : expected.resourceType === "s3" ? !lookupRegion.test(row.region) && !["unknown", "global"].includes(row.region) : row.region !== scope.region) return false;
+    if (inventory) {
+      if (!validLookupCertificate(row)) return false;
+      const id = JSON.stringify([row.profile, row.arn]);
+      const count = (certificateCounts.get(row.profile) || 0) + 1;
+      if (certificateIds.has(id) || count > perProfileLimit) return false;
+      certificateIds.add(id);
+      certificateCounts.set(row.profile, count);
+    }
     if (expected.resourceType === "private-ip" && !validLookupNetwork(row, expected.query)) return false;
     if (expected.resourceType === "load-balancer" && !validLookupLoadBalancerDns(row, expected.query)) return false;
   }
@@ -575,15 +623,18 @@ function validLookupSnapshot(snapshot, expected, id = null) {
 
 function renderLookupSnapshot() {
   const snapshot = lookup.snapshot;
-  const labels = { found: "Found", not_found: "No match", access_denied: "Access denied", auth_failed: "Authentication failed", error: "Check failed", skipped: "Not checked" };
+  const inventory = (snapshot?.resourceType || $("lookup-type").value) === "acm";
+  const labels = { found: inventory ? "Listed" : "Found", not_found: inventory ? "No certificates" : "No match", access_denied: "Access denied", auth_failed: "Authentication failed", error: "Check failed", skipped: "Not checked" };
   const status = $("lookup-status");
-  status.textContent = lookup.message || snapshot?.message || "Search AWS by an exact resource ID, name, ARN, or private IPv4 address. No lookup runs until you select Search resources.";
+  status.textContent = lookup.message || snapshot?.message || (inventory ? "Choose a region and accounts, then select List certificates with a fresh MFA code. No inventory runs automatically." : "Search AWS by an exact resource ID, name, ARN, or private IPv4 address. No lookup runs until you select Search resources.");
   status.classList.toggle("is-error", lookup.error || snapshot?.state === "error");
   status.setAttribute("role", lookup.error || snapshot?.state === "error" ? "alert" : "status");
-  $("lookup-progress").textContent = snapshot ? `${snapshot.completed} of ${snapshot.total} profiles processed · ${snapshot.results.length} ${snapshot.results.length === 1 ? "match" : "matches"}${snapshot.state === "running" ? " · Searching" : ""}` : lookup.running ? "Starting read-only lookup…" : "";
+  $("lookup-progress").textContent = snapshot ? `${snapshot.completed} of ${snapshot.total} profiles processed · ${snapshot.results.length} ${inventory ? snapshot.results.length === 1 ? "certificate" : "certificates" : snapshot.results.length === 1 ? "match" : "matches"}${snapshot.state === "running" ? " · Searching" : ""}` : lookup.running ? "Starting read-only lookup…" : "";
   $("lookup-progress").hidden = !snapshot && !lookup.running;
   $("lookup-results-panel").hidden = !snapshot;
-  $("lookup-results-heading").textContent = snapshot ? `Results for “${snapshot.query}”` : "Search results";
+  $("lookup-results-heading").textContent = snapshot ? inventory ? `ACM certificates in ${snapshot.region}` : `Results for “${snapshot.query}”` : inventory ? "Certificate inventory" : "Search results";
+  $("lookup-table-caption").textContent = inventory ? "ACM certificates by account, profile, and selected region" : "Matching AWS resources by account, profile, and region";
+  $("lookup-resource-heading").textContent = inventory ? "Certificate / Details" : "Resource / Name";
   const failedChecks = snapshot && snapshot.state !== "running" ? snapshot.checks.filter((check) => !["found", "not_found"].includes(check.status)) : [];
   const reasons = new Map();
   for (const check of failedChecks) {
@@ -591,15 +642,23 @@ function renderLookupSnapshot() {
     reasons.set(reason, (reasons.get(reason) || 0) + 1);
   }
   $("lookup-diagnostics").hidden = failedChecks.length === 0;
-  $("lookup-diagnostics-summary").textContent = failedChecks.length ? `${failedChecks.length} of ${snapshot.total} profiles could not be fully checked.${snapshot.results.length ? " Confirmed matches are shown below." : " No matches were returned, but this search cannot confirm the resource is absent."}` : "";
+  $("lookup-diagnostics-summary").textContent = failedChecks.length ? `${failedChecks.length} of ${snapshot.total} profiles could not be fully checked.${inventory ? snapshot.results.length ? " Certificates returned so far are shown below." : " No certificates were returned, but this inventory is incomplete." : snapshot.results.length ? " Confirmed matches are shown below." : " No matches were returned, but this search cannot confirm the resource is absent."}` : "";
   $("lookup-diagnostics-reasons").replaceChildren(...[...reasons].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([reason, count]) => {
     const row = makeElement("li");
     row.append(makeElement("strong", "", `${count} ${count === 1 ? "profile" : "profiles"}: `), makeElement("span", "", reason.length > 500 ? `${reason.slice(0, 500)}…` : reason));
     return row;
   }));
   $("lookup-diagnostics-detail").textContent = failedChecks.length ? `${reasons.size > 3 ? `${reasons.size - 3} more ${reasons.size - 3 === 1 ? "reason is" : "reasons are"} listed below. ` : ""}See Checks by profile below for each account’s full message.` : "";
+  const allResults = snapshot?.results || [];
+  lookup.resultPage = Math.min(lookup.resultPage, Math.max(0, Math.ceil(allResults.length / 100) - 1));
+  const firstResult = inventory ? lookup.resultPage * 100 : 0;
+  const visibleResults = inventory ? allResults.slice(firstResult, firstResult + 100) : allResults;
+  $("lookup-result-pages").hidden = !inventory || allResults.length <= 100;
+  $("lookup-result-page-status").textContent = inventory && allResults.length ? `Showing ${firstResult + 1}–${firstResult + visibleResults.length} of ${allResults.length} certificates` : "";
+  $("lookup-result-previous").disabled = lookup.resultPage === 0;
+  $("lookup-result-next").disabled = firstResult + visibleResults.length >= allResults.length;
   const rows = [];
-  for (const result of snapshot?.results || []) {
+  for (const result of visibleResults) {
     const row = makeElement("tr");
     row.append(makeElement("td", "lookup-mono", result.accountId), makeElement("td", "", result.profile), makeElement("td", "lookup-mono", result.region));
     const resource = makeElement("td");
@@ -608,6 +667,19 @@ function renderLookupSnapshot() {
     if (result.name && result.name !== result.resourceId) resource.append(makeElement("span", "lookup-resource-name", result.name));
     if (result.arn) resource.append(makeElement("code", "lookup-resource-arn", result.arn));
     if (result.resourceType === "load-balancer" && result.dnsName) resource.append(makeElement("code", "lookup-resource-dns", `DNS: ${result.dnsName}`));
+    if (result.resourceType === "acm") {
+      const certificate = result.certificate;
+      const details = makeElement("dl", "lookup-certificate-details");
+      const addDetail = (label, value) => { details.append(makeElement("dt", "", label), makeElement("dd", "", value || "Not reported")); };
+      if (!result.name) resource.append(makeElement("span", "lookup-resource-name", "Primary domain not reported"));
+      addDetail("Type", ({ IMPORTED: "Imported", AMAZON_ISSUED: "ACM-issued public", PRIVATE: "Private" })[certificate.type]);
+      addDetail("Status", certificate.status ? certificate.status.replaceAll("_", " ") : "");
+      addDetail("Key algorithm", certificate.keyAlgorithm);
+      addDetail("In use", certificate.inUse === null ? "" : certificate.inUse ? "Yes" : "No");
+      addDetail("Valid from (UTC)", certificate.notBefore);
+      addDetail("Expires (UTC)", certificate.notAfter);
+      resource.append(details);
+    }
     if (result.resourceType === "private-ip") {
       const network = result.network;
       const details = makeElement("dl", "lookup-network-details");
@@ -630,7 +702,7 @@ function renderLookupSnapshot() {
   $("lookup-results-table").hidden = !rows.length;
   $("lookup-no-results").hidden = rows.length > 0;
   const incomplete = snapshot?.checks.some((check) => !["found", "not_found"].includes(check.status));
-  $("lookup-no-results").textContent = snapshot?.state === "running" ? "No matches received yet. Checks are still running." : incomplete || snapshot?.state === "error" || snapshot?.state === "cancelled" ? "No matches returned. Some profiles were not fully checked; this does not prove the resource is absent." : ["s3", "route53"].includes(snapshot?.resourceType) ? "No exact match was returned from the checked profiles. Other accounts were not searched." : "No exact match was returned from the checked profiles and configured regions. Other accounts and regions were not searched.";
+  $("lookup-no-results").textContent = inventory ? snapshot?.state === "running" ? "No certificates received yet. Checks are still running." : incomplete || snapshot?.state === "error" || snapshot?.state === "cancelled" ? "No certificates returned. Some profiles were not fully checked; the inventory is incomplete." : "No certificates were returned from the checked profiles in the selected region. Other accounts and regions were not searched." : snapshot?.state === "running" ? "No matches received yet. Checks are still running." : incomplete || snapshot?.state === "error" || snapshot?.state === "cancelled" ? "No matches returned. Some profiles were not fully checked; this does not prove the resource is absent." : ["s3", "route53"].includes(snapshot?.resourceType) ? "No exact match was returned from the checked profiles. Other accounts were not searched." : "No exact match was returned from the checked profiles and configured regions. Other accounts and regions were not searched.";
   const checks = [];
   for (const scope of snapshot?.profiles || []) {
     const check = snapshot.checks.find((item) => item.profile === scope.profile);
@@ -642,7 +714,7 @@ function renderLookupSnapshot() {
     checks.push(item);
   }
   $("lookup-checks").replaceChildren(...checks);
-  $("lookup-coverage-note").textContent = "Searches can run for up to 10 minutes. Profiles remaining at the time limit are marked Not checked. Access denied, failed authentication, skipped checks, and errors do not prove a resource is absent. Review every profile’s check status before drawing a conclusion.";
+  $("lookup-coverage-note").textContent = inventory ? "Inventory can run for up to 10 minutes, with up to 5,000 certificates per profile and 10,000 per search. Limits, failed checks, and skipped profiles mean the inventory is incomplete. Different profiles for the same account can list the same certificates. Review every profile’s status; only selected accounts and the chosen region are checked." : "Searches can run for up to 10 minutes. Profiles remaining at the time limit are marked Not checked. Access denied, failed authentication, skipped checks, and errors do not prove a resource is absent. Review every profile’s check status before drawing a conclusion.";
   renderLookupControls();
 }
 
@@ -702,14 +774,24 @@ async function searchResources(event) {
   clearMfa();
   const group = currentLookupGroup();
   const profiles = group?.profiles.filter((profile) => lookup.selected.has(profile.profile)).map((profile) => profile.profile) || [];
-  const query = $("lookup-query").value.trim();
   const resourceType = $("lookup-type").value;
+  const inventory = resourceType === "acm";
+  const query = inventory ? "" : $("lookup-query").value.trim();
+  const region = inventory ? $("lookup-region").value : null;
   resetLookup(false);
-  if (!profiles.length || profiles.length > lookupProfileLimit || !lookupTypes.has(resourceType) || !query || query.length > 256 || /[\x00-\x1f\x7f]/.test(query)) {
+  if (!profiles.length || profiles.length > lookupProfileLimit || !lookupTypes.has(resourceType) || (!inventory && (!query || query.length > 256 || /[\x00-\x1f\x7f]/.test(query)))) {
     mfaCode = "";
-    lookup.message = `Select 1–${lookupProfileLimit} profiles and a resource type, then enter an exact ID, name, or ARN of up to 256 characters. Wildcard searches are not supported.`;
+    lookup.message = inventory ? `Select 1–${lookupProfileLimit} profiles to list their ACM certificates.` : `Select 1–${lookupProfileLimit} profiles and a resource type, then enter an exact ID, name, or ARN of up to 256 characters. Wildcard searches are not supported.`;
     lookup.error = true;
     renderLookupSnapshot();
+    return;
+  }
+  if (inventory && !validCertificateRegion(region)) {
+    mfaCode = "";
+    lookup.message = "Enter a supported AWS region, such as us-east-1 or ap-southeast-1, without spaces. The same region is used for every selected account.";
+    lookup.error = true;
+    renderLookupSnapshot();
+    $("lookup-region").focus();
     return;
   }
   if (resourceType === "private-ip" && !exactIpv4(query)) {
@@ -736,8 +818,8 @@ async function searchResources(event) {
   }
   const version = lookup.version;
   const token = state.token;
-  const scopes = group.profiles.filter((profile) => lookup.selected.has(profile.profile)).map((profile) => ({ profile: profile.profile, accountId: /^arn:aws:iam::([0-9]{12}):role\//.exec(profile.role_arn)?.[1], region: effectiveRegion(profile) }));
-  const expected = { query, resourceType, profiles, scopes };
+  const scopes = group.profiles.filter((profile) => lookup.selected.has(profile.profile)).map((profile) => ({ profile: profile.profile, accountId: /^arn:aws:iam::([0-9]{12}):role\//.exec(profile.role_arn)?.[1], region: inventory ? region : effectiveRegion(profile) }));
+  const expected = { query, resourceType, profiles, scopes, ...(inventory ? { region } : {}) };
   lookup.expected = expected;
   lookup.running = true;
   lookup.mutation = true;
@@ -745,7 +827,7 @@ async function searchResources(event) {
   renderLookupSnapshot();
   renderBusy();
   try {
-    const pending = request("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": token }, body: JSON.stringify({ profiles, resourceType, query, mfaCode }) });
+    const pending = request("/api/lookup", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": token }, body: JSON.stringify({ profiles, resourceType, query, mfaCode, ...(inventory ? { region } : {}) }) });
     mfaCode = "";
     const snapshot = await pending;
     if (version !== lookup.version) { if (snapshot?.state === "running") cancelDetachedLookup(snapshot.id, token); return; }
@@ -879,7 +961,14 @@ $("lookup-group").addEventListener("change", () => {
   lookup.group = $("lookup-group").value;
   selectLookupGroup();
 });
-$("lookup-type").addEventListener("change", () => { if (!busy() && !lookup.running) { resetLookup(false); renderLookupControls(); } });
+$("lookup-type").addEventListener("change", () => { if (!busy() && !lookup.running) { resetLookup(false); renderLookupScope(); renderLookupControls(); } });
+$("lookup-region").addEventListener("input", () => {
+  if (busy() || lookup.running) return;
+  lookup.regionEdited = true;
+  resetLookup(false);
+  renderLookupScope();
+  renderLookupControls();
+});
 $("lookup-query").addEventListener("input", clearLookupMfa);
 $("lookup-select-all").addEventListener("click", () => {
   const group = currentLookupGroup();
@@ -897,8 +986,18 @@ $("lookup-select-none").addEventListener("click", () => {
   renderLookupControls();
 });
 $("lookup-submit").addEventListener("click", searchResources);
-for (const id of ["lookup-query", "lookup-mfa"]) $(id).addEventListener("keydown", (event) => { if (event.key === "Enter") searchResources(event); });
+for (const id of ["lookup-query", "lookup-region", "lookup-mfa"]) $(id).addEventListener("keydown", (event) => { if (event.key === "Enter") searchResources(event); });
 $("lookup-cancel").addEventListener("click", cancelLookup);
+$("lookup-result-previous").addEventListener("click", () => {
+  if (lookup.snapshot?.resourceType !== "acm" || lookup.resultPage === 0) return;
+  lookup.resultPage--;
+  renderLookupSnapshot();
+});
+$("lookup-result-next").addEventListener("click", () => {
+  if (lookup.snapshot?.resourceType !== "acm" || (lookup.resultPage + 1) * 100 >= lookup.snapshot.results.length) return;
+  lookup.resultPage++;
+  renderLookupSnapshot();
+});
 $("lookup-clear").addEventListener("click", () => {
   const wasRunning = lookup.running;
   resetLookup(true, wasRunning ? "Results cleared from this page. Cancellation was requested, but the search may continue until the server confirms it or times out." : "Lookup results cleared from this page.");

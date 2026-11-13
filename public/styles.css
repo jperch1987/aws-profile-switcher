@@ -24,3 +24,9 @@
 
 /* Private IP lookup details. Author: jperch1987 */
 .lookup-ip-help{font-size:11px;line-height:1.8;color:#65795d;background:#f4f7f0;border:1px solid #e0e8db;border-radius:6px;padding:11px 13px;margin-top:14px}.lookup-private-ip{display:block;font:600 11px/1.8 var(--mono);color:#485f43;margin-bottom:3px}.lookup-network-details{display:grid;grid-template-columns:minmax(75px,auto) minmax(0,1fr);gap:4px 10px;margin:10px 0 0;font-size:10px;line-height:1.6}.lookup-network-details dt{font-weight:600;color:#64785b}.lookup-network-details dd{margin:0;color:#52694b;overflow-wrap:anywhere;white-space:pre-wrap}.lookup-network-note{font-size:10px;line-height:1.7;color:#7b795e;margin-top:10px}
+
+/* ACM inventory controls and metadata. Author: jperch1987 */
+.lookup-region-field[hidden],.lookup-query-field[hidden],.lookup-acm-help[hidden]{display:none}.lookup-acm-help{font-size:11px;line-height:1.8;color:#65795d;background:#f4f7f0;border:1px solid #e0e8db;border-radius:6px;padding:11px 13px;margin-top:14px}.lookup-certificate-details{display:grid;grid-template-columns:minmax(95px,auto) minmax(0,1fr);gap:4px 10px;margin:10px 0 0;font-size:10px;line-height:1.6}.lookup-certificate-details dt{font-weight:600;color:#64785b}.lookup-certificate-details dd{margin:0;color:#52694b;overflow-wrap:anywhere}
+
+/* ACM inventory pages keep large inventories responsive. Author: jperch1987 */
+.lookup-result-pages{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}.lookup-result-pages[hidden]{display:none}.lookup-result-pages p{font-size:10px;color:#64785b}.lookup-result-pages>div{display:flex;gap:7px}.lookup-result-pages .button{min-height:30px;font-size:10px;padding:5px 10px}

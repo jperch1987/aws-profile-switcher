@@ -793,3 +793,199 @@ test('terminal error and cancellation snapshots count remaining skipped scopes a
     assert.equal(ui.get('switch-button').disabled, false);
   }
 });
+
+// ACM inventory uses one explicit region across all selected roles. Author: jperch1987
+const CERTIFICATE_REGION = 'ap-southeast-2';
+function certificateResult(index = 0, extra = {}) {
+  const resourceId = '12345678-1234-1234-1234-123456789012';
+  const row = result(index, { region: CERTIFICATE_REGION, resourceType: 'acm', resourceId, name: '*.example.com' });
+  return { ...row, arn: `arn:aws:acm:${row.region}:${row.accountId}:certificate/${resourceId}`,
+    certificate: { type: 'IMPORTED', status: 'ISSUED', keyAlgorithm: 'EC_secp384r1', inUse: true,
+      notBefore: '2029-01-01T00:00:00.000Z', notAfter: '2031-01-01T00:00:00.000Z' }, ...extra };
+}
+function certificateCheck(index, status, message = status) { return { ...check(index, status, message), region: CERTIFICATE_REGION }; }
+function certificateSnapshot(options = {}) {
+  const value = snapshot({ resourceType: 'acm', query: '', ...options });
+  return { ...value, region: CERTIFICATE_REGION, profiles: value.profiles.map((profile) => ({ ...profile, region: CERTIFICATE_REGION })) };
+}
+function chooseCertificates(ui, region = CERTIFICATE_REGION) {
+  ui.get('lookup-type').value = 'acm';
+  ui.get('lookup-type').dispatch('change');
+  ui.get('lookup-region').value = region;
+  ui.get('lookup-region').dispatch('input');
+}
+
+test('ACM inventory lists all selected accounts in one explicit region without an exact query', async () => {
+  const ui = await app({ start: () => response(certificateSnapshot({ state: 'complete',
+    checks: [certificateCheck(0, 'found'), certificateCheck(1, 'not_found')], results: [certificateResult()] })) });
+  assert.match(html, /value="acm">ACM certificates \(inventory\)/);
+  assert.equal(ui.get('lookup-region').value, 'us-east-1');
+  assert.equal(ui.get('lookup-region-field').hidden, true);
+  chooseCertificates(ui);
+  assert.equal(ui.get('lookup-query-field').hidden, true);
+  assert.equal(ui.get('lookup-query').disabled, true);
+  assert.equal(ui.get('lookup-region-field').hidden, false);
+  assert.equal(ui.get('lookup-region').disabled, false);
+  assert.equal(ui.get('lookup-acm-help').hidden, false);
+  assert.equal(ui.get('lookup-submit-label').textContent, 'List certificates');
+  assert.equal(ui.get('lookup-select-all').textContent, 'All selected');
+  assert.match(ui.get('lookup-region-help').textContent, /ap-southeast-2.*every selected profile/);
+  for (const scope of ui.get('lookup-profiles').children) assert.match(allText(scope), /ap-southeast-2/);
+  await ui.search({ type: 'acm', query: '' });
+  assert.deepEqual(JSON.parse(ui.requests[1].options.body), { profiles: ['dev', 'production'], resourceType: 'acm', query: '', region: CERTIFICATE_REGION, mfaCode: '000123' });
+  assert.equal(ui.get('lookup-mfa').value, '');
+  assert.match(ui.get('lookup-results-heading').textContent, /ACM certificates in ap-southeast-2/);
+  assert.match(ui.get('lookup-progress').textContent, /1 certificate/);
+  const text = allText(ui.get('lookup-results-body'));
+  for (const expected of ['*.example.com', 'Imported', 'ISSUED', 'EC_secp384r1', 'Yes', '2029-01-01T00:00:00.000Z', '2031-01-01T00:00:00.000Z', certificateResult().arn]) assert.ok(text.includes(expected), expected);
+  assert.equal(ui.get('lookup-checks').children[1].children[0].children[1].textContent, 'No certificates');
+  assert.equal(ui.get('lookup-resource-heading').textContent, 'Certificate / Details');
+});
+
+test('ACM requires a valid region before transmitting MFA and does not change Console or CLI', async () => {
+  for (const region of ['', ' ', 'us-east-1 ', ' us-east-1', 'us-east-1\n', 'us-east-1\r', 'US-EAST-1', 'us-gov-west-1', 'cn-north-1', 'https://acm.us-east-1.amazonaws.com', 'us-east-0', 'us-east-' + '1'.repeat(65)]) {
+    const ui = await app();
+    chooseCertificates(ui, region);
+    await ui.search({ type: 'acm', query: '' });
+    assert.equal(ui.requests.length, 1, region);
+    assert.equal(ui.get('lookup-mfa').value, '');
+    assert.match(ui.get('lookup-status').textContent, /supported AWS region/);
+    assert.equal(ui.get('lookup-region').focused, true);
+    assert.equal(ui.get('switch-button').disabled, false);
+    assert.equal(ui.get('console-link').href, profiles[0].console.url);
+  }
+});
+
+test('ACM region edits invalidate old results and persist across group changes; exact lookup remains configured-region based', async () => {
+  const list = [...profiles, { ...profiles[0], profile: 'other-source', source_profile: 'other', region: 'eu-central-1' }];
+  const ui = await app({ list, start: (options) => {
+    const request = JSON.parse(options.body);
+    return response(request.resourceType === 'acm' ? certificateSnapshot({ state: 'complete', checks: [certificateCheck(0, 'not_found'), certificateCheck(1, 'not_found')] }) : snapshot({ state: 'complete', checks: [check(0, 'not_found'), check(1, 'not_found')] }));
+  } });
+  chooseCertificates(ui);
+  await ui.search({ type: 'acm' });
+  assert.equal(ui.get('lookup-results-panel').hidden, false);
+  assert.match(ui.get('lookup-no-results').textContent, /No certificates were returned.*selected region/);
+  ui.get('lookup-region').value = 'eu-west-3';
+  ui.get('lookup-region').dispatch('input');
+  assert.equal(ui.get('lookup-results-panel').hidden, true);
+  ui.get('lookup-group').value = ui.get('lookup-group').children[1].value;
+  ui.get('lookup-group').dispatch('change');
+  assert.equal(ui.get('lookup-region').value, 'eu-west-3');
+  assert.match(allText(ui.get('lookup-profiles')), /eu-west-3/);
+  ui.get('lookup-group').value = ui.get('lookup-group').children[0].value;
+  ui.get('lookup-group').dispatch('change');
+  ui.get('lookup-type').value = 'ec2';
+  ui.get('lookup-type').dispatch('change');
+  assert.equal(ui.get('lookup-region-field').hidden, true);
+  assert.equal(ui.get('lookup-region').disabled, true);
+  assert.equal(ui.get('lookup-query-field').hidden, false);
+  assert.equal(ui.get('lookup-query').disabled, false);
+  assert.match(allText(ui.get('lookup-profiles')), /us-east-1/);
+  assert.match(allText(ui.get('lookup-profiles')), /eu-west-1/);
+  await ui.search();
+  assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { profiles: ['dev', 'production'], resourceType: 'ec2', query: 'i-0123456789abcdef0', mfaCode: '000123' });
+});
+
+test('ACM accepts missing optional metadata and renders names as plain text', async () => {
+  for (const name of ['', '<img src=x onerror=alert(1)>']) {
+    const row = certificateResult(0, { name, certificate: { type: '', status: '', keyAlgorithm: '', inUse: null, notBefore: '', notAfter: '' } });
+    const ui = await app({ start: () => response(certificateSnapshot({ state: 'complete', checks: [certificateCheck(0, 'found'), certificateCheck(1, 'not_found')], results: [row] })) });
+    chooseCertificates(ui);
+    await ui.search({ type: 'acm' });
+    assert.equal(ui.get('lookup-results-body').children.length, 1);
+    const cell = ui.get('lookup-results-body').children[0].children[3];
+    assert.match(allText(cell), /Not reported/);
+    assert.ok(allText(cell).includes(name || 'Primary domain not reported'));
+    assert.ok(cell.children.every((child) => !['IMG', 'A', 'SCRIPT'].includes(child.tagName)));
+  }
+});
+
+test('ACM rejects mismatched regions, malformed identities, dates, and extra metadata before rendering', async () => {
+  const base = certificateResult();
+  const badRows = [
+    { ...base, region: 'us-east-1' }, { ...base, accountId: '333333333333' }, { ...base, resourceId: 'invalid-id' },
+    { ...base, arn: base.arn.replace('111111111111', '333333333333') },
+    { ...base, arn: base.arn.replace(CERTIFICATE_REGION, 'us-east-1') },
+    { ...base, name: 'bad\nname' }, { ...base, name: 'a'.repeat(254) }, { ...base, certificate: null },
+    ...[{ type: 'UNKNOWN' }, { status: 'DELETED' }, { keyAlgorithm: 'unknown' }, { inUse: 'true' },
+      { notAfter: '2031-02-30T00:00:00.000Z' }, { notBefore: '2029-01-01T00:00:00Z' }, { notAfter: '2031-01-01T00:00:00.000Z\n' },
+      { privateKey: 'DO_NOT_RENDER' }].map((extra) => ({ ...base, certificate: { ...base.certificate, ...extra } })),
+  ];
+  const badSnapshots = badRows.map((row) => certificateSnapshot({ state: 'complete', checks: [certificateCheck(0, 'found'), certificateCheck(1, 'not_found')], results: [row] }));
+  badSnapshots.push({ ...certificateSnapshot(), region: 'eu-west-1' });
+  badSnapshots.push({ ...certificateSnapshot(), profiles: snapshot().profiles });
+  for (const value of badSnapshots) {
+    const ui = await app({ start: () => response(value) });
+    chooseCertificates(ui);
+    await ui.search({ type: 'acm' });
+    assert.match(ui.get('lookup-status').textContent, /invalid lookup response/);
+    assert.equal(ui.get('lookup-results-body').children.length, 0);
+    assert.equal(ui.get('lookup-results-panel').hidden, true);
+  }
+});
+
+test('ACM accepts inventory beyond the exact-lookup cap and enforces its own per-profile and overall limits', async () => {
+  const ui = await app();
+  const validate = vm.runInContext('validLookupSnapshot', ui.context);
+  const expected = { query: '', resourceType: 'acm', region: CERTIFICATE_REGION, profiles: ['dev', 'production'], scopes: certificateSnapshot().profiles };
+  const rows = Array.from({ length: 5000 }, (_, index) => {
+    const resourceId = `12345678-1234-1234-1234-${index.toString(16).padStart(12, '0')}`;
+    return certificateResult(0, { resourceId, arn: `arn:aws:acm:${CERTIFICATE_REGION}:111111111111:certificate/${resourceId}` });
+  });
+  assert.equal(validate(certificateSnapshot({ results: rows, checks: [certificateCheck(0, 'found')] }), expected), true);
+  const extra = certificateResult(0, { resourceId: 'abcdef01-1234-1234-1234-123456789012', arn: `arn:aws:acm:${CERTIFICATE_REGION}:111111111111:certificate/abcdef01-1234-1234-1234-123456789012` });
+  assert.equal(validate(certificateSnapshot({ results: [...rows, extra], checks: [certificateCheck(0, 'found')] }), expected), false);
+  assert.equal(validate(certificateSnapshot({ results: [rows[0], rows[0]], checks: [certificateCheck(0, 'found')] }), expected), false);
+  const both = [...rows, ...rows.map((row) => ({ ...row, profile: 'production', accountId: '222222222222', arn: row.arn.replace('111111111111', '222222222222') }))];
+  assert.equal(validate(certificateSnapshot({ state: 'complete', results: both, checks: [certificateCheck(0, 'found'), certificateCheck(1, 'found')] }), expected), true);
+  assert.equal(validate(certificateSnapshot({ results: [...both, extra], checks: [certificateCheck(0, 'found'), certificateCheck(1, 'found')] }), expected), false);
+});
+
+test('ACM preserves partial inventory and cancellation status without claiming full account coverage', async () => {
+  const first = certificateSnapshot({ checks: [certificateCheck(0, 'error', 'Certificate inventory reached its limit; this check is incomplete.')], results: [certificateResult()] });
+  const cancelled = certificateSnapshot({ state: 'cancelled', checks: [...first.checks, certificateCheck(1, 'skipped')], results: first.results, message: 'Inventory cancelled.' });
+  const ui = await app({ start: () => response(first), cancel: () => response(cancelled) });
+  chooseCertificates(ui);
+  await ui.search({ type: 'acm' });
+  assert.equal(ui.get('lookup-region').disabled, true);
+  assert.equal(ui.get('lookup-submit-label').textContent, 'Listing certificates…');
+  assert.equal(ui.get('switch-button').disabled, true);
+  assert.equal(ui.get('console-link').href, profiles[0].console.url);
+  await ui.get('lookup-cancel').dispatch('click');
+  assert.deepEqual(JSON.parse(ui.requests.at(-1).options.body), { id: JOB_ID });
+  assert.equal(ui.get('lookup-results-body').children.length, 1);
+  assert.match(ui.get('lookup-progress').textContent, /2 of 2 profiles processed · 1 certificate/);
+  assert.match(ui.get('lookup-diagnostics-summary').textContent, /could not be fully checked.*Certificates returned so far/);
+  assert.match(ui.get('lookup-coverage-note').textContent, /5,000 certificates per profile and 10,000 per search/);
+  assert.equal(ui.get('lookup-region').disabled, false);
+  assert.equal(ui.get('switch-button').disabled, false);
+});
+
+test('ACM pages large inventories locally while retaining the total count and resetting on a new scope', async () => {
+  const rows = Array.from({ length: 101 }, (_, index) => {
+    const resourceId = `12345678-1234-1234-1234-${index.toString(16).padStart(12, '0')}`;
+    return certificateResult(0, { resourceId, name: `certificate-${index}.example.com`, arn: `arn:aws:acm:${CERTIFICATE_REGION}:111111111111:certificate/${resourceId}` });
+  });
+  const ui = await app({ start: () => response(certificateSnapshot({ state: 'complete', results: rows, checks: [certificateCheck(0, 'found'), certificateCheck(1, 'not_found')] })) });
+  chooseCertificates(ui);
+  await ui.search({ type: 'acm' });
+  assert.equal(ui.get('lookup-results-body').children.length, 100);
+  assert.equal(ui.get('lookup-result-pages').hidden, false);
+  assert.equal(ui.get('lookup-result-previous').disabled, true);
+  assert.equal(ui.get('lookup-result-next').disabled, false);
+  assert.match(ui.get('lookup-result-page-status').textContent, /Showing 1–100 of 101/);
+  assert.match(ui.get('lookup-progress').textContent, /101 certificates/);
+  ui.get('lookup-result-next').dispatch('click');
+  assert.equal(ui.get('lookup-results-body').children.length, 1);
+  assert.match(allText(ui.get('lookup-results-body')), /certificate-100.example.com/);
+  assert.match(ui.get('lookup-result-page-status').textContent, /Showing 101–101 of 101/);
+  assert.equal(ui.get('lookup-result-next').disabled, true);
+  ui.get('lookup-result-previous').dispatch('click');
+  assert.equal(ui.get('lookup-results-body').children.length, 100);
+  assert.equal(ui.requests.length, 2);
+  ui.get('lookup-region').value = 'eu-west-3';
+  ui.get('lookup-region').dispatch('input');
+  assert.equal(ui.get('lookup-result-pages').hidden, true);
+  assert.equal(ui.get('lookup-results-body').children.length, 0);
+});

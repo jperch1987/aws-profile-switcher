@@ -72,6 +72,135 @@ test('worker receives MFA only over stdin, metadata is allowlisted, and partial 
   assert.equal(manager.get(started.id).results.length, 1, 'callers cannot mutate stored metadata');
 });
 
+function certificateEvent(profile = 'dev', count = 1, region = 'eu-west-1') {
+  const row = event(profile);
+  row.check.region = region;
+  row.results = Array.from({ length: count }, (_, index) => {
+    const resourceId = `12345678-1234-1234-1234-${index.toString(16).padStart(12, '0')}`;
+    return { profile, accountId: row.check.accountId, region, resourceType: 'acm', resourceId,
+      name: `service-${index}.example.com`, arn: `arn:aws:acm:${region}:${row.check.accountId}:certificate/${resourceId}`,
+      certificate: { type: 'IMPORTED', status: 'ISSUED', keyAlgorithm: 'RSA_4096', inUse: true,
+        notBefore: '2026-01-01T00:00:00.000Z', notAfter: '2027-01-01T00:00:00.000Z' } };
+  });
+  return row;
+}
+
+test('ACM inventory requires a strict chosen region and empty query before spawning', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ resourceType: 'acm', query: '', region: 'eu-west-1' });
+  for (const region of [undefined, null, 42, '', 'EU-WEST-1', 'eu-west-1\n', 'eu-west-1\r', ' eu-west-1', 'eu-west-1 ',
+    'us-gov-west-1', 'cn-north-1', 'https://acm.eu-west-1.amazonaws.com', 'eu-west-1'.repeat(10), 'eu-west-１']) {
+    assert.throws(() => manager.start({ ...body, region }, profiles));
+  }
+  const missing = { ...body }; delete missing.region;
+  assert.throws(() => manager.start(missing, profiles));
+  for (const query of [' ', '*', 'example.com', null, 12]) assert.throws(() => manager.start({ ...body, query }, profiles));
+  assert.throws(() => manager.start({ ...body, extra: true }, profiles));
+  assert.throws(() => manager.start(request({ region: 'eu-west-1' }), profiles), 'non-inventory lookups do not accept a region override');
+  assert.throws(() => manager.start(body, [profiles[0], { ...profiles[1], source_profile: 'other' }]), /same source/);
+  assert.equal(children.length, 0);
+  const before = structuredClone(profiles);
+  const scope = validateLookupRequest(body, profiles);
+  assert.equal(scope.region, 'eu-west-1');
+  assert.equal(scope.query, '');
+  assert.ok(scope.profiles.every((target) => target.region === 'eu-west-1'));
+  assert.deepEqual(profiles, before, 'the selected inventory region never rewrites profile metadata');
+});
+
+test('ACM inventory forwards one region, retains only certificate metadata, and reports empty accounts', (t) => {
+  const { manager, children, calls } = fixture(t);
+  const body = request({ resourceType: 'acm', query: '', region: 'eu-west-1' });
+  const started = manager.start(body, profiles);
+  const child = children[0];
+  assert.deepEqual(JSON.parse(child.input), body);
+  assert.doesNotMatch(JSON.stringify(calls), /012345/);
+  assert.equal(started.region, 'eu-west-1');
+  assert.ok(started.profiles.every((target) => target.region === 'eu-west-1'));
+  const first = certificateEvent('dev', 3);
+  first.results[0].certificate.sdkSecret = 'DO_NOT_RETAIN';
+  first.results[0].secret = 'DO_NOT_RETAIN';
+  first.results[1].certificate = { type: 'AMAZON_ISSUED', status: 'PENDING_VALIDATION', keyAlgorithm: 'EC_prime256v1', inUse: false, notBefore: '', notAfter: '' };
+  first.results[2].name = '';
+  first.results[2].certificate = { type: '', status: '', keyAlgorithm: '', inUse: null, notBefore: '', notAfter: '' };
+  child.event(first);
+  const empty = certificateEvent('production', 0); empty.check.status = 'not_found';
+  empty.check.message = 'No certificates were returned in this region.';
+  child.event(empty); child.event({ event: 'complete' }); child.end();
+  const snapshot = manager.get(started.id);
+  assert.equal(snapshot.state, 'complete'); assert.equal(snapshot.results.length, 3);
+  assert.equal(snapshot.results[0].certificate.type, 'IMPORTED');
+  assert.equal(snapshot.results[1].certificate.keyAlgorithm, 'EC_prime256v1');
+  assert.equal(snapshot.results[2].certificate.inUse, null);
+  assert.deepEqual(Object.keys(snapshot.results[0].certificate).sort(), ['inUse', 'keyAlgorithm', 'notAfter', 'notBefore', 'status', 'type']);
+  assert.equal(snapshot.checks[1].status, 'not_found');
+  assert.doesNotMatch(JSON.stringify(snapshot), /DO_NOT_RETAIN|mfaCode|012345/);
+});
+
+test('ACM inventory rejects mismatched certificate identities, malformed metadata and duplicate rows', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ profiles: ['dev'], resourceType: 'acm', query: '', region: 'eu-west-1' });
+  for (const mutate of [
+    (row) => { row.accountId = '999999999999'; },
+    (row) => { row.region = 'us-east-1'; },
+    (row) => { row.resourceId = row.resourceId.toUpperCase().replace('12345678', 'ABCDEF01'); },
+    (row) => { row.resourceId += '\n'; },
+    (row) => { row.resourceId += '\u2028'; row.arn += '\u2028'; },
+    (row) => { row.arn = row.arn.replace('111111111111', '222222222222'); },
+    (row) => { row.arn = row.arn.replace('eu-west-1', 'us-east-1'); },
+    (row) => { row.arn += '/extra'; },
+    (row) => { row.name = 'x'.repeat(254); },
+    (row) => { row.name = 'bad\u2028name'; },
+    (row) => { delete row.certificate; },
+    (row) => { row.certificate = []; },
+    (row) => { row.certificate.type = 'NEW_UNSUPPORTED_TYPE'; },
+    (row) => { row.certificate.status = 'ISSUED\n'; },
+    (row) => { row.certificate.keyAlgorithm = 'RSA_9999'; },
+    (row) => { row.certificate.inUse = 'true'; },
+    (row) => { row.certificate.notAfter = '2027-02-30T00:00:00.000Z'; },
+    (row) => { row.certificate.notBefore = '2026-01-01T00:00:00+00:00'; },
+    (row) => { row.certificate.notAfter = '2027-01-01T00:00:00.000Z\n'; },
+    (row) => { delete row.certificate.notAfter; },
+  ]) {
+    const started = manager.start(body, profiles);
+    const page = certificateEvent(); mutate(page.results[0]); children.at(-1).event(page);
+    assert.equal(manager.get(started.id).state, 'error');
+    assert.equal(manager.get(started.id).results.length, 0);
+  }
+  const started = manager.start(body, profiles);
+  const duplicate = certificateEvent(); duplicate.results.push(structuredClone(duplicate.results[0]));
+  children.at(-1).event(duplicate);
+  assert.equal(manager.get(started.id).state, 'error');
+});
+
+test('ACM inventory permits bounded large result sets and preserves partial coverage on limits', (t) => {
+  const { manager, children } = fixture(t);
+  const body = request({ resourceType: 'acm', query: '', region: 'eu-west-1' });
+  const started = manager.start(body, profiles);
+  const first = certificateEvent('dev', 5000);
+  assert.ok(Buffer.byteLength(JSON.stringify(first)) > 2 * 1024 * 1024, 'ACM needs a larger per-profile line limit');
+  first.check.status = 'error'; first.check.message = 'The inventory reached its result limit. This check is incomplete.';
+  children[0].event(first);
+  children[0].event(certificateEvent('production', 5000));
+  children[0].event({ event: 'complete' }); children[0].end();
+  const result = manager.get(started.id);
+  assert.equal(result.state, 'complete'); assert.equal(result.results.length, 10000);
+  assert.equal(result.checks[0].status, 'error');
+
+  const perProfile = manager.start(body, profiles);
+  children.at(-1).event(certificateEvent('dev', 5001));
+  assert.equal(manager.get(perProfile.id).state, 'error');
+
+  const moreProfiles = [...profiles, { ...profiles[0], profile: 'third' }];
+  const globalLimit = manager.start({ ...body, profiles: moreProfiles.map((profile) => profile.profile) }, moreProfiles);
+  const child = children.at(-1);
+  child.event(certificateEvent('dev', 5000)); child.event(certificateEvent('production', 5000));
+  const extra = certificateEvent(); extra.check.profile = 'third'; extra.results[0].profile = 'third';
+  child.event(extra);
+  const stopped = manager.get(globalLimit.id);
+  assert.equal(stopped.state, 'error'); assert.equal(stopped.results.length, 10000);
+  assert.equal(stopped.checks.at(-1).status, 'skipped');
+});
+
 test('all 250 profiles can be selected and every account receives a completion status', (t) => {
   const { manager, children } = fixture(t);
   const scope = Array.from({ length: 250 }, (_, index) => ({ ...profiles[0], profile: `account-${index}` }));
